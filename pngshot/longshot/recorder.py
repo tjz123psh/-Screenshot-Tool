@@ -265,6 +265,17 @@ class LongshotRecorder:
         """
         r = self.rect
         pause = max(self.cfg.poll_ms, 0) / 1000.0
+        # Warm up grim with one throwaway grab BEFORE the real loop. The first
+        # grab is ~1.7x slower (cold process/cache), which stretches the gap
+        # between frame #1 and #2; at a normal scroll speed that larger gap can
+        # push the two frames past the overlap threshold -> a spurious "重叠不足"
+        # on the very first uses. Discarding a cold frame means the first frame
+        # the stitcher actually sees is already at the steady-state latency, so
+        # frame spacing is even from the start.
+        try:
+            capture.grab_region(r.x, r.y, r.w, r.h)
+        except capture.CaptureError:
+            pass  # a failed warmup is harmless; the real loop retries + reports
         while self._sampling:
             try:
                 frame = capture.grab_region(r.x, r.y, r.w, r.h)
