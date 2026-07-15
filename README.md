@@ -61,7 +61,7 @@ sudo pacman -S grim wl-clipboard tesseract tesseract-data-chi_sim \
 ```sh
 git clone https://github.com/tjz123psh/-Screenshot-Tool.git ~/.local/share/pngshot
 ln -s ~/.local/share/pngshot/scripts/pngshot ~/.local/bin/pngshot
-# scripts/pngshot 默认从 ~/projects/pngshot 找源码，若放在别处需设 PNGSHOT_ROOT：
+# scripts/pngshot 默认从 ~/Projects/pngshot 找源码，若放在别处需设 PNGSHOT_ROOT：
 #   export PNGSHOT_ROOT=~/.local/share/pngshot
 pngshot region
 ```
