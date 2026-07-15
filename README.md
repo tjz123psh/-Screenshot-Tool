@@ -9,7 +9,7 @@
 - **区域截图** —— 拖拽框选，8 个缩放手柄，可拖动移动选区。
 - **选区下方工具栏** —— 像素级精确，因为整个选区阶段是一整块全屏 `wlr-layer-shell` 覆盖层（而非独立窗口）。
 - **确认 → 剪贴板**（`wl-copy -t image/png`）、**保存**、**取消**。
-- **OCR** —— `tesseract -l chi_sim+eng`，结果显示在可编辑窗口中。
+- **OCR** —— 默认走 tesseract（本地、快、无需联网），会先对截图做放大/灰度/深色主题自动反色的预处理，明显改善屏幕小字的识别。也可在配置里切到 `engine = "vision"`，用 opencode 视觉模型识别（小字、中英混排、低对比度更强，标点更准），失败会自动回退 tesseract。结果显示在可编辑窗口中。
 - **翻译** —— 走本机 opencode 免费模型（`opencode run --format json`），也支持通过 `OPENAI_API_KEY` 使用 OpenAI 兼容接口。
 - **标注** —— 画笔 / 箭头 / 矩形 / 文字，可循环切换颜色与粗细，支持撤销。文字通过 Pango 渲染，中文正常显示。
 - **桌面钉图** —— 无边框浮动窗口（在 niri 中「置顶」即浮动）：
@@ -82,7 +82,7 @@ pngshot region
 
 ## 配置
 
-可选的 `~/.config/pngshot/config.toml`（参见 `config.toml.example`），可覆盖大模型的模型/目标语言、OCR 语言、以及长截图调优参数（`poll_ms`、`match_thresh`、`probe_height`、`min_shift_px`）。
+可选的 `~/.config/pngshot/config.toml`（参见 `config.toml.example`），可覆盖大模型的模型/目标语言、OCR 引擎与预处理（`engine`、`preprocess`、`upscale`、`vision_model`）、以及长截图调优参数（`poll_ms`、`min_shift_px`、`max_diff`）。
 
 ## 命令行
 
@@ -121,7 +121,7 @@ pngshot/
     stitcher.py        OpenCV 垂直拼接 + 重叠复检
   services/
     clipboard.py       wl-copy / wl-paste
-    ocr.py             tesseract + 中文空格清理
+    ocr.py             tesseract（预处理）/ vision 双引擎 + 中文空格清理
     llm.py             opencode run（json）+ OpenAI 兜底
     saver.py           ~/Pictures/Screenshots
   util/

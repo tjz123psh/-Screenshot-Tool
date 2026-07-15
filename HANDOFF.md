@@ -66,6 +66,17 @@ PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface
 - **根因（实测）**：grim 首次抓取 55.8ms、稳态 33.7ms（**首次慢 1.7 倍**）。worker 背靠背抓帧，第一帧慢就拉大帧1→帧2间隔，正常滚动速度下两帧位移越过重叠阈值。拼接计算本身只 3ms，非瓶颈。
 - **修复**（`longshot/recorder.py` `_capture_loop`）：真实采集循环前先做**一次丢弃的预热抓取**，让交给拼接器的第一帧就是热的稳态延迟。
 
+### OCR 识别偏弱（能力增强，非 bug）
+- **现象**：屏幕截图 OCR 结果差，小字/低对比度尤其严重。
+- **根因**：原来把原始截图直接喂 tesseract。屏幕约 96 DPI、字号小，而 tesseract 偏好 ~300 DPI。实测原图小字整行识别成乱码。
+- **增强**（`services/ocr.py`，双引擎）：
+  - **tesseract + 预处理（默认，本地/快/免网）**：`_preprocess` 配方 = 灰度 → 自动反色（深色主题）→ `autocontrast(cutoff=1)` → **LANCZOS** 放大 3x。这套配方和顺序是**字符级准确率基准跑出来的**（4 组测试图：常规/深色小字/超小字/低对比度），平均准确率从 ~0.85 提到 ~0.98，超小字 0.60→1.00。
+  - **vision（可选）**：`engine = "vision"` 走 opencode 视觉模型，质量最好但慢(~2-3s)+需联网，失败自动回退 tesseract。默认**不用**（用户反馈模型慢且不稳定）。
+- **陷阱**：
+  - 预处理**别加锐化/二值化**，实测**降低**小字准确率（硬化抗锯齿伪影）。用 LANCZOS 不要用 BILINEAR。
+  - 残余错误（`OCR→O0CR`、全角标点读成半角）是 tesseract **引擎层固有歧义**，预处理修不了；**别硬转标点**，会破坏英文行本该半角的标点，是负优化。
+  - `recognize()` 现在收完整 `OcrConfig`；保留了对旧 `langs` 字符串的兼容（`_coerce_cfg`），改签名时别破坏它。
+
 ---
 
 ## 3. 长截图拼接器要点（`longshot/stitcher.py`）
@@ -104,14 +115,13 @@ PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface
 - 长截图首用不再误报"重叠不足"（性能优化）。
 - 覆盖层拖选中途切工作区，~10s 后自动取消退出（Bug 3 逃生阀）。
 
+OCR 预处理增强是**用量化基准（渲染图 + 字符准确率打分）验证的**，非纯静态检查，可信度较高；但真实屏幕字体/DPI 与测试图仍有差异，以实际使用为准。
+
 日常使用中这些都已由本人手动确认可用；若回归，从对应 bug 条目的"根因"入手。
 
 ---
 
-## 7. 本地未提交改动（迁移遗留）
+## 7. 提交历史备注
 
-项目从 `~/projects/pngshot` 迁到 `~/Projects/pngshot`（大小写）后，两处路径引用已本地更新但**未提交**：
-- `scripts/pngshot`：`PNGSHOT_ROOT` 默认值改为 `$HOME/Projects/pngshot`。
-- `README.md`：手动安装注释里的路径。
-
-如需提交：`git add scripts/pngshot README.md && git commit`。
+- 项目从 `~/projects/pngshot` 迁到 `~/Projects/pngshot`（大小写），启动器与文档路径已同步（提交 `b4bb63e`）。
+- OCR 双引擎 + 预处理增强见第 2 节末尾章节。

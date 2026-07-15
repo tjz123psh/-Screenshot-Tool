@@ -227,7 +227,7 @@ def run_text_action(img, translate: bool) -> int:
             from ..services import llm, ocr
             cfg = _load()
             try:
-                text = ocr.recognize(img, cfg.ocr.langs)
+                text = ocr.recognize(img, cfg.ocr)
                 if not text.strip():
                     GLib.idle_add(win.set_result, "（未识别到文字）", "")
                     return

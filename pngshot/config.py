@@ -22,6 +22,21 @@ class LlmConfig:
 @dataclass
 class OcrConfig:
     langs: str = "chi_sim+eng"
+    # engine: "tesseract" (local, fast, no network) or "vision" (an opencode
+    # vision model — much better on small / low-contrast screen text, but needs
+    # opencode + network and is slower). "vision" auto-falls back to tesseract
+    # if the model call fails, so it never leaves you with nothing.
+    engine: str = "tesseract"
+    # Preprocess before tesseract: upscale + grayscale + auto-invert dark themes.
+    # Measured to turn garbled small-font lines into correct text at ~no cost.
+    preprocess: bool = True
+    # Linear upscale factor for preprocessing. tesseract wants ~300 DPI; screen
+    # captures are ~96 DPI, so 3x lands in tesseract's comfort zone.
+    upscale: float = 3.0
+    # Model used when engine = "vision". Any vision-capable opencode model works.
+    vision_model: str = "google/gemini-flash-latest"
+    # Seconds before the vision call gives up and falls back to tesseract.
+    vision_timeout_s: int = 30
 
 
 @dataclass

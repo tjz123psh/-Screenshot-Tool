@@ -15,15 +15,26 @@ timeout_s   = 30
 serve_port  = 47823
 
 [ocr]
+# 识别引擎："tesseract"（默认，本地、快、离线）或 "vision"（走 opencode 视觉
+# 模型，小字/低对比/中英混排明显更强，但需要 opencode + 网络、较慢 2-3s）。
+# vision 失败会自动回退 tesseract，不会让你什么都拿不到。
+engine = "tesseract"
 # tesseract 语言包，用 + 组合。已装：chi_sim eng osd
 langs = "chi_sim+eng"
+# tesseract 识别前预处理：放大 + 灰度 + 深色主题自动反色。实测能把小字乱码行
+# 纠正为正确文字，几乎零成本。
+preprocess = true
+# 预处理放大倍数。屏幕截图约 96 DPI，tesseract 偏好 ~300 DPI，放大 3x 正合适。
+upscale = 3.0
+# engine = "vision" 时使用的模型，任意支持视觉的 opencode 模型均可。
+vision_model = "google/gemini-flash-latest"
+# vision 调用超时（秒），超时后回退 tesseract。
+vision_timeout_s = 30
 
 [longshot]
-# 采帧间隔（毫秒）。越小越跟手，越大越省 CPU
-poll_ms      = 200
-# 相邻帧位移小于此值视为"没在滚"，丢弃
-min_shift_px = 20
-# 重叠区匹配置信度阈值，低于此值触发"重叠不足"警告
-match_thresh = 0.90
-# 探针条高度（像素）。自适应会在需要时自动缩小
-probe_height = 150
+# 采帧间隔（毫秒）。0 = 全速背靠背抓帧（推荐）；调大可省 CPU 但可能"重叠不足"
+poll_ms      = 0
+# 一帧至少要贡献这么多新行才追加，过滤原地微抖
+min_shift_px = 4
+# 重叠区行签名差异阈值，超过则判定重叠不足（越低越严格）
+max_diff     = 9.0
