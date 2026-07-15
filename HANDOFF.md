@@ -1,0 +1,117 @@
+# pngshot 交接文档
+
+面向未来维护者（也可能是几个月后的自己）。记录**为什么代码是现在这样**、**踩过哪些坑**、**改动时要小心什么**。泛泛的功能介绍见 `README.md`，这里只写排障和根因。
+
+---
+
+## 1. 运行架构（一句话版）
+
+- 每个动作是**一次性进程**：`pngshot region` 抓全屏 → 全屏 `wlr-layer-shell` 覆盖层选区 → 选完执行动作。
+- 需要长期存活的窗口（钉图 / OCR / 翻译）由覆盖层进程 **spawn 独立子进程**（detached），临时图经临时 PNG 传递，子进程用 `--cleanup` 删掉它。
+- 长截图（`long`）**不 spawn**，留在本进程内：覆盖层选完区 → `app.hold()` 保活 → 后台线程按帧采样屏幕矩形 → 主线程拼接。
+
+### 关键启动约束：LD_PRELOAD
+PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface 失效。**启动器必须预加载** `/usr/lib/libgtk4-layer-shell.so`。直接 `python3 -m pngshot` 会坏，一定要走启动器脚本。见 `scripts/pngshot`。
+
+### 两套启动器（别搞混）
+- `scripts/pngshot`：开发用，`PNGSHOT_ROOT` 默认指向 `~/Projects/pngshot`（本仓库）。
+- `~/.local/bin/pngshot`：`install.sh` 一键安装生成的，指向独立克隆 `~/.local/share/pngshot`。
+- **系统日常用的是后者**，改本仓库源码不会影响已安装的命令，需重跑 `install.sh` 或直接跑 `scripts/pngshot`。
+
+---
+
+## 2. 本次会话修复的 5 个 Bug（根因 + 位置 + 陷阱）
+
+以下都是真实踩过的坑。改到相关代码时先读这里，别重蹈覆辙。
+
+### Bug 1 — 长截图控制面板白边
+- **现象**：面板圆角卡片四周有一圈白色。
+- **根因**：面板窗口背景是 GTK 默认（浅色），圆角卡片只盖住内部，margin 和圆角外露出窗口底色。
+- **修复**：`util/theme.py` 加 `.pngshot-transparent`（只清窗口节点背景，**不能用 `> *`**，否则会连卡片自身背景一起清掉）；`longshot/recorder.py` 给面板窗口加这个 class。`_CSS_VERSION` 要 +1 才会重载。
+- **陷阱**：`theme.py` 的 CSS 是 `b"""..."""` **bytes 字面量，只能 ASCII**。别在里面写中文/破折号，会 `SyntaxError`。
+
+### Bug 2 — OCR / 钉图窗口"单实例劫持"
+- **现象**：不关旧 OCR 窗口就再截图选 OCR → 新图不显示、旧窗口被重新激活、行为诡异。
+- **根因**：GTK `Gtk.Application` 默认单实例。同 `application_id` 的第二个进程只向第一个发 `activate` 后**立即退出**，于是新图的临时 PNG 被 `--cleanup` 删掉、旧窗口用旧图重新弹出。
+- **修复**：给 detached 窗口的 Application 加 `Gio.ApplicationFlags.NON_UNIQUE`。位置：`util/result_win.py`（2 处：`run_result` + `run_text_action`）、`pin/window.py`（`run_pin`）、`overlay/app.py`（overlay 本身也有同样问题，见 Bug 3）。
+- **陷阱**：新增任何会常驻的 detached 窗口进程，**记得加 NON_UNIQUE**，否则重现此 bug。
+
+### Bug 3 — overlay 卡死 + 跨工作区跳转劫持
+- **现象**：点截图后跳转到一个旧的、卡住的覆盖层画面；不同工作区都一样。
+- **根因（两层）**：
+  1. 覆盖层是全屏 layer-shell + EXCLUSIVE 键盘，**唯一退出路径**是用户在它上面触发动作。若在拖选中途切走工作区/焦点被抢，它收不到 Esc、又看不见，`app.run()` 永久卡在 poll → **僵尸进程**。
+  2. 叠加 Bug 2 的单实例语义：新截图被转发 `activate` 到僵尸进程，compositor 把用户拽到僵尸所在工作区。
+- **修复**：
+  - `overlay/app.py`：overlay 的 Application 加 `NON_UNIQUE`（僵尸无法再劫持新启动）。
+  - `overlay/surface.py`：加**三层逃生阀**保证覆盖层永远能自己退出——
+    - `_emit`：唯一、幂等的结果出口（所有动作/取消/失焦/超时都走它，`_finished` 保证只触发一次）。
+    - **失焦宽限**：拿到过焦点后失焦 → 启 10s 计时；重新聚焦取消它；超时才 cancel。
+    - **空闲看门狗**：见 Bug 5（后来重写过）。
+- **陷阱**：新增任何"结果出口"必须走 `_emit`，不要直接调 `on_result`，否则破坏幂等 + 逃生阀。
+
+### Bug 4 —（并入 Bug 3 的三层逃生阀）
+（早期把逃生阀拆成多条，已整合，无独立条目。）
+
+### Bug 5 — 涂鸦时画面突然消失（逃生阀误杀）
+- **现象**：标注涂鸦过程中，画到一半整个覆盖层连同涂鸦消失。
+- **根因**：旧的空闲超时用 `not self._ever_focused` 判断"没在交互"，而 `_ever_focused` **只在 GTK 键盘焦点 enter 事件**里置 True。niri 下 layer-shell 的键盘焦点事件**不可靠/不触发**；用鼠标涂鸦走的是 `GestureClick`，从不碰键盘焦点 → 超时误判"从未交互" → 30s 后取消。
+- **修复**（`overlay/surface.py`）：
+  - 改用**真实输入活动时间戳** `_last_activity`，`_mark_activity()` 在**所有**输入处理器开头调用（`_on_pressed` / `_on_motion` / `_on_released` / `_on_key` / focus enter）。
+  - **涂鸦模式完全豁免**所有自动取消（`if self.annotating: return`，在看门狗、失焦宽限、宽限到期三处都有）。
+  - 超时改为**循环看门狗** `_on_idle_tick`：每 `_IDLE_POLL_S`(5s) 查一次，累计 `_IDLE_TIMEOUT_S`(45s) 完全无输入才取消。旧的一次性 30s focus-only 超时已删。
+- **陷阱**：**不要依赖 GTK 焦点事件判断 niri 下 layer-shell 的用户在场状态**，它不可靠。要用输入活动时间戳。
+
+### 长截图首用"重叠不足"（性能优化，非 bug）
+- **现象**：第一次或头几次长截图报"重叠不足"，多用几次就正常。
+- **根因（实测）**：grim 首次抓取 55.8ms、稳态 33.7ms（**首次慢 1.7 倍**）。worker 背靠背抓帧，第一帧慢就拉大帧1→帧2间隔，正常滚动速度下两帧位移越过重叠阈值。拼接计算本身只 3ms，非瓶颈。
+- **修复**（`longshot/recorder.py` `_capture_loop`）：真实采集循环前先做**一次丢弃的预热抓取**，让交给拼接器的第一帧就是热的稳态延迟。
+
+---
+
+## 3. 长截图拼接器要点（`longshot/stitcher.py`）
+
+- 用**行签名匹配**（每行压成 mean/contrast/edge 三数），**不是** `cv2.matchTemplate`。原因：模板匹配在真实文字/UI 上因亚像素渲染+抗锯齿得分只有 ~0.3，导致首帧后全被拒。
+- canvas 用**块列表**存储（`_blocks`），append/prepend 是 O(1)，只在 `result()` 时 vstack 一次。别改回每帧 `np.vstack`（会退化成二次复杂度，越滚越卡→丢帧→"重叠不足"）。
+- 预览缩略图也是增量的（每块只缩放一次并缓存）。别改成每帧全量重缩放。
+- 支持**双向滚动**（`shift` 有符号，+下/-上），可从页面中间开始先往上再往下。
+- 关键参数在 `config.py` 的 `LongshotConfig`：`poll_ms=0`（0=全速，别调大，否则帧间距变大重现"重叠不足"）、`min_shift_px=4`、`max_diff=9.0`（越低越严）。
+
+---
+
+## 4. niri 依赖（无需为非 niri 特殊处理）
+
+- niri 相关全在 `util/niri.py`，**每个函数检测不到 niri 都优雅降级**（返回 None/False），调用方（主要是 `pin/window.py`）有 GTK 兜底。
+- 本项目就是为 niri 定制的（钉图=floating、按 pid 查窗口 id、IPC 精确调窗口尺寸）。非 niri 环境下这些能力退化但不崩。
+- **不要**为了"通用性"删 niri 代码，只会增加风险且没有收益。
+
+---
+
+## 5. 安全 / 提交注意
+
+- 无硬编码密钥：`services/llm.py` 的 `api_key` 从环境变量 `OPENAI_API_KEY` 读。
+- 只提交 `config.toml.example`，真实 `config.toml` 已在 `.gitignore`，**别提交**。
+- 首次推送用 SSH（`git@github.com:tjz123psh/-Screenshot-Tool.git`），本机 `~/.ssh/id_ed25519` 已绑 GitHub 账号 `tjz123psh`。HTTPS 在非交互环境无法输密码。
+- 提交前扫一遍：无 `__pycache__`、无密钥、无真实 config。
+
+---
+
+## 6. 已知未验证事项
+
+以下改动在**无 Wayland GUI 的环境**下做的静态验证（编译+导入+API 存在性），实际视觉/交互行为需真机确认：
+
+- 面板透明白边是否消除（Bug 1）。
+- 涂鸦中长时间停顿不再消失（Bug 5）。
+- 长截图首用不再误报"重叠不足"（性能优化）。
+- 覆盖层拖选中途切工作区，~10s 后自动取消退出（Bug 3 逃生阀）。
+
+日常使用中这些都已由本人手动确认可用；若回归，从对应 bug 条目的"根因"入手。
+
+---
+
+## 7. 本地未提交改动（迁移遗留）
+
+项目从 `~/projects/pngshot` 迁到 `~/Projects/pngshot`（大小写）后，两处路径引用已本地更新但**未提交**：
+- `scripts/pngshot`：`PNGSHOT_ROOT` 默认值改为 `$HOME/Projects/pngshot`。
+- `README.md`：手动安装注释里的路径。
+
+如需提交：`git add scripts/pngshot README.md && git commit`。
