@@ -4,6 +4,23 @@
 
 ---
 
+## 0. 新对话冷启动接手（出 bug 时先读这里）
+
+**项目位置**：开发仓库 `~/Projects/pngshot`（GitHub: `git@github.com:tjz123psh/-Screenshot-Tool.git`，分支 `main`）。系统日常运行的是一键安装的独立克隆 `~/.local/share/pngshot`（见 §1「两套启动器」，别搞混）。
+
+**技术栈**：Python 3.11+，GTK4 + gtk4-layer-shell，Wayland/niri，纯 pacman 依赖（无 pip 包，`dependencies=[]`）。运行时用到 grim、wl-clipboard、tesseract、python-opencv、python-numpy、python-pillow、python-gobject、python-cairo。
+
+**接手一个新 bug 的标准流程**：
+1. 先在 §2 的 bug 清单里找**有没有同类症状**——很多问题（窗口劫持、覆盖层卡死、涂鸦消失、重叠不足、OCR 崩）都已记录根因和陷阱，别重新踩。
+2. 复现：直接跑 `PNGSHOT_ROOT=~/Projects/pngshot ~/Projects/pngshot/scripts/pngshot region`（或 `long`/`pin-last`）。**必须走启动器**，否则 LD_PRELOAD 缺失 layer-shell 会坏（见 §1）。
+3. 定位：GUI/交互问题看 `overlay/surface.py`（逃生阀、输入）、`overlay/app.py`（进程/单实例）；长截图看 `longshot/`；OCR 看 `services/ocr.py`；niri 交互看 `util/niri.py`。
+4. 验证：无 GUI 环境只能做 `python3 -m py_compile` + 导入检查；OCR/拼接这类纯算法可写字符准确率/合成图基准量化验证（§2 OCR 条目有先例）。真机行为改完必须实际截一次确认。
+5. 改完提交：见 §5 安全/提交注意；改完源码要生效到日常命令需重跑 `install.sh` 或直接用开发启动器。
+
+**当前状态基线**：README 中文、curl 一键安装（`install.sh`）、OCR 双引擎+自适应背景处理、长截图预热，均已提交并真机确认可用。最近提交 `f67201b`（OCR 杂乱背景自适应）。
+
+---
+
 ## 1. 运行架构（一句话版）
 
 - 每个动作是**一次性进程**：`pngshot region` 抓全屏 → 全屏 `wlr-layer-shell` 覆盖层选区 → 选完执行动作。
@@ -20,9 +37,9 @@ PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface
 
 ---
 
-## 2. 本次会话修复的 5 个 Bug（根因 + 位置 + 陷阱）
+## 2. 已修 Bug 与增强档案（根因 + 位置 + 陷阱）
 
-以下都是真实踩过的坑。改到相关代码时先读这里，别重蹈覆辙。
+以下都是真实踩过的坑，按发现顺序累积。改到相关代码时先读这里，别重蹈覆辙。**新修的 bug 请追加到本节末尾**，保留根因和陷阱，方便下一个接手的人。
 
 ### Bug 1 — 长截图控制面板白边
 - **现象**：面板圆角卡片四周有一圈白色。
@@ -117,18 +134,11 @@ PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface
 
 ---
 
-## 6. 已知未验证事项
+## 6. 验证状态
 
-以下改动在**无 Wayland GUI 的环境**下做的静态验证（编译+导入+API 存在性），实际视觉/交互行为需真机确认：
-
-- 面板透明白边是否消除（Bug 1）。
-- 涂鸦中长时间停顿不再消失（Bug 5）。
-- 长截图首用不再误报"重叠不足"（性能优化）。
-- 覆盖层拖选中途切工作区，~10s 后自动取消退出（Bug 3 逃生阀）。
-
-OCR 预处理增强是**用量化基准（渲染图 + 字符准确率打分）验证的**，非纯静态检查，可信度较高；但真实屏幕字体/DPI 与测试图仍有差异，以实际使用为准。
-
-日常使用中这些都已由本人手动确认可用；若回归，从对应 bug 条目的"根因"入手。
+- **已真机确认可用**（本人实际使用验证）：Bug 1~5 的修复、长截图首用不再误报"重叠不足"、OCR 杂乱背景（半透明窗口透壁纸）识别——最后一项已用真实截图确认，橙色标题和正文都能正确识别，剩余错误仅是 tesseract 引擎层固有歧义（O/0、全角标点等），非背景处理问题。
+- **验证方式**：GUI/交互类靠真机手动确认；OCR 类另有量化基准（渲染图 + 字符准确率打分，脚本是一次性的没入库，思路见各 bug 条目）。
+- **若回归**：从对应 bug 条目的"根因"入手，不要从症状表面改。多数 bug 的根因不在表象（例：OCR 崩溃真凶是背景纹理不是颜色；涂鸦消失真凶是 niri 焦点事件不可靠不是超时太短）。
 
 ---
 
