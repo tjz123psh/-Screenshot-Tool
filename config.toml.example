@@ -1,0 +1,29 @@
+# pngshot 配置示例
+# 复制到 ~/.config/pngshot/config.toml 后按需修改。
+# 不存在此文件时，全部使用下面的默认值。
+
+[llm]
+# provider: "opencode"（默认，走本机 opencode CLI 免费模型）或 "openai"（走 OPENAI_API_KEY）
+provider    = "opencode"
+# opencode 免费模型无需登录；也可换成 opencode models 里的其它模型
+model       = "opencode/deepseek-v4-flash-free"
+# 翻译目标语言（源语言自动识别）
+target_lang = "简体中文"
+# 单次翻译超时（秒）。opencode 冷启动约 2-5s
+timeout_s   = 30
+# 预留字段：未来复用常驻 opencode serve 时使用
+serve_port  = 47823
+
+[ocr]
+# tesseract 语言包，用 + 组合。已装：chi_sim eng osd
+langs = "chi_sim+eng"
+
+[longshot]
+# 采帧间隔（毫秒）。越小越跟手，越大越省 CPU
+poll_ms      = 200
+# 相邻帧位移小于此值视为"没在滚"，丢弃
+min_shift_px = 20
+# 重叠区匹配置信度阈值，低于此值触发"重叠不足"警告
+match_thresh = 0.90
+# 探针条高度（像素）。自适应会在需要时自动缩小
+probe_height = 150

@@ -1,0 +1,49 @@
+// pngshot — niri integration snippet
+// Merge the pieces you want into ~/.config/niri/config.kdl, then reload niri.
+// Nothing here is applied automatically by pngshot.
+
+// ---------------------------------------------------------------------------
+// 1) Deskpin window rule
+//
+// The pin window sets title "pngshot-pin". niri matches on title here so the
+// pinned screenshot always opens floating (niri's equivalent of "always on
+// top") without a border or focus ring.
+//
+// pngshot also calls `niri msg action move-window-to-floating` itself right
+// after the window maps, so this rule is optional — but adding it removes the
+// brief tiled flash and lets you fix a default size.
+
+window-rule {
+    match title="pngshot-pin"
+
+    open-floating true
+    // Keep the pin visually clean:
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+    // Optional: give every pin a sane starting size (it's still zoomable).
+    // default-column-width { fixed 800; }
+    // default-window-height { fixed 600; }
+}
+
+// The Stage-1 selection overlay is a layer-shell surface (namespace
+// "pngshot-overlay"), not a normal window, so it needs no window-rule.
+
+// ---------------------------------------------------------------------------
+// 2) Keybinds
+//
+// Put these inside your existing `binds { ... }` block.
+
+binds {
+    // Interactive region screenshot (Stage 1 overlay: select → toolbar).
+    Print { spawn "pngshot" "region"; }
+
+    // Region screenshot straight into long-shot mode.
+    Shift+Print { spawn "pngshot" "long"; }
+
+    // Pin whatever image is currently on the clipboard.
+    Mod+Print { spawn "pngshot" "pin-last"; }
+}
