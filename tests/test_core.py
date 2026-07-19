@@ -11,7 +11,7 @@ import cairo
 from PIL import Image
 
 from pngshot import config
-from pngshot import controller, diagnostics, fastctl
+from pngshot import controller, diagnostics, fastctl, shortcuts
 from pngshot import tray_config
 from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
@@ -112,6 +112,25 @@ class ControllerTests(unittest.TestCase):
             with mock.patch.object(fastctl, "_fallback", return_value=7) as fallback:
                 self.assertEqual(fastctl.main(["long"]), 7)
         fallback.assert_called_once_with(["long"])
+
+    def test_shortcut_discovery_lists_action_and_source_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.kdl"
+            config.write_text(
+                'binds {\n'
+                '  Shift+Print { spawn "pngshotctl" "long"; }\n'
+                '  Mod+Print hotkey-overlay-title="Pngshot" '
+                '{ spawn-sh "$HOME/.local/bin/pngshot region"; }\n'
+                '}\n'
+            )
+            found = shortcuts.discover(Path(directory))
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[0].key, "Shift+Print")
+        self.assertEqual(found[0].action, "long")
+        self.assertEqual(found[0].line, 2)
+        self.assertEqual(found[1].key, "Mod+Print")
+        self.assertEqual(found[1].action, "region")
+        self.assertEqual(found[1].line, 3)
 
     def test_niri_shortcut_check_follows_included_files(self):
         with tempfile.TemporaryDirectory() as directory:

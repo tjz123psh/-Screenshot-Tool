@@ -35,6 +35,7 @@ PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface
 - `scripts/pngshot`：开发用，`PNGSHOT_ROOT` 默认指向 `~/Projects/pngshot`（本仓库）。
 - `~/.local/bin/pngshot`：`install.sh` 一键安装生成的，指向独立克隆 `~/.local/share/pngshot`。
 - `~/.local/bin/pngshotctl`：指向同一启动器，推荐给 Niri 快捷键、状态栏和诊断调用。
+- 快捷键归 Niri `binds {}` 管理，pngshot 不注册全局热键；`pngshotctl shortcuts` 只读扫描被 include 的 `.kdl`，列出动作、按键和来源行号，不自动修改用户配置。
 - **系统日常用的是后者**，改本仓库源码不会影响已安装的命令，需重跑 `install.sh` 或直接跑 `scripts/pngshot`。
 
 ---

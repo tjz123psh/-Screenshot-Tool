@@ -86,6 +86,12 @@ pngshot region
 
 `pngshot` 与 `pngshotctl` 都会走同一套确认协议。新配置推荐使用 `pngshotctl`，便于区分“向服务发送动作”和内部一次性窗口进程。
 
+快捷键由 Niri 的 `binds {}` 负责注册，pngshot 不会抢占全局键盘，也不会自动改写你的 Niri 配置。要改按键，只需编辑实际被 include 的 `.kdl` 文件，把 `spawn-sh`（或 `spawn`）后面的动作保持为 `region`、`long`、`pin-last` 之一；修改后按你的 Niri 配置方式 reload。查看当前实际生效的 pngshot 绑定可以运行：
+
+```sh
+pngshotctl shortcuts
+```
+
 ### 服务状态
 
 安装后 `pngshot.service` 由 systemd 用户会话监管。即使服务没有运行，截图命令也会先自动拉起并重试；服务仍不可用时才回退原来的直接启动路径，因此不会因为后台服务故障而完全失去截图能力。
@@ -96,6 +102,7 @@ pngshotctl status --json   # Niri/Waybar/QuickShell 状态模块
 pngshotctl doctor          # 依赖、环境、OCR 语言、快捷键诊断
 pngshotctl restart         # 重启服务
 pngshotctl logs            # 最近 50 行日志
+pngshotctl shortcuts       # 列出 Niri 中实际配置的截图快捷键
 pngshotctl tray            # 手动启动托盘（通常由 systemd 自动启动）
 ```
 

@@ -136,6 +136,21 @@ def _cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_shortcuts(_args: argparse.Namespace) -> int:
+    from .shortcuts import action_label, config_dir, discover
+
+    root = config_dir()
+    bindings = discover(root)
+    print(f"Niri 快捷键配置：{root}")
+    if not bindings:
+        print("未发现 pngshot 快捷键。请参考 contrib/niri-pngshot.kdl")
+        return 1
+    for item in bindings:
+        print(f"{item.key:12} → {action_label(item.action):8} "
+              f"({item.path}:{item.line})")
+    return 0
+
+
 def _cmd_tray(_args: argparse.Namespace) -> int:
     from .tray import run
     return run()
@@ -230,6 +245,9 @@ def build_parser() -> argparse.ArgumentParser:
     logs = sub.add_parser("logs", help="show recent service logs")
     logs.add_argument("--lines", type=int, default=50)
     logs.set_defaults(func=_cmd_logs)
+
+    shortcuts = sub.add_parser("shortcuts", help="list configured Niri shortcuts")
+    shortcuts.set_defaults(func=_cmd_shortcuts)
 
     tray = sub.add_parser("tray", help="run the Pngshot system tray")
     tray.set_defaults(func=_cmd_tray)

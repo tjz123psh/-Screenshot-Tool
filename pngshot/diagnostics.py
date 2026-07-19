@@ -9,6 +9,7 @@ import shutil
 import subprocess
 
 from .controller import service_status
+from .shortcuts import discover
 
 
 @dataclass
@@ -125,17 +126,15 @@ def _shortcut_check() -> Check:
     config_dir = Path.home() / ".config/niri"
     if not config_dir.exists():
         return Check("shortcuts", "Niri 快捷键", "warning", "无法读取 niri 配置", False)
-    found = False
-    for path in config_dir.rglob("*.kdl"):
-        try:
-            text = path.read_text(errors="replace")
-        except OSError:
-            continue
-        if "Print" in text and "pngshot" in text:
-            found = True
-            break
+    bindings = discover(config_dir)
+    found = bool(bindings)
+    detail = "配置中已发现 " + ", ".join(
+        f"{item.key}→{item.action}" for item in bindings[:4]
+    ) if found else "未在 Niri 配置中发现 pngshot 快捷键"
+    if len(bindings) > 4:
+        detail += f" 等 {len(bindings)} 项"
     return Check(
         "shortcuts", "Niri 快捷键", "ok" if found else "warning",
-        "配置中已发现 Print + pngshot" if found else "未在主配置中发现 pngshot 快捷键",
+        detail,
         False,
     )
