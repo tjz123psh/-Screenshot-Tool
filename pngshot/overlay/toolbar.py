@@ -43,11 +43,11 @@ class ToolbarButton:
 
 # Order matters: this is what the user sees left-to-right.
 BUTTONS: list[ToolbarButton] = [
-    ToolbarButton("confirm",   "确认",   "Return", "⏎"),
-    ToolbarButton("annotate",  "涂鸦",   "d",      "D"),
+    ToolbarButton("confirm",   "完成",   "Return", "⏎"),
+    ToolbarButton("annotate",  "标注",   "d",      "D"),
     ToolbarButton("ocr",       "OCR",    "o",      "O"),
     ToolbarButton("translate", "翻译",   "t",      "T"),
-    ToolbarButton("pin",       "Pin",    "p",      "P"),
+    ToolbarButton("pin",       "钉图",   "p",      "P"),
     ToolbarButton("long",      "长截图", "l",      "L"),
     ToolbarButton("cancel",    "取消",   "Escape", "⎋"),
 ]
@@ -66,14 +66,18 @@ ANNOTATE_BUTTONS: list[ToolbarButton] = [
     ToolbarButton("anno.done",   "完成",   "Return", "⏎"),
 ]
 
-BTN_PAD_X = 12
+BTN_PAD_X = 11
 BTN_PAD_Y = 8
 BTN_GAP = 4
-BAR_MARGIN = 8          # gap between selection edge and toolbar
+GROUP_GAP = 9
+BAR_MARGIN = 10         # gap between selection edge and toolbar
 BAR_INNER_PAD = 6
-LABEL_FONT = "Sans 11"
+LABEL_FONT = "Sans 10.5"
 HINT_FONT = "Sans 8"
-CORNER_R = 6
+CORNER_R = 9
+
+# Read the toolbar as deliberate action groups: finish, tools, dismiss.
+GROUP_BREAK_BEFORE = {"annotate", "cancel", "anno.color", "anno.done"}
 
 
 def _pango_layout(cr: cairo.Context, text: str, font: str) -> Pango.Layout:
@@ -99,6 +103,7 @@ class Toolbar:
         self._label_sizes: dict[str, tuple[int, int]] = {}
         self._hint_sizes: dict[str, tuple[int, int]] = {}
         self._button_h: float = 0.0
+        self._separator_x: list[float] = []
 
     # ---- one-shot text measurement ---------------------------------------
 
@@ -122,8 +127,14 @@ class Toolbar:
         self._measure()
         bh = self._button_h
 
-        widths = [self._label_sizes[b.id][0] + BTN_PAD_X * 2 for b in self.buttons]
-        bar_w = sum(widths) + BTN_GAP * (len(self.buttons) - 1) + BAR_INNER_PAD * 2
+        widths = []
+        for b in self.buttons:
+            lw, _ = self._label_sizes[b.id]
+            hw, _ = self._hint_sizes.get(b.id, (0, 0))
+            widths.append(lw + hw + BTN_PAD_X * 2 + (8 if hw else 0))
+        group_count = sum(1 for b in self.buttons if b.id in GROUP_BREAK_BEFORE)
+        bar_w = (sum(widths) + BTN_GAP * (len(self.buttons) - 1)
+                 + GROUP_GAP * group_count + BAR_INNER_PAD * 2)
         bar_h = bh + BAR_INNER_PAD * 2
 
         # horizontal: center on selection, then clamp to screen
@@ -145,8 +156,12 @@ class Toolbar:
         self.bar_rect = (bar_x, bar_y, bar_w, bar_h)
 
         bx = bar_x + BAR_INNER_PAD
+        self._separator_x = []
         by = bar_y + BAR_INNER_PAD
         for b, w in zip(self.buttons, widths):
+            if b.id in GROUP_BREAK_BEFORE:
+                self._separator_x.append(bx - (BTN_GAP + GROUP_GAP / 2))
+                bx += GROUP_GAP
             b.x, b.y, b.w, b.h = bx, by, w, bh
             bx += w + BTN_GAP
 
@@ -175,38 +190,58 @@ class Toolbar:
         self.layout(sel, screen_w, screen_h)
         bx, by, bw, bh = self.bar_rect
 
-        # bar background
+        # Two crisp translucent layers give the floating palette depth without
+        # the muddy pseudo-shadow the previous single rectangle produced.
+        _rounded_rect(cr, bx + 1, by + 3, bw, bh, CORNER_R)
+        cr.set_source_rgba(0, 0, 0, 0.28)
+        cr.fill()
         _rounded_rect(cr, bx, by, bw, bh, CORNER_R)
-        cr.set_source_rgba(0.10, 0.10, 0.11, 0.92)
+        cr.set_source_rgba(0.09, 0.105, 0.14, 0.96)
         cr.fill_preserve()
-        cr.set_source_rgba(1, 1, 1, 0.08)
+        cr.set_source_rgba(0.76, 0.82, 0.96, 0.18)
         cr.set_line_width(1)
         cr.stroke()
+
+        for sx in self._separator_x:
+            cr.set_source_rgba(1, 1, 1, 0.13)
+            cr.set_line_width(1)
+            cr.move_to(sx, by + 7)
+            cr.line_to(sx, by + bh - 7)
+            cr.stroke()
 
         for b in self.buttons:
             hovered = b.id == hover_id
             active = b.id == active_id
             _rounded_rect(cr, b.x, b.y, b.w, b.h, CORNER_R - 2)
-            if active:
-                cr.set_source_rgba(0.20, 0.65, 0.45, 0.90)   # green = selected tool
+            if b.id in ("confirm", "anno.done"):
+                cr.set_source_rgba(0.39, 0.52, 0.91, 0.96)
+            elif active:
+                cr.set_source_rgba(0.34, 0.48, 0.88, 0.88)
+            elif b.id == "cancel" and hovered:
+                cr.set_source_rgba(0.56, 0.20, 0.26, 0.80)
             elif hovered:
-                cr.set_source_rgba(0.30, 0.55, 0.95, 0.85)
+                cr.set_source_rgba(0.30, 0.38, 0.58, 0.78)
             else:
-                cr.set_source_rgba(1, 1, 1, 0.05)
+                cr.set_source_rgba(1, 1, 1, 0.055)
             cr.fill()
 
-            # label (centered) — Pango
+            # Label + a quiet keycap; the old overlapping corner glyphs read
+            # like debug annotations rather than useful shortcuts.
             lw, lh = self._label_sizes[b.id]
-            cr.set_source_rgba(0.95, 0.96, 0.98, 1.0)
-            cr.move_to(b.x + (b.w - lw) / 2, b.y + (b.h - lh) / 2)
+            cr.set_source_rgba(0.97, 0.98, 1.0, 1.0)
+            cr.move_to(b.x + BTN_PAD_X, b.y + (b.h - lh) / 2 + 1)
             layout = _pango_layout(cr, b.label, LABEL_FONT)
             PangoCairo.show_layout(cr, layout)
 
-            # hint (top-right)
             if b.hint and b.id in self._hint_sizes:
                 hw, hh = self._hint_sizes[b.id]
-                cr.set_source_rgba(1, 1, 1, 0.55)
-                cr.move_to(b.x + b.w - hw - 4, b.y + 2)
+                key_x = b.x + b.w - hw - BTN_PAD_X
+                key_y = b.y + (b.h - hh) / 2
+                _rounded_rect(cr, key_x - 4, key_y - 2, hw + 8, hh + 4, 5)
+                cr.set_source_rgba(1, 1, 1, 0.10)
+                cr.fill()
+                cr.set_source_rgba(0.86, 0.90, 1.0, 0.72)
+                cr.move_to(key_x, key_y)
                 hlayout = _pango_layout(cr, b.hint, HINT_FONT)
                 PangoCairo.show_layout(cr, hlayout)
 

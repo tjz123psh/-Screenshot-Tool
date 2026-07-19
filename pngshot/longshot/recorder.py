@@ -139,6 +139,27 @@ class LongshotRecorder:
         self.root.set_margin_start(16)
         self.root.set_margin_end(16)
 
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content.set_margin_top(14)
+        content.set_margin_bottom(14)
+        content.set_margin_start(14)
+        content.set_margin_end(14)
+        self.root.append(content)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        live_dot = Gtk.Label(label="●")
+        live_dot.add_css_class("pngshot-live-dot")
+        header.append(live_dot)
+        title = Gtk.Label(label="长截图")
+        title.add_css_class("pngshot-title")
+        title.set_xalign(0.0)
+        title.set_hexpand(True)
+        header.append(title)
+        self.state = Gtk.Label(label="采集中")
+        self.state.add_css_class("pngshot-status-chip")
+        header.append(self.state)
+        content.append(header)
+
         # live preview of the stitched result
         self.preview = Gtk.Picture()
         self.preview.set_size_request(PREVIEW_W, PREVIEW_H)
@@ -146,36 +167,43 @@ class LongshotRecorder:
         frame = Gtk.Frame()
         frame.add_css_class("pngshot-preview")
         frame.set_child(self.preview)
-        self.root.append(frame)
+        content.append(frame)
 
-        # readout
-        self.status = Gtk.Label()
+        # Direction and measurements are separate typographic roles: the user
+        # sees what to do first, then the current capture facts.
+        self.status = Gtk.Label(label="预览会随滚动实时增长")
+        self.status.add_css_class("pngshot-title")
         self.status.set_wrap(True)
         self.status.set_max_width_chars(28)
         self.status.set_xalign(0.0)
-        self.root.append(self.status)
+        content.append(self.status)
+
+        self.metrics = Gtk.Label()
+        self.metrics.add_css_class("pngshot-dim")
+        self.metrics.set_xalign(0.0)
+        content.append(self.metrics)
 
         # instructions
-        hint = Gtk.Label(label="向上或向下滚动目标窗口，预览会实时增长")
-        hint.add_css_class("pngshot-dim")
+        hint = Gtk.Label(label="保持目标窗口在前台，向上或向下滚动")
+        hint.add_css_class("pngshot-caption")
         hint.set_wrap(True)
         hint.set_max_width_chars(28)
         hint.set_xalign(0.0)
-        self.root.append(hint)
+        content.append(hint)
 
         # buttons
         btnbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         btnbox.set_homogeneous(True)
         btnbox.set_margin_top(2)
-        cancel_btn = Gtk.Button(label="取消 (Esc)")
+        cancel_btn = Gtk.Button(label="取消  Esc")
         cancel_btn.add_css_class("pngshot-quiet")
         cancel_btn.connect("clicked", lambda _b: self._finish(cancel=True))
-        done_btn = Gtk.Button(label="完成 (Enter)")
+        done_btn = Gtk.Button(label="完成  Enter")
         done_btn.add_css_class("suggested-action")
         done_btn.connect("clicked", lambda _b: self._finish(cancel=False))
         btnbox.append(cancel_btn)
         btnbox.append(done_btn)
-        self.root.append(btnbox)
+        content.append(btnbox)
 
         self.window.set_child(self.root)
 
@@ -348,29 +376,26 @@ class LongshotRecorder:
         self.preview.set_pixbuf(_pil_to_pixbuf(thumb))
 
     def _update_status(self) -> None:
-        tail = (
-            f'已拼 {self._captured_height}px · '
-            f'{self.stitcher.frames_used} 帧'
-        )
+        tail = f"{self._captured_height:,} px  ·  {self.stitcher.frames_used} 帧"
+        self.metrics.set_text(tail)
         if self._hint == "low_overlap":
             self.root.add_css_class("pngshot-alert")
-            self.status.set_markup(
-                f'<span foreground="#ff7a85" weight="bold">⚠ 重叠不足，'
-                f'向回滚一点再继续</span>\n<span foreground="#c8cdd8">{tail}</span>'
-            )
+            self.state.set_text("需调整")
+            self.state.add_css_class("pngshot-error")
+            self.status.set_text("向回滚一点，恢复重叠后继续")
+            self.status.add_css_class("pngshot-error")
         elif self._hint == "no_move":
             self.root.remove_css_class("pngshot-alert")
-            self.status.set_markup(
-                f'<span foreground="#ffd479" weight="bold">↑↓ 滚动目标窗口（上下均可）</span>'
-                f'\n<span foreground="#c8cdd8">{tail}</span>'
-            )
+            self.state.set_text("等待滚动")
+            self.state.remove_css_class("pngshot-error")
+            self.status.set_text("向上或向下滚动目标窗口")
+            self.status.remove_css_class("pngshot-error")
         else:
             self.root.remove_css_class("pngshot-alert")
-            self.status.set_markup(
-                f'<span foreground="#8ab4ff" weight="bold">● 采集中</span>  '
-                f'<span foreground="#eef1f6">已拼 <b>{self._captured_height}px</b> · '
-                f'{self.stitcher.frames_used} 帧</span>'
-            )
+            self.state.set_text("采集中")
+            self.state.remove_css_class("pngshot-error")
+            self.status.set_text("预览会随滚动实时增长")
+            self.status.remove_css_class("pngshot-error")
 
     # ------------------------------------------------------------------
 

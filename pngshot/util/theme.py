@@ -24,7 +24,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
 # Bumped whenever the CSS below changes so a long-lived display re-loads it.
-_CSS_VERSION = 4
+_CSS_VERSION = 5
 _INSTALLED: set[int] = set()
 
 # Accent + surface palette. Kept in one block so the two windows never drift.
@@ -32,130 +32,169 @@ _INSTALLED: set[int] = set()
 #   surface     card background (semi-opaque dark, works over any wallpaper)
 #   text/dim    foreground tiers
 _CSS = b"""
-/* ---- card surface -------------------------------------------------- */
+/* pngshot's visual language: a dark camera-workbench surface with one calm
+   blue accent. These surfaces are deliberately opaque enough to remain legible
+   over a busy wallpaper while retaining a little of the desktop underneath. */
+.pngshot-card,
+.pngshot-window {
+  background-color: rgba(23, 26, 33, 0.97);
+  color: #f2f4f8;
+}
 .pngshot-card {
-  background-color: rgba(28, 30, 38, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 18px;
-  color: #e8eaf0;
-  /* Softer, more translucent drop shadow so the card floats without the
-     heavy "smudge" a single opaque shadow leaves on a dark background. */
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28),
-              0 14px 34px rgba(0, 0, 0, 0.40);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.30),
+              0 18px 42px rgba(0, 0, 0, 0.42);
+}
+.pngshot-window {
+  border: 1px solid rgba(255, 255, 255, 0.10);
 }
 
-/* headings inside a card */
-.pngshot-card .pngshot-title,
-.pngshot-window .pngshot-title {
-  font-size: 15px;
+.pngshot-title {
+  color: #f6f7fb;
+  font-size: 17px;
   font-weight: 700;
-  color: #f4f6fb;
 }
-
-.pngshot-card .pngshot-dim,
-.pngshot-window .pngshot-dim {
-  color: rgba(232, 234, 240, 0.55);
+.pngshot-eyebrow {
+  color: #8ea9ff;
+  font-size: 11px;
+  font-weight: 700;
+}
+.pngshot-dim {
+  color: rgba(232, 236, 245, 0.60);
+  font-size: 12px;
+}
+.pngshot-caption {
+  color: rgba(232, 236, 245, 0.45);
+  font-size: 11px;
+}
+.pngshot-error {
+  color: #ff8995;
+}
+.pngshot-success {
+  color: #7ed9ad;
+}
+.pngshot-status-chip {
+  background-color: rgba(142, 169, 255, 0.14);
+  border: 1px solid rgba(142, 169, 255, 0.22);
+  border-radius: 999px;
+  color: #b9c8ff;
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.pngshot-status-chip.pngshot-error {
+  background-color: rgba(255, 137, 149, 0.13);
+  border-color: rgba(255, 137, 149, 0.28);
+  color: #ffadb6;
+}
+.pngshot-live-dot {
+  color: #7ed9ad;
   font-size: 12px;
 }
 
-.pngshot-card .pngshot-error,
-.pngshot-window .pngshot-error {
-  color: #ff8c8c;
-}
-
-/* ---- preview frame (long-shot) ------------------------------------- */
+/* ---- preview and text surfaces ------------------------------------ */
 .pngshot-preview {
-  background-color: rgba(0, 0, 0, 0.35);
-  border: 1px solid rgba(255, 255, 255, 0.10);
+  background-color: rgba(8, 10, 14, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 12px;
-  padding: 4px;
+  padding: 5px;
 }
-
-/* the card turns its border red when overlap confidence drops, without a
-   layout shift (border width is unchanged, only the colour) */
 .pngshot-card.pngshot-alert {
-  border-color: rgba(255, 107, 107, 0.85);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28),
-              0 14px 34px rgba(0, 0, 0, 0.40),
-              0 0 0 1px rgba(255, 107, 107, 0.35);
+  border-color: rgba(255, 137, 149, 0.82);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.30),
+              0 18px 42px rgba(0, 0, 0, 0.42),
+              0 0 0 1px rgba(255, 137, 149, 0.20);
 }
-
-/* ---- text view (result window) ------------------------------------- */
+.pngshot-text-shell {
+  background-color: rgba(10, 12, 17, 0.74);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 13px;
+  padding: 1px;
+}
 .pngshot-textview {
-  background-color: rgba(0, 0, 0, 0.38);
-  border: 1px solid rgba(255, 255, 255, 0.10);
-  border-radius: 12px;
-  color: #eef0f6;
+  background-color: transparent;
+  color: #eef1f7;
   font-size: 14px;
 }
 .pngshot-textview text {
   background-color: transparent;
-  color: #eef0f6;
-  padding: 12px 16px;
+  color: #eef1f7;
+  padding: 14px 16px;
   line-height: 1.5;
 }
 .pngshot-textview text selection {
-  background-color: rgba(76, 116, 217, 0.55);
+  background-color: rgba(101, 132, 232, 0.60);
   color: #ffffff;
 }
+.pngshot-divider {
+  background-color: rgba(255, 255, 255, 0.10);
+  min-height: 1px;
+}
 
-/* ---- buttons ------------------------------------------------------- */
-.pngshot-card button,
-.pngshot-window button {
-  border-radius: 13px;
-  padding: 8px 18px;
-  font-weight: 600;
-  border: 1px solid rgba(255, 255, 255, 0.10);
+/* ---- action controls ------------------------------------------------ */
+.pngshot-window button,
+.pngshot-card button {
+  min-height: 34px;
+  border-radius: 10px;
+  padding: 7px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
   background-image: none;
-  background-color: rgba(255, 255, 255, 0.06);
-  color: #e8eaf0;
-  transition: background-color 120ms ease, border-color 120ms ease;
+  background-color: rgba(255, 255, 255, 0.065);
+  color: #edf0f6;
+  font-weight: 600;
   box-shadow: none;
   text-shadow: none;
 }
-.pngshot-card button:hover,
-.pngshot-window button:hover {
+.pngshot-window button:hover,
+.pngshot-card button:hover {
   background-color: rgba(255, 255, 255, 0.13);
-  border-color: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.20);
 }
-.pngshot-card button:active,
-.pngshot-window button:active {
-  background-color: rgba(255, 255, 255, 0.20);
+.pngshot-window button:active,
+.pngshot-card button:active {
+  background-color: rgba(255, 255, 255, 0.18);
 }
-.pngshot-card button:focus,
-.pngshot-window button:focus {
+.pngshot-window button:focus,
+.pngshot-card button:focus {
   outline: none;
-  border-color: rgba(76, 116, 217, 0.75);
+  border-color: rgba(142, 169, 255, 0.86);
 }
-
-/* primary / suggested action: filled accent */
-.pngshot-card button.suggested-action,
-.pngshot-window button.suggested-action {
-  background-image: none;
-  background-color: #4c74d9;
-  border-color: rgba(76, 116, 217, 0.0);
+.pngshot-window button.suggested-action,
+.pngshot-card button.suggested-action {
+  background-color: #6484e8;
+  border-color: #6484e8;
   color: #ffffff;
 }
-.pngshot-card button.suggested-action:hover,
-.pngshot-window button.suggested-action:hover {
-  background-color: #5b82e6;
+.pngshot-window button.suggested-action:hover,
+.pngshot-card button.suggested-action:hover {
+  background-color: #7594f2;
+  border-color: #7594f2;
 }
-.pngshot-card button.suggested-action:active,
-.pngshot-window button.suggested-action:active {
-  background-color: #4064c2;
+.pngshot-window button.suggested-action:active,
+.pngshot-card button.suggested-action:active {
+  background-color: #526fc8;
+  border-color: #526fc8;
 }
-
-/* destructive-ish (cancel) stays subtle unless hovered */
-.pngshot-card button.pngshot-quiet:hover,
-.pngshot-window button.pngshot-quiet:hover {
-  background-color: rgba(255, 107, 107, 0.18);
-  border-color: rgba(255, 107, 107, 0.45);
+.pngshot-window button.pngshot-quiet,
+.pngshot-card button.pngshot-quiet {
+  background-color: transparent;
+  border-color: transparent;
+  color: rgba(232, 236, 245, 0.64);
 }
-
-/* the whole result window surface */
-.pngshot-window {
-  background-color: rgba(28, 30, 38, 0.98);
-  color: #e8eaf0;
+.pngshot-window button.pngshot-quiet:hover,
+.pngshot-card button.pngshot-quiet:hover {
+  background-color: rgba(255, 137, 149, 0.14);
+  border-color: rgba(255, 137, 149, 0.28);
+  color: #ffadb6;
+}
+.pngshot-icon-button {
+  min-width: 34px;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.pngshot-footer {
+  padding-top: 2px;
 }
 
 /* Transparent window chrome for the long-shot control panel: the panel is a

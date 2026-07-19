@@ -57,6 +57,7 @@ class PinWindow:
         self._popover: Gtk.PopoverMenu | None = None
         self._notice = ""
         self._notice_source = 0
+        self._notice_error = False
 
         self.win_w, self.win_h = self._initial_window_size()
         # fit image into the initial window (contain)
@@ -70,6 +71,10 @@ class PinWindow:
         self.window.set_title("pngshot-pin")
         # app-id used by niri window rules (see contrib/niri snippet)
         self.window.set_default_size(self.win_w, self.win_h)
+
+        from ..util import theme
+        theme.apply(self.window)
+        self.window.add_css_class("pngshot-transparent")
 
         self.canvas = Gtk.DrawingArea()
         self.canvas.set_draw_func(self._on_draw)
@@ -196,7 +201,7 @@ class PinWindow:
         self.scale = new_scale
         self.off_x = self._ptr_x - img_x * new_scale
         self.off_y = self._ptr_y - img_y * new_scale
-        self.canvas.queue_draw()
+        self._show_notice(f"缩放  {self.scale * 100:.0f}%")
 
     def _zoom_window(self, dy: float) -> None:
         # Whole-tile zoom: resize the *window itself* so the whole sticker
@@ -225,7 +230,7 @@ class PinWindow:
         if not applied:
             # fallback: best-effort GTK resize (mainly pre-map / non-niri)
             self.window.set_default_size(new_w, new_h)
-        self.canvas.queue_draw()
+        self._show_notice(f"窗口  {new_w} × {new_h}")
 
     def _on_key(self, _kc, keyval: int, _kc2: int, _state) -> bool:
         name = Gdk.keyval_name(keyval) or ""
@@ -259,10 +264,10 @@ class PinWindow:
     def _act_copy(self) -> None:
         try:
             clipboard.copy_image(self.img)
-            self._show_notice("已复制")
+            self._show_notice("已复制到剪贴板")
         except Exception as e:  # noqa: BLE001
             print(f"[pngshot] copy failed: {e}")
-            self._show_notice("复制失败")
+            self._show_notice("复制失败", error=True)
 
     def _act_save(self) -> None:
         try:
@@ -271,19 +276,20 @@ class PinWindow:
             self._show_notice("截图已保存")
         except Exception as e:  # noqa: BLE001
             print(f"[pngshot] save failed: {e}")
-            self._show_notice("保存失败")
+            self._show_notice("保存失败", error=True)
 
     def _act_reset(self) -> None:
         self.scale = 1.0
         self.off_x = (self.win_w - self.iw) / 2
         self.off_y = (self.win_h - self.ih) / 2
-        self.canvas.queue_draw()
+        self._show_notice("缩放  100%")
 
     def _act_close(self) -> None:
         self.window.close()
 
-    def _show_notice(self, text: str) -> None:
+    def _show_notice(self, text: str, *, error: bool = False) -> None:
         self._notice = text
+        self._notice_error = error
         if self._notice_source:
             GLib.source_remove(self._notice_source)
         self._notice_source = GLib.timeout_add(1600, self._clear_notice)
@@ -292,6 +298,7 @@ class PinWindow:
     def _clear_notice(self) -> bool:
         self._notice_source = 0
         self._notice = ""
+        self._notice_error = False
         self.canvas.queue_draw()
         return False
 
@@ -300,9 +307,17 @@ class PinWindow:
 
     def _on_draw(self, _da, ctx, w: int, h: int) -> None:
         self.win_w, self.win_h = w, h
-        # checkerboard-ish dark backdrop for the empty area
-        ctx.set_source_rgba(0.12, 0.12, 0.13, 1.0)
+        # A restrained checkerboard makes transparent/empty image bounds clear
+        # without competing with the screenshot itself.
+        ctx.set_source_rgba(0.055, 0.065, 0.085, 1.0)
         ctx.paint()
+        cell = 18
+        ctx.set_source_rgba(1, 1, 1, 0.025)
+        for yy in range(0, h, cell):
+            for xx in range(0, w, cell):
+                if (xx // cell + yy // cell) % 2 == 0:
+                    ctx.rectangle(xx, yy, cell, cell)
+        ctx.fill()
 
         ctx.save()
         ctx.translate(self.off_x, self.off_y)
@@ -312,6 +327,13 @@ class PinWindow:
         ctx.get_source().set_filter(cairo_filter(self.scale))
         ctx.paint()
         ctx.restore()
+
+        # niri's rule removes compositor borders for pinned images. Retain a
+        # subtle inner edge so light screenshots still have a visible boundary.
+        ctx.rectangle(0.5, 0.5, max(0, w - 1), max(0, h - 1))
+        ctx.set_source_rgba(1, 1, 1, 0.18)
+        ctx.set_line_width(1)
+        ctx.stroke()
 
         if self._notice:
             self._draw_notice(ctx, w, h, self._notice)
@@ -329,9 +351,15 @@ class PinWindow:
         bx = (width - bw) / 2
         by = height - bh - 18
         ctx.save()
-        ctx.set_source_rgba(0.08, 0.09, 0.11, 0.92)
+        if self._notice_error:
+            ctx.set_source_rgba(0.30, 0.09, 0.12, 0.95)
+        else:
+            ctx.set_source_rgba(0.075, 0.09, 0.13, 0.95)
         _rounded_rect(ctx, bx, by, bw, bh, 10)
-        ctx.fill()
+        ctx.fill_preserve()
+        ctx.set_source_rgba(1, 1, 1, 0.16)
+        ctx.set_line_width(1)
+        ctx.stroke()
         ctx.set_source_rgba(1, 1, 1, 0.92)
         ctx.move_to(bx + pad_x, by + pad_y)
         PangoCairo.show_layout(ctx, layout)

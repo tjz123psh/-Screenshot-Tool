@@ -469,7 +469,7 @@ class OverlaySurface:
         ctx.paint()
 
         # 2) dim overlay everywhere except inside the selection
-        ctx.set_source_rgba(0, 0, 0, 0.45)
+        ctx.set_source_rgba(0.025, 0.03, 0.045, 0.56)
         r = self.selector.rect
         if r.valid:
             # dim by drawing four rectangles around the selection
@@ -484,8 +484,8 @@ class OverlaySurface:
             ctx.fill()
 
             # 3) selection border
-            ctx.set_source_rgba(0.30, 0.75, 1.0, 1.0)
-            ctx.set_line_width(1.5)
+            ctx.set_source_rgba(0.39, 0.52, 0.91, 1.0)
+            ctx.set_line_width(2)
             ctx.rectangle(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1)
             ctx.stroke()
 
@@ -529,42 +529,48 @@ class OverlaySurface:
     # ---- draw helpers -----------------------------------------------------
 
     def _draw_handles(self, ctx: cairo.Context, r: Rect) -> None:
-        size = 8
+        size = 9
         for _name, hx, hy in handle_positions(r):
-            ctx.set_source_rgba(1, 1, 1, 1)
-            ctx.rectangle(hx - size / 2, hy - size / 2, size, size)
+            ctx.arc(hx, hy, size / 2, 0, 2 * 3.141592653589793)
+            ctx.set_source_rgba(0.96, 0.97, 1.0, 1.0)
             ctx.fill_preserve()
-            ctx.set_source_rgba(0.30, 0.75, 1.0, 1.0)
-            ctx.set_line_width(1)
+            ctx.set_source_rgba(0.39, 0.52, 0.91, 1.0)
+            ctx.set_line_width(2)
             ctx.stroke()
 
     def _draw_size_hint(self, ctx: cairo.Context, text: str, r: Rect) -> None:
-        tw, th = _pango_measure(ctx, text, 12)
-        pad = 4
-        bw = tw + pad * 2
-        bh = th + pad * 2
+        tw, th = _pango_measure(ctx, text, 11)
+        pad_x, pad_y = 9, 5
+        bw = tw + pad_x * 2
+        bh = th + pad_y * 2
         bx = r.x
-        by = r.y - bh - 4
+        by = r.y - bh - 7
         if by < 0:
-            by = r.y + 4
-        ctx.set_source_rgba(0, 0, 0, 0.75)
-        ctx.rectangle(bx, by, bw, bh)
-        ctx.fill()
-        ctx.set_source_rgba(1, 1, 1, 1)
-        _pango_draw(ctx, text, bx + pad, by + pad, 12)
+            by = r.y + 7
+        _rounded_rect(ctx, bx, by, bw, bh, 7)
+        ctx.set_source_rgba(0.09, 0.105, 0.14, 0.94)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(0.76, 0.82, 0.96, 0.22)
+        ctx.set_line_width(1)
+        ctx.stroke()
+        ctx.set_source_rgba(0.93, 0.95, 1.0, 1)
+        _pango_draw(ctx, text, bx + pad_x, by + pad_y, 11)
 
     def _draw_center_hint(self, ctx: cairo.Context, text: str, w: int, h: int) -> None:
-        tw, th = _pango_measure(ctx, text, 14)
-        pad = 10
-        bw = tw + pad * 2
-        bh = th + pad * 2
+        tw, th = _pango_measure(ctx, text, 13)
+        pad_x, pad_y = 16, 10
+        bw = tw + pad_x * 2
+        bh = th + pad_y * 2
         bx = (w - bw) / 2
         by = h - bh - 40
-        ctx.set_source_rgba(0, 0, 0, 0.6)
-        ctx.rectangle(bx, by, bw, bh)
-        ctx.fill()
-        ctx.set_source_rgba(1, 1, 1, 0.9)
-        _pango_draw(ctx, text, bx + pad, by + pad, 14)
+        _rounded_rect(ctx, bx, by, bw, bh, 10)
+        ctx.set_source_rgba(0.09, 0.105, 0.14, 0.92)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(1, 1, 1, 0.14)
+        ctx.set_line_width(1)
+        ctx.stroke()
+        ctx.set_source_rgba(0.93, 0.95, 1.0, 0.92)
+        _pango_draw(ctx, text, bx + pad_x, by + pad_y, 13)
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +597,18 @@ def _pango_draw(ctx: cairo.Context, text: str, x: float, y: float, size_pt: floa
     layout = _pango_layout(ctx, text, size_pt)
     ctx.move_to(x, y)
     PangoCairo.show_layout(ctx, layout)
+
+
+def _rounded_rect(cr: cairo.Context, x: float, y: float,
+                  w: float, h: float, radius: float) -> None:
+    import math
+    radius = min(radius, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - radius, y + radius, radius, -math.pi / 2, 0)
+    cr.arc(x + w - radius, y + h - radius, radius, 0, math.pi / 2)
+    cr.arc(x + radius, y + h - radius, radius, math.pi / 2, math.pi)
+    cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    cr.close_path()
 
 
 def _cairo_surface_to_pil(surface: cairo.ImageSurface) -> Image.Image:

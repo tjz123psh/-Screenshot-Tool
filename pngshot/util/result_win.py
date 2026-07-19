@@ -18,8 +18,9 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("Pango", "1.0")
 
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from PIL import Image  # noqa: E402
 
@@ -28,6 +29,17 @@ from ..services import clipboard
 from ..util import niri
 
 APP_ID = "ai.pngshot.result"
+
+
+def _action_button(label: str, icon_name: str) -> Gtk.Button:
+    """Create a compact GNOME-style text action with a symbolic icon."""
+    content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+    content.append(Gtk.Image.new_from_icon_name(icon_name))
+    content.append(Gtk.Label(label=label))
+    button = Gtk.Button()
+    button.set_child(content)
+    button.set_tooltip_text(label)
+    return button
 
 
 class ResultWindow:
@@ -40,33 +52,71 @@ class ResultWindow:
         self._closed = False
         self._translation_busy = False
         self.window = Gtk.ApplicationWindow(application=app)
-        self.window.set_title("pngshot-result")
-        self.window.set_default_size(560, 400)
+        self.window.set_title("提取的文字" if mode == "ocr" else "翻译结果")
+        self.window.set_default_size(560, 420)
 
         from ..util import theme
         theme.apply(self.window)
         self.window.add_css_class("pngshot-window")
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        root.set_margin_top(16)
-        root.set_margin_bottom(16)
-        root.set_margin_start(18)
-        root.set_margin_end(18)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.window.set_child(root)
 
-        # header
-        title = "OCR 结果" if mode == "ocr" else "翻译结果"
-        header = Gtk.Label(label=title)
-        header.add_css_class("pngshot-title")
-        header.set_xalign(0.0)
+        # A compact, self-contained header is used instead of relying on the
+        # compositor title bar: the user's niri config prefers no CSD and the
+        # window's job should remain obvious in either decoration mode.
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header.set_margin_top(16)
+        header.set_margin_bottom(14)
+        header.set_margin_start(18)
+        header.set_margin_end(14)
+
+        mode_badge = Gtk.Label(label="OCR" if mode == "ocr" else "译")
+        mode_badge.add_css_class("pngshot-status-chip")
+        mode_badge.set_valign(Gtk.Align.CENTER)
+        header.append(mode_badge)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        title_box.set_hexpand(True)
+        title = Gtk.Label(label="提取的文字" if mode == "ocr" else "翻译结果")
+        title.add_css_class("pngshot-title")
+        title.set_xalign(0.0)
+        title_box.append(title)
+        subtitle = Gtk.Label(label=(
+            "可直接编辑，再复制或翻译"
+            if mode == "ocr" else "可直接编辑或复制到剪贴板"
+        ))
+        subtitle.add_css_class("pngshot-dim")
+        subtitle.set_xalign(0.0)
+        title_box.append(subtitle)
+        header.append(title_box)
+
+        close_btn = Gtk.Button.new_from_icon_name("window-close-symbolic")
+        close_btn.add_css_class("pngshot-quiet")
+        close_btn.add_css_class("pngshot-icon-button")
+        close_btn.set_tooltip_text("关闭")
+        close_btn.set_valign(Gtk.Align.CENTER)
+        close_btn.connect("clicked", lambda _b: self.window.close())
+        header.append(close_btn)
         root.append(header)
 
+        divider = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        divider.add_css_class("pngshot-divider")
+        root.append(divider)
+
         # text area (editable, scrollable) inside a rounded card
+        text_shell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        text_shell.add_css_class("pngshot-text-shell")
+        text_shell.set_margin_top(14)
+        text_shell.set_margin_bottom(12)
+        text_shell.set_margin_start(18)
+        text_shell.set_margin_end(18)
+        text_shell.set_vexpand(True)
         scroller = Gtk.ScrolledWindow()
         scroller.set_vexpand(True)
         scroller.set_hexpand(True)
-        scroller.add_css_class("pngshot-textview")
         self.textview = Gtk.TextView()
+        self.textview.add_css_class("pngshot-textview")
         self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.textview.get_buffer().set_text(text)
         self.textview.set_monospace(False)
@@ -75,44 +125,51 @@ class ResultWindow:
         self.textview.set_top_margin(4)
         self.textview.set_bottom_margin(4)
         scroller.set_child(self.textview)
-        root.append(scroller)
+        text_shell.append(scroller)
+        root.append(text_shell)
 
-        # Status line doubles as a compact progress indicator.  A spinner is
-        # clearer than changing text alone while OCR or translation is running.
+        # The footer reserves a stable place for transient feedback so copying
+        # text never causes the buttons to jump.
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        footer.add_css_class("pngshot-footer")
+        footer.set_margin_bottom(16)
+        footer.set_margin_start(18)
+        footer.set_margin_end(18)
+
         status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        status_row.set_hexpand(True)
+        status_row.set_valign(Gtk.Align.CENTER)
         self.spinner = Gtk.Spinner()
         status_row.append(self.spinner)
         self.status = Gtk.Label(label="")
         self.status.add_css_class("pngshot-dim")
         self.status.set_xalign(0.0)
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
         status_row.append(self.status)
-        status_row.set_visible(False)
+        self.spinner.set_visible(False)
+        self.status.set_visible(False)
         self.status_row = status_row
-        root.append(status_row)
+        footer.append(status_row)
 
-        # button row
-        btnbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btnbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btnbox.set_halign(Gtk.Align.END)
-        btnbox.set_margin_top(2)
 
-        copy_btn = Gtk.Button(label="复制")
+        copy_btn = _action_button("复制", "edit-copy-symbolic")
         copy_btn.connect("clicked", self._on_copy)
         self.copy_btn = copy_btn
         btnbox.append(copy_btn)
 
         if mode == "ocr":
-            trans_btn = Gtk.Button(label="翻译")
+            trans_btn = _action_button("翻译", "preferences-desktop-locale-symbolic")
             trans_btn.add_css_class("suggested-action")
             trans_btn.connect("clicked", self._on_translate)
             self.translate_btn = trans_btn
             btnbox.append(trans_btn)
+        else:
+            copy_btn.add_css_class("suggested-action")
 
-        close_btn = Gtk.Button(label="关闭")
-        close_btn.add_css_class("pngshot-quiet")
-        close_btn.connect("clicked", lambda _b: self.window.close())
-        btnbox.append(close_btn)
-
-        root.append(btnbox)
+        footer.append(btnbox)
+        root.append(footer)
 
         # Esc closes
         key = Gtk.EventControllerKey.new()
@@ -212,7 +269,9 @@ class ResultWindow:
         return False
 
     def _set_busy(self, busy: bool) -> None:
-        self.status_row.set_visible(busy or bool(self.status.get_text()))
+        self.status_row.set_visible(True)
+        self.spinner.set_visible(busy)
+        self.status.set_visible(bool(self.status.get_text()))
         if busy:
             self.spinner.start()
         else:
