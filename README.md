@@ -18,7 +18,7 @@
   - 任意位置拖动 = 移动窗口
   - `c` 复制，`s` 保存，`0` 重置缩放，`q`/`Esc` 关闭，右键菜单
 - **长截图** —— 半自动。Wayland 禁止合成滚动事件，所以由你手动滚动目标窗口，pngshot 按定时采样选区，并用 OpenCV 模板匹配拼接各帧。`Space` 强制取一帧，`Enter` 完成，`Esc` 取消。
-- **可靠的快捷键服务** —— 轻量后台服务确认每次调用；异常退出自动重启，动作启动失败会显示桌面通知并记录日志。
+- **可靠的快捷键服务** —— 轻量后台服务确认每次调用；`pngshotctl` 的截图热键走精简 socket 客户端，健康服务下不加载完整 CLI，异常时自动拉起并回退；动作启动失败会显示桌面通知并记录日志。
 - **系统托盘** —— 常驻相机图标显示就绪/截图中/异常；菜单直接提供区域截图、长截图、钉图、保存/复制偏好、诊断和重启。
 
 ## 一键安装
@@ -138,6 +138,7 @@ pngshotctl tray            # 手动启动托盘（通常由 systemd 自动启动
 ```
 pngshot/
   __main__.py        CLI（region / long / pin-last / pin-file / text-file / debug）
+  fastctl.py         快捷键热路径的精简 Unix socket 客户端
   controller.py      Unix socket 后台服务、动作确认、自愈与失败通知
   tray.py            GTK3/Ayatana 系统托盘与传统 dbusmenu 右键菜单
   diagnostics.py     Wayland/Niri/截图/OCR/翻译环境检查

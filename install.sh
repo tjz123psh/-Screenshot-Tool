@@ -86,6 +86,16 @@ set -euo pipefail
 PNGSHOT_ROOT="\${PNGSHOT_ROOT:-$SRC_DIR}"
 export PYTHONPATH="\$PNGSHOT_ROOT\${PYTHONPATH:+:\$PYTHONPATH}"
 
+# 健康服务的快捷键热路径：避免每次按键加载完整 CLI 和 GTK 预加载。
+# 服务缺失时 fastctl 会补回预加载并 exec 普通入口，保留完整兜底。
+case "\${1:-}" in
+    region|long|pin-last)
+        if [[ "\${PNGSHOT_BYPASS_SERVICE:-0}" != "1" ]]; then
+            exec python3 -m pngshot.fastctl "\$@"
+        fi
+        ;;
+esac
+
 # gtk4-layer-shell 必须在 libwayland-client 之前加载；PyGObject 的链接顺序相反，
 # 因此预加载官方推荐的 shim 修复 layer-shell 失效问题。
 _LAYER_SHELL_LIB="/usr/lib/libgtk4-layer-shell.so"

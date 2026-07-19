@@ -11,7 +11,7 @@ import cairo
 from PIL import Image
 
 from pngshot import config
-from pngshot import controller, diagnostics
+from pngshot import controller, diagnostics, fastctl
 from pngshot import tray_config
 from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
@@ -97,6 +97,21 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(controller.route_action("long", []), (True, 0))
         self.assertEqual(request.call_count, 2)
         ensure.assert_called_once_with()
+
+    def test_fast_hotkey_client_uses_running_service(self):
+        with mock.patch.object(
+            fastctl, "_request", return_value={"accepted": True}
+        ) as request:
+            with mock.patch.object(fastctl, "_fallback") as fallback:
+                self.assertEqual(fastctl.main(["region", "--no-save"]), 0)
+        request.assert_called_once_with("region", ["--no-save"])
+        fallback.assert_not_called()
+
+    def test_fast_hotkey_client_falls_back_when_service_is_missing(self):
+        with mock.patch.object(fastctl, "_request", return_value=None):
+            with mock.patch.object(fastctl, "_fallback", return_value=7) as fallback:
+                self.assertEqual(fastctl.main(["long"]), 7)
+        fallback.assert_called_once_with(["long"])
 
     def test_niri_shortcut_check_follows_included_files(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,17 @@ set -euo pipefail
 PNGSHOT_ROOT="${PNGSHOT_ROOT:-$HOME/Projects/pngshot}"
 export PYTHONPATH="$PNGSHOT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
+# Healthy-service hot path: avoid loading the full argparse/controller stack
+# or GTK preload for every key press. fastctl restores the preload itself if
+# it needs to exec the normal CLI for service activation/fallback.
+case "${1:-}" in
+    region|long|pin-last)
+        if [[ "${PNGSHOT_BYPASS_SERVICE:-0}" != "1" ]]; then
+            exec python3 -m pngshot.fastctl "$@"
+        fi
+        ;;
+esac
+
 # gtk4-layer-shell must be loaded before libwayland-client; PyGObject links
 # them in the wrong order, so preload the shim (upstream-recommended fix).
 _LAYER_SHELL_LIB="/usr/lib/libgtk4-layer-shell.so"
