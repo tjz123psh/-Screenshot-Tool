@@ -19,12 +19,16 @@ normal window and everything else works.
 """
 from __future__ import annotations
 
+import math
+
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
 
-from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from ..services import clipboard, saver
@@ -50,6 +54,9 @@ class PinWindow:
         self.off_x = 0.0
         self.off_y = 0.0
         self._niri_id: int | None = None   # our window id in niri (set on map)
+        self._popover: Gtk.PopoverMenu | None = None
+        self._notice = ""
+        self._notice_source = 0
 
         self.win_w, self.win_h = self._initial_window_size()
         # fit image into the initial window (contain)
@@ -133,6 +140,14 @@ class PinWindow:
         rc.set_button(Gdk.BUTTON_SECONDARY)
         rc.connect("pressed", self._on_right_click)
         self.canvas.add_controller(rc)
+
+        menu = Gio.Menu()
+        menu.append("复制", "win.copy")
+        menu.append("保存", "win.save")
+        menu.append("重置缩放", "win.reset")
+        menu.append("关闭", "win.close")
+        self._popover = Gtk.PopoverMenu.new_from_model(menu)
+        self._popover.set_parent(self.canvas)
 
         # track pointer for anchored zoom
         self._ptr_x = self.win_w / 2
@@ -229,13 +244,9 @@ class PinWindow:
         return False
 
     def _on_right_click(self, _g, _n, x: float, y: float) -> None:
-        menu = Gio.Menu()
-        menu.append("复制", "win.copy")
-        menu.append("保存", "win.save")
-        menu.append("重置缩放", "win.reset")
-        menu.append("关闭", "win.close")
-        pop = Gtk.PopoverMenu.new_from_model(menu)
-        pop.set_parent(self.canvas)
+        pop = self._popover
+        if pop is None:
+            return
         pop.set_has_arrow(True)
         rect = Gdk.Rectangle()
         rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
@@ -248,15 +259,19 @@ class PinWindow:
     def _act_copy(self) -> None:
         try:
             clipboard.copy_image(self.img)
+            self._show_notice("已复制")
         except Exception as e:  # noqa: BLE001
             print(f"[pngshot] copy failed: {e}")
+            self._show_notice("复制失败")
 
     def _act_save(self) -> None:
         try:
             path = saver.save_image(self.img, prefix="pngshot-pin")
             print(f"saved: {path}")
+            self._show_notice("截图已保存")
         except Exception as e:  # noqa: BLE001
             print(f"[pngshot] save failed: {e}")
+            self._show_notice("保存失败")
 
     def _act_reset(self) -> None:
         self.scale = 1.0
@@ -266,6 +281,19 @@ class PinWindow:
 
     def _act_close(self) -> None:
         self.window.close()
+
+    def _show_notice(self, text: str) -> None:
+        self._notice = text
+        if self._notice_source:
+            GLib.source_remove(self._notice_source)
+        self._notice_source = GLib.timeout_add(1600, self._clear_notice)
+        self.canvas.queue_draw()
+
+    def _clear_notice(self) -> bool:
+        self._notice_source = 0
+        self._notice = ""
+        self.canvas.queue_draw()
+        return False
 
     # ------------------------------------------------------------------
     # drawing
@@ -285,11 +313,45 @@ class PinWindow:
         ctx.paint()
         ctx.restore()
 
+        if self._notice:
+            self._draw_notice(ctx, w, h, self._notice)
+
+    def _draw_notice(self, ctx, width: int, height: int, text: str) -> None:
+        layout = PangoCairo.create_layout(ctx)
+        desc = Pango.FontDescription()
+        desc.set_family("Sans")
+        desc.set_absolute_size(12 * Pango.SCALE)
+        layout.set_font_description(desc)
+        layout.set_text(text, -1)
+        tw, th = layout.get_pixel_size()
+        pad_x, pad_y = 12, 7
+        bw, bh = tw + pad_x * 2, th + pad_y * 2
+        bx = (width - bw) / 2
+        by = height - bh - 18
+        ctx.save()
+        ctx.set_source_rgba(0.08, 0.09, 0.11, 0.92)
+        _rounded_rect(ctx, bx, by, bw, bh, 10)
+        ctx.fill()
+        ctx.set_source_rgba(1, 1, 1, 0.92)
+        ctx.move_to(bx + pad_x, by + pad_y)
+        PangoCairo.show_layout(ctx, layout)
+        ctx.restore()
+
 
 def cairo_filter(scale: float):
     import cairo
     # when zoomed way in, GOOD/ nearest keeps pixels crisp; else bilinear
     return cairo.Filter.NEAREST if scale >= 3 else cairo.Filter.GOOD
+
+
+def _rounded_rect(cr, x: float, y: float, w: float, h: float, radius: float) -> None:
+    radius = min(radius, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - radius, y + radius, radius, -math.pi / 2, 0)
+    cr.arc(x + w - radius, y + h - radius, radius, 0, math.pi / 2)
+    cr.arc(x + radius, y + h - radius, radius, math.pi / 2, math.pi)
+    cr.arc(x + radius, y + radius, radius, math.pi, 3 * math.pi / 2)
+    cr.close_path()
 
 
 # ---------------------------------------------------------------------------

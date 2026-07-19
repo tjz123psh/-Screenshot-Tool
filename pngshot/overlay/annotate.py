@@ -62,6 +62,11 @@ class Annotator:
         self._active: Stroke | None = None
         # text editing
         self.editing_text: Stroke | None = None
+        # Completed strokes are rasterized once.  The overlay can receive
+        # hundreds of motion events per second; replaying every old pen point
+        # on each frame made long annotations increasingly expensive.
+        self._cache: cairo.ImageSurface | None = None
+        self._cache_origin: tuple[int, int] = (0, 0)
 
     # ---- properties ------------------------------------------------------
 
@@ -92,6 +97,7 @@ class Annotator:
             return
         if self.strokes:
             self.strokes.pop()
+            self._rebuild_cache()
 
     def has_content(self) -> bool:
         return bool(self.strokes) or self.editing_text is not None
@@ -119,6 +125,12 @@ class Annotator:
         if s is None:
             return
         if s.tool == "pen":
+            # GTK can report identical or sub-pixel-neighbouring motion events
+            # at a much higher rate than the display refreshes.  They do not
+            # change the visible stroke, so discard them before storing points.
+            lx, ly = s.points[-1]
+            if (x - lx) ** 2 + (y - ly) ** 2 < 1.0:
+                return
             s.points.append((x, y))
         else:  # arrow / rect: move the end point
             s.points[1] = (x, y)
@@ -130,13 +142,13 @@ class Annotator:
             return
         if s.tool == "pen":
             if len(s.points) >= 2:
-                self.strokes.append(s)
+                self._append_stroke(s)
         else:
             s.points[1] = (x, y)
             # ignore zero-size drags
             (x0, y0), (x1, y1) = s.points
             if abs(x1 - x0) > 2 or abs(y1 - y0) > 2:
-                self.strokes.append(s)
+                self._append_stroke(s)
 
     # ---- text editing ----------------------------------------------------
 
@@ -151,7 +163,7 @@ class Annotator:
     def _commit_text(self) -> None:
         if self.editing_text is not None:
             if self.editing_text.text.strip():
-                self.strokes.append(self.editing_text)
+                self._append_stroke(self.editing_text)
             self.editing_text = None
 
     def commit_text(self) -> None:
@@ -159,9 +171,45 @@ class Annotator:
 
     # ---- rendering -------------------------------------------------------
 
+    def begin_canvas(self, rect) -> None:
+        """Prepare a transparent cache for the fixed annotation selection."""
+        self._cache_origin = (int(rect.x), int(rect.y))
+        width, height = int(rect.w), int(rect.h)
+        if width <= 0 or height <= 0:
+            self._cache = None
+            return
+        self._cache = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        self._rebuild_cache()
+
+    def _append_stroke(self, stroke: Stroke) -> None:
+        self.strokes.append(stroke)
+        self._draw_to_cache(stroke)
+
+    def _draw_to_cache(self, stroke: Stroke) -> None:
+        if self._cache is None:
+            return
+        cr = cairo.Context(self._cache)
+        cr.translate(-self._cache_origin[0], -self._cache_origin[1])
+        self._draw_stroke(cr, stroke)
+        self._cache.flush()
+
+    def _rebuild_cache(self) -> None:
+        if self._cache is None:
+            return
+        cr = cairo.Context(self._cache)
+        cr.set_operator(cairo.Operator.CLEAR)
+        cr.paint()
+        cr.set_operator(cairo.Operator.OVER)
+        for stroke in self.strokes:
+            self._draw_to_cache(stroke)
+
     def draw(self, cr: cairo.Context) -> None:
-        for s in self.strokes:
-            self._draw_stroke(cr, s)
+        if self._cache is not None:
+            cr.set_source_surface(self._cache, *self._cache_origin)
+            cr.paint()
+        else:
+            for s in self.strokes:
+                self._draw_stroke(cr, s)
         if self._active is not None:
             self._draw_stroke(cr, self._active)
         if self.editing_text is not None:
@@ -232,15 +280,19 @@ class Annotator:
         selection in screen coords. Returns a new ARGB surface of the crop size
         with annotations burned in.
         """
-        out = cairo.ImageSurface(cairo.FORMAT_ARGB32, rect.w, rect.h)
+        out = cairo.ImageSurface(cairo.FORMAT_ARGB32, int(rect.w), int(rect.h))
         cr = cairo.Context(out)
         # blit the cropped region of the background
         cr.set_source_surface(base_surface, -rect.x, -rect.y)
         cr.paint()
-        # translate so screen-space strokes land in crop-space
-        cr.translate(-rect.x, -rect.y)
         # make sure any in-progress text is included
         self._commit_text()
-        self.draw(cr)
+        if self._cache is not None:
+            cr.set_source_surface(self._cache, 0, 0)
+            cr.paint()
+        else:
+            # translate so screen-space strokes land in crop-space
+            cr.translate(-rect.x, -rect.y)
+            self.draw(cr)
         out.flush()
         return out

@@ -93,6 +93,9 @@ pngshot region
 | `pngshot pin-last` | 把当前剪贴板图片钉到桌面 |
 | `pngshot debug-capture` | 抓取全屏并复制（冒烟测试） |
 
+`region` 和 `long` 默认保存到 `~/Pictures/Screenshots` 并复制到剪贴板；可用
+`--no-save` 或 `--no-copy` 分别关闭其中一项。
+
 内部命令（由覆盖层派生，不供直接调用）：`pin-file`、`text-file`，均带 `--cleanup`。
 
 ## 长截图的限制

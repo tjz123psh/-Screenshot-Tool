@@ -33,10 +33,12 @@ APP_ID = "ai.pngshot.result"
 class ResultWindow:
     def __init__(self, app: Gtk.Application, mode: str, text: str,
                  source_img: "Image.Image | None" = None,
-                 auto_translate: bool = False) -> None:
+                 auto_translate: bool = False, busy: bool = False) -> None:
         self.app = app
         self.mode = mode
         self.source_img = source_img      # kept so [翻译] can re-run if needed
+        self._closed = False
+        self._translation_busy = False
         self.window = Gtk.ApplicationWindow(application=app)
         self.window.set_title("pngshot-result")
         self.window.set_default_size(560, 400)
@@ -75,12 +77,18 @@ class ResultWindow:
         scroller.set_child(self.textview)
         root.append(scroller)
 
-        # status line (for translate progress / errors)
+        # Status line doubles as a compact progress indicator.  A spinner is
+        # clearer than changing text alone while OCR or translation is running.
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.spinner = Gtk.Spinner()
+        status_row.append(self.spinner)
         self.status = Gtk.Label(label="")
         self.status.add_css_class("pngshot-dim")
         self.status.set_xalign(0.0)
-        self.status.set_visible(False)
-        root.append(self.status)
+        status_row.append(self.status)
+        status_row.set_visible(False)
+        self.status_row = status_row
+        root.append(status_row)
 
         # button row
         btnbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -89,12 +97,14 @@ class ResultWindow:
 
         copy_btn = Gtk.Button(label="复制")
         copy_btn.connect("clicked", self._on_copy)
+        self.copy_btn = copy_btn
         btnbox.append(copy_btn)
 
         if mode == "ocr":
             trans_btn = Gtk.Button(label="翻译")
             trans_btn.add_css_class("suggested-action")
             trans_btn.connect("clicked", self._on_translate)
+            self.translate_btn = trans_btn
             btnbox.append(trans_btn)
 
         close_btn = Gtk.Button(label="关闭")
@@ -110,6 +120,10 @@ class ResultWindow:
         self.window.add_controller(key)
 
         self.window.connect("map", self._on_map)
+        self.window.connect("close-request", self._on_close_request)
+        if busy:
+            self._set_busy(True)
+            self._set_content_ready(False)
 
     # ------------------------------------------------------------------
 
@@ -124,10 +138,14 @@ class ResultWindow:
         start, end = buf.get_bounds()
         return buf.get_text(start, end, False)
 
-    def set_result(self, text: str, status: str = "") -> bool:
+    def set_result(self, text: str, status: str = "", busy: bool = False,
+                   usable: bool = True) -> bool:
         """Replace the text view contents (called from a worker via idle_add)."""
+        if self._closed:
+            return False
         self.textview.get_buffer().set_text(text)
-        self._flash(status)
+        self._set_content_ready(usable and not busy)
+        self._flash(status, busy=busy, error=bool(status) and not busy and not usable)
         return False  # one-shot idle callback
 
     # ------------------------------------------------------------------
@@ -138,14 +156,18 @@ class ResultWindow:
             clipboard.copy_text(self._current_text())
             self._flash("已复制到剪贴板")
         except Exception as e:  # noqa: BLE001
-            self._flash(f"复制失败: {e}")
+            self._flash(f"复制失败: {e}", error=True)
 
     def _on_translate(self, _btn) -> None:
         text = self._current_text().strip()
         if not text:
             self._flash("没有文本可翻译")
             return
-        self._flash("翻译中…")
+        if self._translation_busy:
+            return
+        self._translation_busy = True
+        self.translate_btn.set_sensitive(False)
+        self._flash("翻译中…", busy=True)
 
         # Run translation off the main loop so the UI stays responsive.
         import threading
@@ -157,14 +179,26 @@ class ResultWindow:
                 out = llm.translate(text, cfg.llm)
                 GLib.idle_add(self._open_translation, out)
             except Exception as e:  # noqa: BLE001
-                GLib.idle_add(self._flash, f"翻译失败: {e}")
+                GLib.idle_add(self._translation_failed, f"翻译失败: {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _open_translation(self, translated: str) -> bool:
+        if self._closed:
+            return False
+        self._translation_busy = False
+        self.translate_btn.set_sensitive(True)
         self._flash("")
         win = ResultWindow(self.app, "translate", translated)
         win.present()
+        return False
+
+    def _translation_failed(self, message: str) -> bool:
+        if self._closed:
+            return False
+        self._translation_busy = False
+        self.translate_btn.set_sensitive(True)
+        self._flash(message, error=True)
         return False
 
     def _on_key(self, _kc, keyval: int, _kc2: int, _state) -> bool:
@@ -173,9 +207,34 @@ class ResultWindow:
             return True
         return False
 
-    def _flash(self, msg: str) -> bool:
+    def _on_close_request(self, *_args) -> bool:
+        self._closed = True
+        return False
+
+    def _set_busy(self, busy: bool) -> None:
+        self.status_row.set_visible(busy or bool(self.status.get_text()))
+        if busy:
+            self.spinner.start()
+        else:
+            self.spinner.stop()
+
+    def _set_content_ready(self, ready: bool) -> None:
+        self.textview.set_editable(ready)
+        self.textview.set_cursor_visible(ready)
+        self.copy_btn.set_sensitive(ready)
+        if hasattr(self, "translate_btn"):
+            self.translate_btn.set_sensitive(ready and not self._translation_busy)
+
+    def _flash(self, msg: str, *, busy: bool = False,
+               error: bool = False) -> bool:
+        if self._closed:
+            return False
         self.status.set_text(msg)
-        self.status.set_visible(bool(msg))
+        if error:
+            self.status.add_css_class("pngshot-error")
+        else:
+            self.status.remove_css_class("pngshot-error")
+        self._set_busy(busy)
         return False
 
 
@@ -217,7 +276,7 @@ def run_text_action(img, translate: bool) -> int:
 
     def on_activate(a: Gtk.Application) -> None:
         placeholder = "识别中…" if not translate else "识别并翻译中…"
-        win = ResultWindow(a, mode, placeholder, source_img=img)
+        win = ResultWindow(a, mode, placeholder, source_img=img, busy=True)
         win.present()
 
         import threading
@@ -229,16 +288,20 @@ def run_text_action(img, translate: bool) -> int:
             try:
                 text = ocr.recognize(img, cfg.ocr)
                 if not text.strip():
-                    GLib.idle_add(win.set_result, "（未识别到文字）", "")
+                    GLib.idle_add(
+                        win.set_result, "（未识别到文字）", "未识别到文字", False, False
+                    )
                     return
                 if translate:
-                    GLib.idle_add(win.set_result, text, "翻译中…")
+                    GLib.idle_add(win.set_result, text, "翻译中…", True, False)
                     out = llm.translate(text, cfg.llm)
-                    GLib.idle_add(win.set_result, out, "")
+                    GLib.idle_add(win.set_result, out, "", False, True)
                 else:
-                    GLib.idle_add(win.set_result, text, "")
+                    GLib.idle_add(win.set_result, text, "", False, True)
             except Exception as e:  # noqa: BLE001
-                GLib.idle_add(win.set_result, f"[错误] {e}", "")
+                GLib.idle_add(
+                    win.set_result, f"[错误] {e}", "处理失败", False, False
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 

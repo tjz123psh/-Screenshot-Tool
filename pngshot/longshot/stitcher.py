@@ -36,6 +36,8 @@ Constraints (documented for the user):
 """
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -66,7 +68,7 @@ class Stitcher:
         # ``np.vstack([canvas, new])`` every frame, an O(canvas height) copy that
         # turned a long scroll quadratic and was a major cause of the "slower the
         # longer you scroll" stutter.
-        self._blocks: list[np.ndarray] = []      # RGB uint8 row-blocks, in order
+        self._blocks: deque[np.ndarray] = deque()  # RGB blocks, top -> bottom
         self._height: int = 0                    # total canvas rows = sum block heights
         self._width: int = 0
         # Incremental preview thumbnail, also a block list. Each canvas block is
@@ -76,7 +78,7 @@ class Stitcher:
         # from the whole canvas every frame was O(canvas height) and dominated
         # per-frame cost (~70 ms at 24k px), which is what made long scrolls
         # stutter and then drop frames (-> "重叠不足").
-        self._thumb_blocks: list[np.ndarray] = []  # scaled RGB blocks, in order
+        self._thumb_blocks: deque[np.ndarray] = deque()  # scaled RGB blocks
         self._thumb_side: str = "bottom"         # where the last content landed
         self._preview_w = 220                    # thumbnail width in px
         # Row signature of the last *tracked* frame; matching is always the
@@ -210,7 +212,7 @@ class Stitcher:
         if side == "bottom":
             self._blocks.append(block)
         else:  # top
-            self._blocks.insert(0, block)
+            self._blocks.appendleft(block)
         self._height += block.shape[0]
         self._thumb_add_block(block, side=side)
 
@@ -235,7 +237,7 @@ class Stitcher:
         if side == "bottom":
             self._thumb_blocks.append(small)
         else:  # top
-            self._thumb_blocks.insert(0, small)
+            self._thumb_blocks.appendleft(small)
         self._thumb_side = side
 
     # ------------------------------------------------------------------
@@ -409,7 +411,7 @@ def _col_diff(a: np.ndarray, b: np.ndarray, offset: int, min_overlap: int) -> fl
     return float(np.abs(aa - bb).mean())
 
 
-def _offset_candidates(max_offset: int, predict: int) -> list[int]:
+def _offset_candidates(max_offset: int, predict: int) -> Iterator[int]:
     """Signed offsets to try, nearest the predicted one first.
 
     Ranges over [-max_offset, max_offset] so both scroll directions match:
@@ -418,18 +420,14 @@ def _offset_candidates(max_offset: int, predict: int) -> list[int]:
     usually matches on the first probe.
     """
     predict = min(max(predict, -max_offset), max_offset)
-    seen = {predict}
-    candidates = [predict]
+    yield predict
     for delta in range(1, 2 * max_offset + 1):
         up = predict + delta
-        if up <= max_offset and up not in seen:
-            candidates.append(up)
-            seen.add(up)
+        if up <= max_offset:
+            yield up
         down = predict - delta
-        if down >= -max_offset and down not in seen:
-            candidates.append(down)
-            seen.add(down)
-    return candidates
+        if down >= -max_offset:
+            yield down
 
 
 def _frame_signature(arr: np.ndarray) -> np.ndarray:

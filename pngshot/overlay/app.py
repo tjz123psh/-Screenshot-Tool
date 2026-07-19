@@ -25,7 +25,7 @@ from ..overlay.model import Rect
 from ..services import clipboard, saver
 
 
-def run_region(*, save: bool = False, copy: bool = True, long_shot: bool = False) -> int:
+def run_region(*, save: bool = True, copy: bool = True, long_shot: bool = False) -> int:
     """Launch the Stage 1 overlay and process the user's chosen action.
 
     Returns 0 on success, non-zero on cancel or error.
@@ -143,15 +143,9 @@ def _handle_action(state: dict) -> int:
         warnings = state.get("warnings") or []
         for w in warnings:
             print(f"[pngshot] warning: {w}")
-        # A finished capture always lands in BOTH the clipboard and a file on
-        # disk, so the user never has to choose between "paste it now" and "find
-        # it later". --no-copy can still opt out of the clipboard leg.
-        path = saver.save_image(cropped, prefix="pngshot-long")
-        print(f"saved: {path}")
-        if state["copy"]:
-            clipboard.copy_image(cropped)
-            print(f"long-shot done: {cropped.size[0]}x{cropped.size[1]} copied")
-        return 0
+        # Saving is enabled by default for parity with the interactive confirm
+        # action, while both legs can be disabled from the CLI.
+        return _keep_image(cropped, state, prefix="pngshot-long", long_shot=True)
 
     if cropped is None:
         print("[pngshot] cancelled")
@@ -176,17 +170,34 @@ def _handle_action(state: dict) -> int:
         # default keep behaviour (save + copy).
         pass
 
-    # Default "keep" behaviour for confirm/annotate (and any legacy "save"
-    # action): always both save to ~/Pictures/Screenshots AND copy to the
-    # clipboard, so a plain screenshot is persisted on disk and immediately
-    # pasteable without extra flags. The old dedicated "保存" toolbar button was
-    # dropped because it now does exactly the same thing as "确认".
-    path = saver.save_image(cropped)
-    print(f"saved: {path}")
-    clipboard.copy_image(cropped)
-    print(f"copied: {cropped.size[0]}x{cropped.size[1]} to clipboard")
+    # Default "keep" behaviour for confirm/annotate.  The interactive action
+    # defaults to both save and copy, but detached callers can opt out of either
+    # leg through the CLI state.
+    return _keep_image(cropped, state)
 
-    return 0
+
+def _keep_image(cropped: Image.Image, state: dict, *,
+                prefix: str = "pngshot", long_shot: bool = False) -> int:
+    """Attempt save and clipboard independently so one failure loses no data."""
+    failed = False
+    if state["save"]:
+        try:
+            path = saver.save_image(cropped, prefix=prefix)
+            print(f"saved: {path}")
+        except Exception as e:  # noqa: BLE001
+            failed = True
+            print(f"[pngshot] save failed: {e}")
+    if state["copy"]:
+        try:
+            clipboard.copy_image(cropped)
+            if long_shot:
+                print(f"long-shot done: {cropped.size[0]}x{cropped.size[1]} copied")
+            else:
+                print(f"copied: {cropped.size[0]}x{cropped.size[1]} to clipboard")
+        except Exception as e:  # noqa: BLE001
+            failed = True
+            print(f"[pngshot] clipboard failed: {e}")
+    return 1 if failed else 0
 
 
 def _spawn_detached(cropped: Image.Image, subcmd: list[str], done_msg: str) -> int:
@@ -194,7 +205,7 @@ def _spawn_detached(cropped: Image.Image, subcmd: list[str], done_msg: str) -> i
 
     Used for actions whose window must outlive this one-shot screenshot
     process (pin / OCR / translate). The child gets the temp file path as its
-    last argument and deletes it (``--cleanup``) when its window closes.
+    last argument and deletes it (``--cleanup``) after loading it into memory.
     """
     import os
     import subprocess
@@ -203,10 +214,9 @@ def _spawn_detached(cropped: Image.Image, subcmd: list[str], done_msg: str) -> i
 
     fd, path = tempfile.mkstemp(prefix="pngshot-", suffix=".png")
     os.close(fd)
-    cropped.save(path, format="PNG")
-
-    cmd = [sys.executable, "-m", "pngshot", *subcmd, path]
     try:
+        cropped.save(path, format="PNG")
+        cmd = [sys.executable, "-m", "pngshot", *subcmd, path]
         subprocess.Popen(
             cmd,
             start_new_session=True,
@@ -216,7 +226,11 @@ def _spawn_detached(cropped: Image.Image, subcmd: list[str], done_msg: str) -> i
             env=os.environ.copy(),
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[pngshot] failed to launch child: {e}")
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        print(f"[pngshot] failed to prepare or launch child: {e}")
         return 1
     print(done_msg)
     return 0

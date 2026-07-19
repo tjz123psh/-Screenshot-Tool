@@ -79,6 +79,34 @@ def load() -> Config:
 
 
 def _merge(dest: object, src: dict) -> None:
+    if not isinstance(src, dict):
+        return
     for k, v in src.items():
-        if hasattr(dest, k):
+        if hasattr(dest, k) and _valid_value(dest, k, v):
             setattr(dest, k, v)
+
+
+def _valid_value(dest: object, key: str, value: object) -> bool:
+    """Reject malformed config values while preserving safe defaults."""
+    current = getattr(dest, key)
+    if type(value) is not type(current):
+        return False
+    if key in {"timeout_s", "vision_timeout_s"}:
+        return value > 0
+    if key == "serve_port":
+        return 1 <= value <= 65535
+    if key in {"poll_ms", "min_shift_px"}:
+        return value >= 0
+    if key == "max_diff":
+        return value > 0
+    if key == "upscale":
+        return value >= 1.0
+    if key in {"provider", "engine"}:
+        allowed = {
+            "provider": {"opencode", "openai"},
+            "engine": {"tesseract", "vision"},
+        }[key]
+        return value in allowed
+    if key in {"langs", "model", "target_lang", "vision_model"}:
+        return bool(value.strip())
+    return True

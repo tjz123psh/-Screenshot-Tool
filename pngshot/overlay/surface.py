@@ -422,6 +422,7 @@ class OverlaySurface:
 
     def _enter_annotate(self) -> None:
         self.annotating = True
+        self.annotator.begin_canvas(self.selector.rect)
         self._hover_button = ""
         self.canvas.queue_draw()
 

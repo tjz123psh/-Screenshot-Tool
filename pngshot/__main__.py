@@ -7,7 +7,7 @@ User-facing subcommands:
   debug-capture     smoke-test: grab full screen, copy (+ optionally save)
 
 Internal subcommands (spawned as detached children by the overlay; the crop
-is passed as a temp PNG that the child deletes with --cleanup):
+is passed as a temp PNG that the child loads and deletes with --cleanup):
   pin-file <path>   open a pin window for an image file
   text-file <path>  run OCR (--mode ocr) or translate (--mode translate) and
                     show a result window
@@ -15,7 +15,26 @@ is passed as a temp PNG that the child deletes with --cleanup):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+
+def _load_image_file(path: str, *, cleanup: bool):
+    """Load an image fully, then remove an internal temp file immediately."""
+    from PIL import Image
+
+    try:
+        with Image.open(path) as source:
+            return source.copy()
+    except Exception as e:  # noqa: BLE001
+        print(f"[pngshot] cannot open image: {e}", file=sys.stderr)
+        return None
+    finally:
+        if cleanup:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _cmd_region(args: argparse.Namespace) -> int:
@@ -34,23 +53,11 @@ def _cmd_pin_last(_args: argparse.Namespace) -> int:
 
 
 def _cmd_pin_file(args: argparse.Namespace) -> int:
-    from PIL import Image
-
     from .pin import window
-    try:
-        img = Image.open(args.path)
-        img.load()
-    except Exception as e:  # noqa: BLE001
-        print(f"[pngshot] cannot open image: {e}", file=sys.stderr)
+    img = _load_image_file(args.path, cleanup=args.cleanup)
+    if img is None:
         return 1
-    rc = window.run_pin(img)
-    if args.cleanup:
-        import os
-        try:
-            os.unlink(args.path)
-        except OSError:
-            pass
-    return rc
+    return window.run_pin(img)
 
 
 def _cmd_text_file(args: argparse.Namespace) -> int:
@@ -59,23 +66,11 @@ def _cmd_text_file(args: argparse.Namespace) -> int:
     Used as a detached child process spawned by the overlay so the result
     window can own its own GTK main loop after the overlay has closed.
     """
-    from PIL import Image
-
     from .util import result_win
-    try:
-        img = Image.open(args.path)
-        img.load()
-    except Exception as e:  # noqa: BLE001
-        print(f"[pngshot] cannot open image: {e}", file=sys.stderr)
+    img = _load_image_file(args.path, cleanup=args.cleanup)
+    if img is None:
         return 1
-    rc = result_win.run_text_action(img, translate=(args.mode == "translate"))
-    if args.cleanup:
-        import os
-        try:
-            os.unlink(args.path)
-        except OSError:
-            pass
-    return rc
+    return result_win.run_text_action(img, translate=(args.mode == "translate"))
 
 
 def _cmd_debug_capture(args: argparse.Namespace) -> int:
@@ -97,13 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     r = sub.add_parser("region", help="interactive region screenshot")
-    r.add_argument("--save", action="store_true", help="save to ~/Pictures/Screenshots")
+    r.add_argument("--save", dest="save", action=argparse.BooleanOptionalAction,
+                   default=True, help="save to ~/Pictures/Screenshots (default)")
     r.add_argument("--no-copy", action="store_true", help="do not copy to clipboard")
     r.set_defaults(func=_cmd_region)
 
     l = sub.add_parser("long", help="interactive region + long-shot")
-    l.add_argument("--save", action="store_true")
-    l.add_argument("--no-copy", action="store_true")
+    l.add_argument("--save", dest="save", action=argparse.BooleanOptionalAction,
+                   default=True, help="save to ~/Pictures/Screenshots (default)")
+    l.add_argument("--no-copy", action="store_true", help="do not copy to clipboard")
     l.set_defaults(func=_cmd_long)
 
     pin = sub.add_parser("pin-last", help="pin the current clipboard image")
@@ -112,14 +109,14 @@ def build_parser() -> argparse.ArgumentParser:
     pinf = sub.add_parser("pin-file", help="pin an image file (internal use)")
     pinf.add_argument("path")
     pinf.add_argument("--cleanup", action="store_true",
-                      help="delete the file after the window closes")
+                      help="delete the file after loading it")
     pinf.set_defaults(func=_cmd_pin_file)
 
     txt = sub.add_parser("text-file", help="OCR/translate an image file (internal use)")
     txt.add_argument("path")
     txt.add_argument("--mode", choices=("ocr", "translate"), default="ocr")
     txt.add_argument("--cleanup", action="store_true",
-                     help="delete the file after the window closes")
+                     help="delete the file after loading it")
     txt.set_defaults(func=_cmd_text_file)
 
     dbg = sub.add_parser("debug-capture", help="smoke-test the capture/clipboard pipeline")

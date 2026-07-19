@@ -24,7 +24,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
 # Bumped whenever the CSS below changes so a long-lived display re-loads it.
-_CSS_VERSION = 3
+_CSS_VERSION = 4
 _INSTALLED: set[int] = set()
 
 # Accent + surface palette. Kept in one block so the two windows never drift.
@@ -45,15 +45,22 @@ _CSS = b"""
 }
 
 /* headings inside a card */
-.pngshot-card .pngshot-title {
+.pngshot-card .pngshot-title,
+.pngshot-window .pngshot-title {
   font-size: 15px;
   font-weight: 700;
   color: #f4f6fb;
 }
 
-.pngshot-card .pngshot-dim {
+.pngshot-card .pngshot-dim,
+.pngshot-window .pngshot-dim {
   color: rgba(232, 234, 240, 0.55);
   font-size: 12px;
+}
+
+.pngshot-card .pngshot-error,
+.pngshot-window .pngshot-error {
+  color: #ff8c8c;
 }
 
 /* ---- preview frame (long-shot) ------------------------------------- */
