@@ -82,7 +82,9 @@ pngshot region
 
 ## 配置
 
-可选的 `~/.config/pngshot/config.toml`（参见 `config.toml.example`），可覆盖大模型的模型/目标语言、OCR 引擎与预处理（`engine`、`preprocess`、`upscale`、`vision_model`）、以及长截图调优参数（`poll_ms`、`min_shift_px`、`max_diff`）。
+可选的 `~/.config/pngshot/config.toml`（参见 `config.toml.example`），可覆盖大模型的模型/目标语言、OCR 引擎与预处理（`engine`、`preprocess`、`upscale`、`vision_model`）、以及长截图调优参数（`poll_ms`、`min_shift_px`、`max_diff`）。若 `serve_port` 上已有 `opencode serve`，翻译会直接复用其 HTTP API；否则自动回退一次性 CLI，不需要手动切换。
+
+经常使用免费模型翻译时，可在登录会话中启动 `opencode serve --pure --port 47823`，后续翻译会复用已加载的服务；不启动也不影响功能。
 
 ## 命令行
 
@@ -100,9 +102,10 @@ pngshot region
 
 ## 长截图的限制
 
+- 采集中会在选区**外侧**显示蓝色边界；边界不遮挡内容，也不会进入最终长图。
 - **仅支持垂直滚动。** 横向移动会破坏匹配。
 - **吸顶/吸底栏会重复。** 请框住滚动内容本身，避开固定栏。
-- **帧间动画内容**会降低匹配得分；低置信度的帧会被丢弃，状态栏会提示你往回滚一点。
+- **帧间动画内容**会降低匹配得分；采集器会保留连续中间帧，确实无法建立重叠时状态栏才会提示调整。
 
 ## 架构
 
@@ -120,12 +123,13 @@ pngshot/
     app.py             捕获 → 覆盖层 → 动作流水线；长截图交接
   pin/window.py      桌面钉图浮动窗口（内容/窗口缩放、移动）
   longshot/
-    recorder.py        定时区域采样 + 控制栏
+    recorder.py        后台连续采样 + 有序队列 + 控制栏
+    highlight.py       采集区外侧 layer-shell 高亮边界
     stitcher.py        OpenCV 垂直拼接 + 重叠复检
   services/
     clipboard.py       wl-copy / wl-paste
     ocr.py             tesseract（预处理）/ vision 双引擎 + 中文空格清理
-    llm.py             opencode run（json）+ OpenAI 兜底
+    llm.py             opencode serve 快速通道 / CLI 回退 + OpenAI 兜底
     saver.py           ~/Pictures/Screenshots
   util/
     niri.py            niri msg action 辅助（浮动等）

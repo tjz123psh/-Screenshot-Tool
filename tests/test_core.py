@@ -12,12 +12,13 @@ from pngshot import config
 from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
 from pngshot.longshot.recorder import LongshotRecorder
+from pngshot.longshot.highlight import edge_rects
 from pngshot.overlay.model import Mode, Rect
 from pngshot.overlay.annotate import Annotator
 from pngshot.overlay.selector import Selector
 from pngshot.overlay.surface import OverlaySurface
 from pngshot.overlay.toolbar import ANNOTATE_BUTTONS, Toolbar
-from pngshot.services import saver
+from pngshot.services import llm, ocr, saver
 
 
 class SelectorTests(unittest.TestCase):
@@ -66,6 +67,24 @@ class StitcherTests(unittest.TestCase):
         stitcher.add(frame.copy())
         self.assertEqual(stitcher.current_height(), 40)
 
+    def test_local_animation_in_repeated_ui_does_not_fake_scroll(self):
+        """A blinking badge over periodic list rows must remain one frame."""
+        first = np.full((500, 800, 3), 30, dtype=np.uint8)
+        for y in (40, 140, 240, 340, 440):
+            first[y:y + 2] = 90
+        for y in (70, 170, 270, 370):
+            first[y:y + 12, 60:500] = np.arange(440, dtype=np.uint8)[None, :, None]
+        animated = first.copy()
+        animated[50:80, 650:690] = 180
+
+        stitcher = Stitcher()
+        stitcher.add(Image.fromarray(first, "RGB"))
+        stitcher.add(Image.fromarray(animated, "RGB"))
+
+        self.assertEqual(stitcher.current_height(), 500)
+        self.assertEqual(stitcher.frames_used, 1)
+        self.assertEqual(stitcher.last_shift, 0)
+
 
 class LongshotRecorderTests(unittest.TestCase):
     def test_drain_pending_frames_preserves_capture_order(self):
@@ -94,7 +113,9 @@ class LongshotRecorderTests(unittest.TestCase):
         recorder._sampling = True
         recorder._pending_frames = deque([frame1, frame2], maxlen=24)
         recorder._pending_lock = threading.Lock()
+        recorder._pending_condition = threading.Condition(recorder._pending_lock)
         recorder.window = type("Window", (), {"close": lambda self: None})()
+        recorder.highlight = type("Highlight", (), {"close": lambda self: None})()
         consumed = []
         completed = []
 
@@ -116,6 +137,51 @@ class LongshotRecorderTests(unittest.TestCase):
         self.assertFalse(recorder._sampling)
         self.assertTrue(recorder._finished)
         self.assertEqual(completed, [(frame2, [])])
+
+    def test_highlight_edges_stay_outside_capture(self):
+        rect = Rect(100, 80, 320, 240)
+        edges = edge_rects(rect, (800, 600))
+        self.assertEqual(len(edges), 4)
+        for x, y, w, h in edges:
+            overlaps_x = x < rect.x2 and x + w > rect.x
+            overlaps_y = y < rect.y2 and y + h > rect.y
+            self.assertFalse(overlaps_x and overlaps_y)
+
+    def test_highlight_omits_edges_that_touch_screen_boundary(self):
+        edges = edge_rects(Rect(0, 0, 100, 80), (100, 80))
+        self.assertEqual(edges, [])
+
+
+class OcrRoutingTests(unittest.TestCase):
+    def test_layout_mode_adapts_to_selection_shape(self):
+        self.assertEqual(ocr._layout_psm(Image.new("RGB", (800, 60))), 7)
+        self.assertEqual(ocr._layout_psm(Image.new("RGB", (1000, 200))), 11)
+        self.assertEqual(ocr._layout_psm(Image.new("RGB", (500, 400))), 6)
+
+    def test_ocr_quality_counts_text_not_punctuation(self):
+        self.assertEqual(ocr._ocr_quality("... ---"), 0)
+        self.assertEqual(ocr._ocr_quality("你好 A1"), 4)
+
+
+class TranslationRoutingTests(unittest.TestCase):
+    def test_target_language_short_circuit_is_conservative(self):
+        self.assertTrue(llm._already_target_language("这是中文界面", "简体中文"))
+        self.assertFalse(llm._already_target_language("這是軟體資料", "简体中文"))
+        self.assertFalse(llm._already_target_language("hello world", "简体中文"))
+        self.assertTrue(llm._already_target_language("hello world", "English"))
+
+    def test_opencode_model_is_split_once_for_http_route(self):
+        self.assertEqual(
+            llm._split_model("opencode/deepseek-v4-flash-free"),
+            ("opencode", "deepseek-v4-flash-free"),
+        )
+
+    def test_ndjson_parser_ignores_non_text_events(self):
+        stream = "\n".join([
+            '{"type":"step_start"}',
+            '{"type":"text","part":{"type":"text","text":"译文"}}',
+        ])
+        self.assertEqual(llm._extract_text(stream), "译文")
 
 
 class ConfigAndSaverTests(unittest.TestCase):

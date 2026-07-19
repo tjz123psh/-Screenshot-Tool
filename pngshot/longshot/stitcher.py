@@ -86,6 +86,11 @@ class Stitcher:
         # height and the offset is a simple relative scroll distance (which may
         # be negative when the user scrolls up).
         self._last_cols: np.ndarray | None = None
+        # Sparse real pixels from the same tracked frame. Row signatures are
+        # excellent for finding offsets, but repeated cards/list rows can make
+        # a wrong periodic offset look perfect. A final pixel-level comparison
+        # against the zero-offset view rejects that stationary-animation trap.
+        self._last_pixels: np.ndarray | None = None
         self._last_offset = 0
         self._last_signature: np.ndarray | None = None
         # Where the *last tracked frame's top* sits within the canvas, in canvas
@@ -122,6 +127,7 @@ class Stitcher:
             self._width = arr.shape[1]
             self._append_block(arr, side="bottom")
             self._last_cols = _compute_cols(arr)
+            self._last_pixels = _sample_pixels(arr)
             self._last_signature = _frame_signature(arr)
             self._last_offset = 0
             self._anchor_pos = 0
@@ -159,12 +165,27 @@ class Stitcher:
             # scrolls accumulate against a fixed reference and eventually append.
             return diff
 
+        pixels = _sample_pixels(arr)
+        if self._last_pixels is not None:
+            aligned = _pixel_overlap_diff(self._last_pixels, pixels, shift)
+            stationary = _pixel_overlap_diff(self._last_pixels, pixels, 0)
+            changed = _pixel_change_fraction(self._last_pixels, pixels)
+            if changed < 0.012 or stationary <= aligned + 0.2:
+                # The current screen is closer at its original position than
+                # at the proposed scroll offset, or fewer than 1.2% of sampled
+                # pixels changed at all. This is usually a blinking badge/caret
+                # over a periodic list, not actual page movement.
+                self.last_shift = 0
+                self.last_diff = stationary
+                return stationary
+
         # `shift` is signed: +down / -up. Convert to the incoming frame's
         # position within the canvas and grow whichever edge it overhangs.
         new_pos = self._anchor_pos + shift
         self._extend_canvas(arr, new_pos)
 
         self._last_cols = cols
+        self._last_pixels = pixels
         self._last_signature = sig
         self._last_offset = shift
         self.frames_used += 1
@@ -368,6 +389,42 @@ def _compute_cols(arr: np.ndarray) -> np.ndarray:
     else:
         edges = np.zeros(h, dtype=np.float32)
     return np.stack([mean * 2.0, contrast, bright + edges], axis=1)
+
+
+def _sample_pixels(arr: np.ndarray) -> np.ndarray:
+    """Retain sparse RGB columns for the final motion-consistency check."""
+    return np.ascontiguousarray(arr[:, _sample_columns(arr.shape[1]), :])
+
+
+def _pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> float:
+    """Raw-pixel overlap MAD using the same ignored edge bands as matching."""
+    h1, h2 = len(a), len(b)
+    if offset >= 0:
+        a_start, b_start, length = offset, 0, min(h1 - offset, h2)
+    else:
+        a_start, b_start, length = 0, -offset, min(h1, h2 + offset)
+    if length <= 0:
+        return float("inf")
+    top = _content_top_ignore(length)
+    bottom = _content_bottom_ignore(length)
+    end = length - bottom
+    if end <= top:
+        return float("inf")
+    aa = a[a_start + top:a_start + end].astype(np.int16)
+    bb = b[b_start + top:b_start + end].astype(np.int16)
+    return float(np.abs(aa - bb).mean())
+
+
+def _pixel_change_fraction(a: np.ndarray, b: np.ndarray) -> float:
+    """Fraction of sparse pixels with a perceptible change at zero offset."""
+    h = min(len(a), len(b))
+    w = min(a.shape[1], b.shape[1])
+    if h <= 0 or w <= 0:
+        return 1.0
+    delta = np.abs(
+        a[:h, :w].astype(np.int16) - b[:h, :w].astype(np.int16)
+    )
+    return float((delta.max(axis=2) > 6).mean())
 
 
 def _content_top_ignore(length: int) -> int:

@@ -24,7 +24,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
 # Bumped whenever the CSS below changes so a long-lived display re-loads it.
-_CSS_VERSION = 5
+_CSS_VERSION = 6
 _INSTALLED: set[int] = set()
 
 # Accent + surface palette. Kept in one block so the two windows never drift.
@@ -209,6 +209,13 @@ _CSS = b"""
    of selector specificity.) */
 .pngshot-transparent {
   background-color: transparent;
+}
+.pngshot-highlight-window {
+  background-color: transparent;
+}
+.pngshot-highlight-edge {
+  background-color: rgba(100, 132, 232, 0.96);
+  box-shadow: 0 0 8px rgba(100, 132, 232, 0.72);
 }
 """
 

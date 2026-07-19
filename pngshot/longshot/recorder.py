@@ -53,6 +53,7 @@ from PIL import Image  # noqa: E402
 from .. import capture
 from ..config import LongshotConfig
 from ..overlay.model import Rect
+from .highlight import SelectionHighlight
 from .stitcher import Stitcher
 
 # Callback fired when recording ends. (image | None, warnings)
@@ -103,11 +104,13 @@ class LongshotRecorder:
         # GTK was busy, making the next frame jump past the stitcher's overlap
         # window and forcing the user to roll back.  A bounded queue preserves
         # continuity while keeping pathological backlogs finite.
-        self._pending_frames: deque[Image.Image] = deque(maxlen=24)
+        self._pending_frames: deque[Image.Image] = deque(maxlen=48)
         self._pending_lock = threading.Lock()
+        self._pending_condition = threading.Condition(self._pending_lock)
         self._idle_queued = False
 
         self._build_panel()
+        self.highlight = SelectionHighlight(app, rect, screen_size)
 
     # ------------------------------------------------------------------
 
@@ -272,6 +275,7 @@ class LongshotRecorder:
         Gtk4LayerShell.set_margin(self.window, edge_map[side], margin)
 
     def present(self) -> None:
+        self.highlight.present()
         self.window.present()
         # Delay the worker start so the Stage-1 overlay is fully gone and we
         # don't capture our own dimming as frame #1.
@@ -319,13 +323,16 @@ class LongshotRecorder:
                     break
                 time.sleep(0.1)
                 continue
-            with self._pending_lock:
+            with self._pending_condition:
+                # Never discard an intermediate scroll position: one dropped
+                # bridge frame is enough to force the user to roll back.  Under
+                # exceptional GTK load, pause sampling until ordered work has
+                # drained instead of silently punching a hole in the sequence.
+                while (self._sampling and
+                       len(self._pending_frames) >= self._pending_frames.maxlen):
+                    self._pending_condition.wait(timeout=0.05)
                 if not self._sampling:
                     break
-                if len(self._pending_frames) == self._pending_frames.maxlen:
-                    # Drop the oldest only under sustained overload; keeping
-                    # the newest samples lets the recorder recover promptly.
-                    self._pending_frames.popleft()
                 self._pending_frames.append(frame)
                 if not self._idle_queued:
                     self._idle_queued = True
@@ -338,6 +345,8 @@ class LongshotRecorder:
         with self._pending_lock:
             frame = self._pending_frames.popleft() if self._pending_frames else None
             self._idle_queued = False
+            if frame is not None:
+                self._pending_condition.notify()
         if frame is None or not self._sampling:
             return False
         self._process_frame(frame)
@@ -432,6 +441,9 @@ class LongshotRecorder:
         # UI thread (a grim grab may be mid-flight). It exits on the next loop
         # check. Any late idle callback bails out because _sampling is False.
         self._sampling = False
+        with self._pending_condition:
+            self._pending_condition.notify_all()
+        self.highlight.close()
         self.window.close()
         if cancel:
             self.on_done(None, [])
@@ -455,6 +467,9 @@ class LongshotRecorder:
                 if not self._pending_frames:
                     return
                 frame = self._pending_frames.popleft()
+                condition = getattr(self, "_pending_condition", None)
+                if condition is not None:
+                    condition.notify()
             self._process_frame(frame)
 
 

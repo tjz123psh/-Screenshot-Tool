@@ -68,10 +68,24 @@ def _recognize_tesseract(img: Image.Image, cfg: OcrConfig) -> str:
     prepared = _preprocess(img, cfg) if cfg.preprocess else img.convert("RGB")
     buf = io.BytesIO()
     prepared.save(buf, format="PNG")
-    cmd = ["tesseract", "-l", cfg.langs, "--psm", "6", "stdin", "stdout"]
+    payload = buf.getvalue()
+    psm = _layout_psm(img)
+    text = _run_tesseract(payload, cfg.langs, psm)
+    # Empty/near-empty output is where a wrong layout assumption hurts most.
+    # Retry only then, keeping normal OCR to one fast local process.
+    if _ocr_quality(text) < 2:
+        alternate = 11 if psm != 11 else 6
+        retry = _run_tesseract(payload, cfg.langs, alternate)
+        if _ocr_quality(retry) > _ocr_quality(text):
+            text = retry
+    return _cleanup(text)
+
+
+def _run_tesseract(payload: bytes, langs: str, psm: int) -> str:
+    cmd = ["tesseract", "-l", langs, "--psm", str(psm), "stdin", "stdout"]
     try:
         p = subprocess.run(
-            cmd, input=buf.getvalue(), capture_output=True, timeout=30
+            cmd, input=payload, capture_output=True, timeout=30
         )
     except FileNotFoundError as e:
         raise OcrError("tesseract not found; install tesseract") from e
@@ -80,8 +94,30 @@ def _recognize_tesseract(img: Image.Image, cfg: OcrConfig) -> str:
     if p.returncode != 0:
         err = p.stderr.decode(errors="replace").strip()
         raise OcrError(f"tesseract failed: {err}")
-    text = p.stdout.decode("utf-8", errors="replace")
-    return _cleanup(text)
+    return p.stdout.decode("utf-8", errors="replace")
+
+
+def _layout_psm(img: Image.Image) -> int:
+    """Select a Tesseract layout suited to common screen selections.
+
+    Short banner/label selections are one line (7), very wide selections are
+    usually sparse UI fragments (11), and document-like blocks remain the
+    stable uniform-block mode (6).
+    """
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return 6
+    ratio = w / h
+    if ratio >= 2.4 and h <= 96:
+        return 7
+    if ratio >= 3.6:
+        return 11
+    return 6
+
+
+def _ocr_quality(text: str) -> int:
+    """Cheap score used only to decide whether an alternate layout is worth it."""
+    return sum(c.isalnum() or "\u3400" <= c <= "\u9fff" for c in text)
 
 
 def _mean_lum(g: Image.Image) -> float:

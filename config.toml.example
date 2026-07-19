@@ -9,9 +9,9 @@ provider    = "opencode"
 model       = "opencode/deepseek-v4-flash-free"
 # 翻译目标语言（源语言自动识别）
 target_lang = "简体中文"
-# 单次翻译超时（秒）。opencode 冷启动约 2-5s
+# 单次翻译超时（秒）。若本机服务未启动，会自动回退 opencode CLI
 timeout_s   = 30
-# 预留字段：未来复用常驻 opencode serve 时使用
+# 若此端口已有 opencode serve，优先复用其 HTTP API，避免每次翻译冷启动
 serve_port  = 47823
 
 [ocr]
