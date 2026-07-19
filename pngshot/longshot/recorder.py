@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from typing import Callable
 
 import gi
@@ -93,11 +94,16 @@ class LongshotRecorder:
 
         # Background capture: grim takes ~36 ms per grab, which would freeze the
         # GTK main loop if run on it at a high rate. Instead a worker thread
-        # grabs frames back-to-back (~20 fps) and hands the latest one to the
-        # main thread via GLib.idle_add. The higher rate keeps consecutive
+        # grabs frames back-to-back (~20 fps) and hands an ordered frame queue
+        # to the main thread via GLib.idle_add. The higher rate keeps consecutive
         # frames overlapping so "重叠不足" stops firing on a normal scroll.
         self._capture_thread: threading.Thread | None = None
-        self._pending_frame: Image.Image | None = None  # main-thread only
+        # Keep a short ordered queue instead of only the newest frame.  A
+        # latest-only slot silently dropped intermediate scroll positions when
+        # GTK was busy, making the next frame jump past the stitcher's overlap
+        # window and forcing the user to roll back.  A bounded queue preserves
+        # continuity while keeping pathological backlogs finite.
+        self._pending_frames: deque[Image.Image] = deque(maxlen=24)
         self._pending_lock = threading.Lock()
         self._idle_queued = False
 
@@ -282,14 +288,13 @@ class LongshotRecorder:
     # ------------------------------------------------------------------
 
     def _capture_loop(self) -> None:
-        """Worker thread: grab the region back-to-back and hand off the newest.
+        """Worker thread: grab the region back-to-back into an ordered queue.
 
         Runs off the GTK main loop so grim's ~36 ms latency never blocks the
-        UI. Only the *latest* frame is kept pending; if the main thread hasn't
-        consumed the previous one yet we overwrite it, so stitching naturally
-        samples at whatever rate it can keep up with instead of building a
-        backlog. ``poll_ms`` becomes a small inter-grab pause (a floor on the
-        rate) rather than the sampling period.
+        UI. A short bounded queue retains intermediate scroll positions while
+        the main thread is briefly busy, preventing otherwise-overlapping
+        frames from being skipped. ``poll_ms`` becomes a small inter-grab pause
+        (a floor on the rate) rather than the sampling period.
         """
         r = self.rect
         pause = max(self.cfg.poll_ms, 0) / 1000.0
@@ -315,7 +320,11 @@ class LongshotRecorder:
                 time.sleep(0.1)
                 continue
             with self._pending_lock:
-                self._pending_frame = frame
+                if len(self._pending_frames) == self._pending_frames.maxlen:
+                    # Drop the oldest only under sustained overload; keeping
+                    # the newest samples lets the recorder recover promptly.
+                    self._pending_frames.popleft()
+                self._pending_frames.append(frame)
                 if not self._idle_queued:
                     self._idle_queued = True
                     GLib.idle_add(self._consume_pending)
@@ -323,15 +332,19 @@ class LongshotRecorder:
                 time.sleep(pause)
 
     def _consume_pending(self) -> bool:
-        """Main thread: stitch the newest captured frame (if any)."""
+        """Main thread: stitch the next captured frame in order (if any)."""
         with self._pending_lock:
-            frame = self._pending_frame
-            self._pending_frame = None
+            frame = self._pending_frames.popleft() if self._pending_frames else None
             self._idle_queued = False
         if frame is None or not self._sampling:
             return False
         self._process_frame(frame)
-        return False  # one-shot; the worker re-queues us for the next frame
+        with self._pending_lock:
+            more = bool(self._pending_frames)
+            if more and not self._idle_queued and self._sampling:
+                self._idle_queued = True
+                GLib.idle_add(self._consume_pending)
+        return False  # one-shot; queue continuation is scheduled above
 
     def _process_frame(self, frame: Image.Image) -> None:
         prev_frames = self.stitcher.frames_used

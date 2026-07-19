@@ -27,6 +27,7 @@ gi.require_version("PangoCairo", "1.0")
 from gi.repository import Gdk, GLib, Gtk, Gtk4LayerShell, Pango, PangoCairo  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from .annotate import Annotator, PALETTE, WIDTHS
 from .model import HitKind, Mode, Rect, handle_positions
 from .selector import Selector
 from .toolbar import Toolbar, ToolbarButton
@@ -62,11 +63,12 @@ class OverlaySurface:
 
         # Annotation sub-mode (Step 5). When active, the region toolbar is
         # replaced by the annotate toolbar and pointer events draw strokes.
-        from .annotate import Annotator
         from .toolbar import ANNOTATE_BUTTONS
         self.annotator = Annotator()
         self.annotate_toolbar = Toolbar(ANNOTATE_BUTTONS)
         self.annotating = False
+        self._annotation_popup: str | None = None
+        self._annotation_popup_hover = -1
 
         self.window = Gtk.ApplicationWindow(application=app)
         self.window.set_decorated(False)
@@ -232,6 +234,19 @@ class OverlaySurface:
         if self.annotating:
             if button != Gdk.BUTTON_PRIMARY:
                 return
+            if self._annotation_popup is not None:
+                option = self._annotation_popup_hit_test(x, y)
+                if option >= 0:
+                    self._apply_annotation_popup_option(option)
+                else:
+                    btn = self.annotate_toolbar.hit_test(
+                        x, y, self.selector.rect, self.screen_w, self.screen_h
+                    )
+                    if btn is not None:
+                        self._invoke_annotate_button(btn)
+                    else:
+                        self._close_annotation_popup()
+                return
             btn = self.annotate_toolbar.hit_test(x, y, self.selector.rect,
                                                  self.screen_w, self.screen_h)
             if btn is not None:
@@ -266,6 +281,12 @@ class OverlaySurface:
         self._mark_activity()
         # ---- annotation sub-mode ----
         if self.annotating:
+            if self._annotation_popup is not None:
+                previous = self._annotation_popup_hover
+                self._annotation_popup_hover = self._annotation_popup_hit_test(x, y)
+                if previous != self._annotation_popup_hover:
+                    self.canvas.queue_draw()
+                return
             prev_hover = self._hover_button
             self._hover_button = ""
             btn = self.annotate_toolbar.hit_test(x, y, self.selector.rect,
@@ -296,6 +317,8 @@ class OverlaySurface:
         if gesture.get_current_button() != Gdk.BUTTON_PRIMARY:
             return
         if self.annotating:
+            if self._annotation_popup is not None:
+                return
             self.annotator.release(x, y)
             self.canvas.queue_draw()
             return
@@ -361,6 +384,9 @@ class OverlaySurface:
 
         # Not editing text — hotkeys drive tools / actions.
         if name == "Escape":
+            if self._annotation_popup is not None:
+                self._close_annotation_popup()
+                return True
             # leave annotation without applying
             self._exit_annotate(apply=False)
             return True
@@ -422,12 +448,16 @@ class OverlaySurface:
 
     def _enter_annotate(self) -> None:
         self.annotating = True
+        self._annotation_popup = None
+        self._annotation_popup_hover = -1
         self.annotator.begin_canvas(self.selector.rect)
         self._hover_button = ""
         self.canvas.queue_draw()
 
     def _exit_annotate(self, *, apply: bool) -> None:
         self.annotating = False
+        self._annotation_popup = None
+        self._annotation_popup_hover = -1
         self._hover_button = ""
         if not apply or not self.annotator.has_content():
             # nothing to bake — just return to the region toolbar
@@ -451,14 +481,86 @@ class OverlaySurface:
             self.annotator.undo()
             self.canvas.queue_draw()
         elif bid == "anno.color":
-            self.annotator.cycle_color()
-            self.canvas.queue_draw()
+            self._toggle_annotation_popup("color")
         elif bid == "anno.width":
-            self.annotator.cycle_width()
-            self.canvas.queue_draw()
+            self._toggle_annotation_popup("width")
         elif bid.startswith("tool."):
             self.annotator.set_tool(bid[len("tool."):])
             self.canvas.queue_draw()
+
+    # ------------------------------------------------------------------
+    # annotation colour/width popup
+
+    def _annotation_popup_layout(
+        self,
+    ) -> tuple[
+        tuple[float, float, float, float],
+        list[tuple[float, float, float, float]],
+    ]:
+        """Return popup and option rectangles in screen coordinates."""
+        kind = self._annotation_popup
+        if kind not in ("color", "width"):
+            return (0, 0, 0, 0), []
+
+        r = self.selector.rect
+        self.annotate_toolbar.layout(r, self.screen_w, self.screen_h)
+        button = next(
+            b for b in self.annotate_toolbar.buttons if b.id == f"anno.{kind}"
+        )
+
+        count = len(PALETTE) if kind == "color" else len(WIDTHS)
+        item_w = 34 if kind == "color" else 64
+        item_h = 34 if kind == "color" else 42
+        pad_x, pad_y, gap = 10, 9, 7
+        popup_w = pad_x * 2 + count * item_w + (count - 1) * gap
+        popup_h = pad_y * 2 + item_h
+        popup_x = button.x + button.w / 2 - popup_w / 2
+        popup_x = max(8, min(popup_x, self.screen_w - popup_w - 8))
+
+        gap_from_bar = 8
+        _bx, by, _bw, bh = self.annotate_toolbar.bar_rect
+        above_y = by - popup_h - gap_from_bar
+        below_y = by + bh + gap_from_bar
+        if above_y >= 8:
+            popup_y = above_y
+        elif below_y + popup_h <= self.screen_h - 8:
+            popup_y = below_y
+        else:
+            popup_y = max(8, min(above_y, self.screen_h - popup_h - 8))
+
+        options: list[tuple[float, float, float, float]] = []
+        ox = popup_x + pad_x
+        oy = popup_y + pad_y
+        for _ in range(count):
+            options.append((ox, oy, item_w, item_h))
+            ox += item_w + gap
+        return (popup_x, popup_y, popup_w, popup_h), options
+
+    def _annotation_popup_hit_test(self, x: float, y: float) -> int:
+        _popup, options = self._annotation_popup_layout()
+        for idx, (ox, oy, ow, oh) in enumerate(options):
+            if ox <= x < ox + ow and oy <= y < oy + oh:
+                return idx
+        return -1
+
+    def _toggle_annotation_popup(self, kind: str) -> None:
+        self._annotation_popup = None if self._annotation_popup == kind else kind
+        self._annotation_popup_hover = -1
+        self.canvas.queue_draw()
+
+    def _close_annotation_popup(self) -> None:
+        if self._annotation_popup is None:
+            return
+        self._annotation_popup = None
+        self._annotation_popup_hover = -1
+        self.canvas.queue_draw()
+
+    def _apply_annotation_popup_option(self, option: int) -> None:
+        if self._annotation_popup == "color" and 0 <= option < len(PALETTE):
+            self.annotator.color_idx = option
+        elif self._annotation_popup == "width" and 0 <= option < len(WIDTHS):
+            self.annotator.width_idx = option
+        self._close_annotation_popup()
 
     # ------------------------------------------------------------------
     # drawing
@@ -506,6 +608,8 @@ class OverlaySurface:
                     hover_id=self._hover_button,
                     active_id=self._annotate_active_id(),
                 )
+                self._draw_annotation_toolbar_values(ctx)
+                self._draw_annotation_popup(ctx)
             else:
                 # 5) handles
                 self._draw_handles(ctx, r)
@@ -555,6 +659,94 @@ class OverlaySurface:
         ctx.stroke()
         ctx.set_source_rgba(0.93, 0.95, 1.0, 1)
         _pango_draw(ctx, text, bx + pad_x, by + pad_y, 11)
+
+    def _draw_annotation_popup(self, ctx: cairo.Context) -> None:
+        if self._annotation_popup is None:
+            return
+        (px, py, pw, ph), options = self._annotation_popup_layout()
+        _rounded_rect(ctx, px + 1, py + 3, pw, ph, 11)
+        ctx.set_source_rgba(0, 0, 0, 0.30)
+        ctx.fill()
+        _rounded_rect(ctx, px, py, pw, ph, 11)
+        ctx.set_source_rgba(0.075, 0.09, 0.125, 0.98)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(0.76, 0.82, 0.96, 0.22)
+        ctx.set_line_width(1)
+        ctx.stroke()
+
+        current = (
+            self.annotator.color_idx
+            if self._annotation_popup == "color"
+            else self.annotator.width_idx
+        )
+        for idx, (ox, oy, ow, oh) in enumerate(options):
+            hovered = idx == self._annotation_popup_hover
+            selected = idx == current
+            _rounded_rect(ctx, ox, oy, ow, oh, 8)
+            if hovered:
+                ctx.set_source_rgba(0.30, 0.39, 0.62, 0.76)
+            elif selected:
+                ctx.set_source_rgba(0.24, 0.33, 0.55, 0.70)
+            else:
+                ctx.set_source_rgba(1, 1, 1, 0.045)
+            ctx.fill()
+
+            if self._annotation_popup == "color":
+                cr, cg, cb = PALETTE[idx]
+                cx, cy = ox + ow / 2, oy + oh / 2
+                ctx.arc(cx, cy, 9, 0, 2 * 3.141592653589793)
+                ctx.set_source_rgb(cr, cg, cb)
+                ctx.fill_preserve()
+                ctx.set_source_rgba(1, 1, 1, 0.80 if selected else 0.24)
+                ctx.set_line_width(2 if selected else 1)
+                ctx.stroke()
+                if selected:
+                    ctx.set_source_rgb(1, 1, 1)
+                    ctx.set_line_width(1.8)
+                    ctx.move_to(cx - 4, cy)
+                    ctx.line_to(cx - 1, cy + 3)
+                    ctx.line_to(cx + 5, cy - 4)
+                    ctx.stroke()
+            else:
+                width = WIDTHS[idx]
+                ctx.set_source_rgb(*self.annotator.color)
+                ctx.set_line_width(width)
+                ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+                ctx.move_to(ox + 11, oy + oh / 2)
+                ctx.line_to(ox + ow - 11, oy + oh / 2)
+                ctx.stroke()
+                ctx.set_line_cap(cairo.LINE_CAP_BUTT)
+                label = f"{int(width)} px"
+                tw, th = _pango_measure(ctx, label, 9)
+                ctx.set_source_rgba(0.88, 0.91, 0.98, 0.76)
+                _pango_draw(ctx, label, ox + (ow - tw) / 2, oy + oh - th - 3, 9)
+            if selected:
+                _rounded_rect(ctx, ox - 1, oy - 1, ow + 2, oh + 2, 9)
+                ctx.set_source_rgba(0.48, 0.62, 1.0, 0.85)
+                ctx.set_line_width(1.5)
+                ctx.stroke()
+
+    def _draw_annotation_toolbar_values(self, ctx: cairo.Context) -> None:
+        """Show the current colour and width even while the popup is closed."""
+        by_id = {button.id: button for button in self.annotate_toolbar.buttons}
+        color_button = by_id["anno.color"]
+        cx = color_button.x + 8
+        cy = color_button.y + color_button.h - 7
+        ctx.arc(cx, cy, 3.5, 0, 2 * 3.141592653589793)
+        ctx.set_source_rgb(*self.annotator.color)
+        ctx.fill_preserve()
+        ctx.set_source_rgba(1, 1, 1, 0.55)
+        ctx.set_line_width(1)
+        ctx.stroke()
+
+        width_button = by_id["anno.width"]
+        ctx.set_source_rgb(*self.annotator.color)
+        ctx.set_line_width(min(self.annotator.width, 4.5))
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.move_to(width_button.x + 6, width_button.y + width_button.h - 7)
+        ctx.line_to(width_button.x + 18, width_button.y + width_button.h - 7)
+        ctx.stroke()
+        ctx.set_line_cap(cairo.LINE_CAP_BUTT)
 
     def _draw_center_hint(self, ctx: cairo.Context, text: str, w: int, h: int) -> None:
         tw, th = _pango_measure(ctx, text, 13)

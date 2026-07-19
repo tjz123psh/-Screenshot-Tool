@@ -12,6 +12,8 @@ from pngshot.longshot.stitcher import Stitcher
 from pngshot.overlay.model import Mode, Rect
 from pngshot.overlay.annotate import Annotator
 from pngshot.overlay.selector import Selector
+from pngshot.overlay.surface import OverlaySurface
+from pngshot.overlay.toolbar import ANNOTATE_BUTTONS, Toolbar
 from pngshot.services import saver
 
 
@@ -97,6 +99,52 @@ class ConfigAndSaverTests(unittest.TestCase):
 
 
 class AnnotationTests(unittest.TestCase):
+    def _surface_stub(self):
+        surface = OverlaySurface.__new__(OverlaySurface)
+        surface.screen_w = 640
+        surface.screen_h = 480
+        surface.selector = Selector(surface.screen_w, surface.screen_h)
+        surface.selector.rect = Rect(12, 36, 616, 390)
+        surface.annotate_toolbar = Toolbar(ANNOTATE_BUTTONS)
+        surface.annotator = Annotator()
+        surface._annotation_popup = "color"
+        surface._annotation_popup_hover = -1
+
+        class Canvas:
+            def queue_draw(self):
+                pass
+
+        surface.canvas = Canvas()
+        return surface
+
+    def test_annotation_popup_is_clamped_and_selectable(self):
+        surface = self._surface_stub()
+        popup, options = surface._annotation_popup_layout()
+        self.assertEqual(len(options), 6)
+        self.assertGreaterEqual(popup[0], 8)
+        self.assertLessEqual(popup[0] + popup[2], surface.screen_w - 8)
+        self.assertGreaterEqual(popup[1], 8)
+        self.assertLessEqual(popup[1] + popup[3], surface.screen_h - 8)
+
+        ox, oy, ow, oh = options[4]
+        self.assertEqual(surface._annotation_popup_hit_test(ox + ow / 2, oy + oh / 2), 4)
+        surface._apply_annotation_popup_option(4)
+        self.assertEqual(surface.annotator.color_idx, 4)
+        self.assertIsNone(surface._annotation_popup)
+
+    def test_annotation_width_popup_uses_real_presets(self):
+        surface = self._surface_stub()
+        surface._annotation_popup = "width"
+        _popup, options = surface._annotation_popup_layout()
+        self.assertEqual(len(options), 4)
+        widths = [2.0, 4.0, 7.0, 11.0]
+        for idx, (ox, oy, ow, oh) in enumerate(options):
+            self.assertGreater(ow, 0)
+            self.assertGreater(oh, 0)
+            surface._apply_annotation_popup_option(idx)
+            self.assertEqual(surface.annotator.width, widths[idx])
+            surface._annotation_popup = "width"
+
     def test_cached_annotation_is_baked_at_crop_origin(self):
         base = cairo.ImageSurface(cairo.FORMAT_ARGB32, 80, 60)
         cr = cairo.Context(base)
