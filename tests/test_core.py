@@ -1,5 +1,7 @@
 import tempfile
+import threading
 import unittest
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +11,7 @@ from PIL import Image
 from pngshot import config
 from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
+from pngshot.longshot.recorder import LongshotRecorder
 from pngshot.overlay.model import Mode, Rect
 from pngshot.overlay.annotate import Annotator
 from pngshot.overlay.selector import Selector
@@ -62,6 +65,57 @@ class StitcherTests(unittest.TestCase):
         stitcher.add(frame)
         stitcher.add(frame.copy())
         self.assertEqual(stitcher.current_height(), 40)
+
+
+class LongshotRecorderTests(unittest.TestCase):
+    def test_drain_pending_frames_preserves_capture_order(self):
+        """Frames captured before clicking 完成 must all reach the stitcher."""
+        recorder = LongshotRecorder.__new__(LongshotRecorder)
+        frame1 = Image.new("RGB", (4, 3), "red")
+        frame2 = Image.new("RGB", (4, 3), "blue")
+        recorder._pending_frames = deque([frame1, frame2], maxlen=24)
+        recorder._pending_lock = threading.Lock()
+        consumed = []
+
+        def process(frame):
+            consumed.append(frame)
+
+        recorder._process_frame = process
+        recorder._drain_pending_frames()
+
+        self.assertEqual(consumed, [frame1, frame2])
+        self.assertFalse(recorder._pending_frames)
+
+    def test_finish_flushes_queue_before_building_result(self):
+        recorder = LongshotRecorder.__new__(LongshotRecorder)
+        frame1 = Image.new("RGB", (4, 3), "red")
+        frame2 = Image.new("RGB", (4, 3), "blue")
+        recorder._finished = False
+        recorder._sampling = True
+        recorder._pending_frames = deque([frame1, frame2], maxlen=24)
+        recorder._pending_lock = threading.Lock()
+        recorder.window = type("Window", (), {"close": lambda self: None})()
+        consumed = []
+        completed = []
+
+        def process(frame):
+            consumed.append(frame)
+
+        class StitcherStub:
+            def result(self):
+                testcase.assertEqual(consumed, [frame1, frame2])
+                return type("Result", (), {"image": frame2, "warnings": []})()
+
+        testcase = self
+        recorder._process_frame = process
+        recorder.stitcher = StitcherStub()
+        recorder.on_done = lambda image, warnings: completed.append((image, warnings))
+
+        recorder._finish(cancel=False)
+
+        self.assertFalse(recorder._sampling)
+        self.assertTrue(recorder._finished)
+        self.assertEqual(completed, [(frame2, [])])
 
 
 class ConfigAndSaverTests(unittest.TestCase):

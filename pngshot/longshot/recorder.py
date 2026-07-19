@@ -320,6 +320,8 @@ class LongshotRecorder:
                 time.sleep(0.1)
                 continue
             with self._pending_lock:
+                if not self._sampling:
+                    break
                 if len(self._pending_frames) == self._pending_frames.maxlen:
                     # Drop the oldest only under sustained overload; keeping
                     # the newest samples lets the recorder recover promptly.
@@ -435,10 +437,25 @@ class LongshotRecorder:
             self.on_done(None, [])
             return
         try:
+            # The worker may have captured several frames while the main loop
+            # was busy repainting the preview or while the user clicked
+            # 完成.  Stitch those already-owned frames before taking the final
+            # snapshot; otherwise the saved image silently stops short of the
+            # last visible scroll position.
+            self._drain_pending_frames()
             res = self.stitcher.result()
             self.on_done(res.image, res.warnings)
         except ValueError:
             self.on_done(None, ["no frames captured"])
+
+    def _drain_pending_frames(self) -> None:
+        """Consume frames already captured before recording was stopped."""
+        while True:
+            with self._pending_lock:
+                if not self._pending_frames:
+                    return
+                frame = self._pending_frames.popleft()
+            self._process_frame(frame)
 
 
 # ---------------------------------------------------------------------------
