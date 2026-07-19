@@ -7,7 +7,7 @@ export PYTHONPATH="$PNGSHOT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # gtk4-layer-shell must be loaded before libwayland-client; PyGObject links
 # them in the wrong order, so preload the shim (upstream-recommended fix).
 _LAYER_SHELL_LIB="/usr/lib/libgtk4-layer-shell.so"
-if [[ -e "$_LAYER_SHELL_LIB" ]]; then
+if [[ "${1:-}" != "tray" && -e "$_LAYER_SHELL_LIB" ]]; then
     export LD_PRELOAD="${_LAYER_SHELL_LIB}${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 

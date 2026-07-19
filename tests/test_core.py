@@ -12,6 +12,7 @@ from PIL import Image
 
 from pngshot import config
 from pngshot import controller, diagnostics
+from pngshot import tray_config
 from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
 from pngshot.longshot.recorder import LongshotRecorder
@@ -88,6 +89,27 @@ class ControllerTests(unittest.TestCase):
             with mock.patch.dict("os.environ", {"HOME": directory}):
                 check = diagnostics._shortcut_check()
             self.assertEqual(check.status, "ok")
+
+    def test_tray_preferences_keep_safe_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": directory}):
+                self.assertEqual(
+                    tray_config.load_preferences(), {"save": True, "copy": True}
+                )
+                tray_config.save_preferences({"save": False, "copy": True})
+                self.assertEqual(
+                    tray_config.load_preferences(), {"save": False, "copy": True}
+                )
+
+    def test_tray_preferences_ignore_malformed_types(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": directory}):
+                path = tray_config.preference_path()
+                path.parent.mkdir(parents=True)
+                path.write_text('{"save": "no", "copy": false}')
+                self.assertEqual(
+                    tray_config.load_preferences(), {"save": True, "copy": False}
+                )
 
 
 class StitcherTests(unittest.TestCase):

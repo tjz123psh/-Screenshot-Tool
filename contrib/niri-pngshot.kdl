@@ -47,6 +47,4 @@ binds {
     // Pin whatever image is currently on the clipboard.
     Mod+Print { spawn "pngshotctl" "pin-last"; }
 
-    // Open the optional status / diagnostics control center.
-    Mod+Alt+Print { spawn "pngshotctl" "client"; }
 }

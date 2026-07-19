@@ -19,7 +19,7 @@
   - `c` 复制，`s` 保存，`0` 重置缩放，`q`/`Esc` 关闭，右键菜单
 - **长截图** —— 半自动。Wayland 禁止合成滚动事件，所以由你手动滚动目标窗口，pngshot 按定时采样选区，并用 OpenCV 模板匹配拼接各帧。`Space` 强制取一帧，`Enter` 完成，`Esc` 取消。
 - **可靠的快捷键服务** —— 轻量后台服务确认每次调用；异常退出自动重启，动作启动失败会显示桌面通知并记录日志。
-- **控制中心** —— 查看服务、截图组件、OCR、翻译和 Niri 快捷键状态，也可直接启动截图、运行诊断或重启服务。
+- **系统托盘** —— 常驻相机图标显示就绪/截图中/异常；菜单直接提供区域截图、长截图、钉图、保存/复制偏好、诊断和重启。
 
 ## 一键安装
 
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/ins
 
 1. 把源码克隆/更新到 `~/.local/share/pngshot`
 2. 安装 `pngshot` / `pngshotctl` 启动器（内置 `PYTHONPATH` 与 `LD_PRELOAD` 修复）
-3. 安装并启动 systemd 用户服务，把控制中心加入应用菜单
+3. 安装并启动 systemd 用户服务与系统托盘
 4. 检查系统依赖，列出缺失项及对应的 `pacman` 安装命令
 5. 提示 `~/.local/bin` 是否在 `PATH` 中
 
@@ -43,8 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/ins
 
 ```
 grim wl-clipboard libnotify tesseract tesseract-data-chi_sim tesseract-data-eng
-python-gobject python-cairo gtk4-layer-shell libadwaita python-pillow
-python-opencv python-numpy
+python-gobject python-cairo gtk4-layer-shell libayatana-appindicator
+python-pillow python-opencv python-numpy
 ```
 
 翻译功能使用 PATH 上的 `opencode`（免费模型，无需登录）；不装也不影响其它功能。
@@ -53,8 +53,8 @@ python-opencv python-numpy
 
 ```sh
 sudo pacman -S grim wl-clipboard libnotify tesseract tesseract-data-chi_sim \
-    tesseract-data-eng python-gobject python-cairo gtk4-layer-shell libadwaita \
-    python-pillow python-opencv python-numpy
+    tesseract-data-eng python-gobject python-cairo gtk4-layer-shell \
+    libayatana-appindicator python-pillow python-opencv python-numpy
 ```
 
 ## 手动安装
@@ -83,7 +83,7 @@ pngshot region
 | `Shift+Print` | `pngshot long` |
 | `Mod+Print` | `pngshot pin-last` |
 
-`pngshot` 与 `pngshotctl` 都会走同一套确认协议。新配置推荐使用 `pngshotctl`，便于区分“向服务发送动作”和内部一次性窗口进程。控制中心可绑定为 `pngshotctl client`。
+`pngshot` 与 `pngshotctl` 都会走同一套确认协议。新配置推荐使用 `pngshotctl`，便于区分“向服务发送动作”和内部一次性窗口进程。
 
 ### 服务状态
 
@@ -95,10 +95,10 @@ pngshotctl status --json   # Niri/Waybar/QuickShell 状态模块
 pngshotctl doctor          # 依赖、环境、OCR 语言、快捷键诊断
 pngshotctl restart         # 重启服务
 pngshotctl logs            # 最近 50 行日志
-pngshotctl client          # 打开控制中心
+pngshotctl tray            # 手动启动托盘（通常由 systemd 自动启动）
 ```
 
-状态模块可按 JSON 的 `state` 字段显示：`idle`（就绪）、`busy`（正在截图）、`stopped`（未运行）。点击模块时执行 `pngshotctl client` 即可打开控制中心。
+托盘图标会按状态切换：相机（就绪）、录制点（正在截图）、警告（服务异常）。若使用自定义状态模块，也可按 JSON 的 `state` 字段显示：`idle`、`busy`、`stopped`。
 
 ## 配置
 
@@ -113,7 +113,7 @@ pngshotctl client          # 打开控制中心
 | `pngshot region` | 交互式区域截图 |
 | `pngshot long` | 区域 → 长截图模式 |
 | `pngshot pin-last` | 把当前剪贴板图片钉到桌面 |
-| `pngshot client` | 打开服务状态与诊断控制中心 |
+| `pngshot tray` | 手动启动系统托盘（通常无需手动执行） |
 | `pngshot status --json` | 输出后台服务状态，供状态栏读取 |
 | `pngshot doctor` | 检查截图、OCR、通知、翻译和快捷键环境 |
 | `pngshot restart` | 重新启动后台服务 |
@@ -138,7 +138,7 @@ pngshotctl client          # 打开控制中心
 pngshot/
   __main__.py        CLI（region / long / pin-last / pin-file / text-file / debug）
   controller.py      Unix socket 后台服务、动作确认、自愈与失败通知
-  control_center.py  GTK4/libadwaita 服务状态与诊断客户端
+  tray.py            GTK3/Ayatana 系统托盘与简洁右键菜单
   diagnostics.py     Wayland/Niri/截图/OCR/翻译环境检查
   capture.py         grim 封装（全屏 / 指定输出 / 区域）
   config.py          ~/.config/pngshot/config.toml 加载器

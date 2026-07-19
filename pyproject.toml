@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 #   grim, wl-clipboard, tesseract, tesseract-data-{chi_sim,eng,osd},
 #   python-gobject, python-cairo, gtk4-layer-shell,
 #   python-pillow, python-opencv, python-numpy
-#   libadwaita (control center)
+#   libayatana-appindicator (system tray)
 dependencies = []
 
 [project.scripts]

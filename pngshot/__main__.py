@@ -4,7 +4,7 @@ User-facing subcommands:
   region            interactive region screenshot (Stage 1 overlay)
   long              interactive region + long-shot mode
   pin-last          open a pin window with the current clipboard image
-  client            open the service status / diagnostics control center
+  tray              run the compact system tray
   status/doctor     service state and runtime health checks
   restart/logs      service recovery and recent activity
   debug-capture     smoke-test: grab full screen, copy (+ optionally save)
@@ -136,8 +136,8 @@ def _cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_client(_args: argparse.Namespace) -> int:
-    from .control_center import run
+def _cmd_tray(_args: argparse.Namespace) -> int:
+    from .tray import run
     return run()
 
 
@@ -231,8 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--lines", type=int, default=50)
     logs.set_defaults(func=_cmd_logs)
 
-    client = sub.add_parser("client", help="open the Pngshot control center")
-    client.set_defaults(func=_cmd_client)
+    tray = sub.add_parser("tray", help="run the Pngshot system tray")
+    tray.set_defaults(func=_cmd_tray)
 
     return p
 

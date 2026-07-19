@@ -293,7 +293,7 @@ class _ServiceState:
         if rc not in (0, 130):
             notify(
                 "Pngshot 启动失败",
-                self.last_event + "。请打开控制中心或运行 pngshot doctor",
+                self.last_event + "。请右键托盘运行诊断或执行 pngshot doctor",
                 urgency="critical",
             )
 

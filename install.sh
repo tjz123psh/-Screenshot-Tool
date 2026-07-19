@@ -7,7 +7,7 @@
 # 做的事（全部在用户目录内，不需要 root）：
 #   1. 把源码克隆/更新到 ~/.local/share/pngshot
 #   2. 安装 pngshot / pngshotctl 启动器
-#   3. 安装并启动 systemd 用户服务与控制中心桌面入口
+#   3. 安装并启动 systemd 用户服务与系统托盘
 #   4. 检查系统依赖（pacman 包），列出缺失项和对应安装命令
 #   5. 提示 ~/.local/bin 是否在 PATH
 #
@@ -55,7 +55,7 @@ export PYTHONPATH="\$PNGSHOT_ROOT\${PYTHONPATH:+:\$PYTHONPATH}"
 # gtk4-layer-shell 必须在 libwayland-client 之前加载；PyGObject 的链接顺序相反，
 # 因此预加载官方推荐的 shim 修复 layer-shell 失效问题。
 _LAYER_SHELL_LIB="/usr/lib/libgtk4-layer-shell.so"
-if [[ -e "\$_LAYER_SHELL_LIB" ]]; then
+if [[ "\${1:-}" != "tray" && -e "\$_LAYER_SHELL_LIB" ]]; then
     export LD_PRELOAD="\${_LAYER_SHELL_LIB}\${LD_PRELOAD:+:\$LD_PRELOAD}"
 fi
 
@@ -65,29 +65,31 @@ chmod +x "$LAUNCHER"
 ln -sfn "pngshot" "$CTL_LAUNCHER"
 ok "启动器已安装"
 
-# --- 3. 后台服务与控制中心 ------------------------------------------------
-info "安装截图服务与控制中心"
+# --- 3. 后台服务与系统托盘 ------------------------------------------------
+info "安装截图服务与系统托盘"
 mkdir -p "$SYSTEMD_DIR" "$APPLICATION_DIR"
 sed "s|@PNGSHOT_LAUNCHER@|$LAUNCHER|g" \
     "$SRC_DIR/contrib/pngshot.service" > "$SYSTEMD_DIR/pngshot.service"
 sed "s|@PNGSHOT_LAUNCHER@|$LAUNCHER|g" \
-    "$SRC_DIR/contrib/ai.pngshot.ControlCenter.desktop" \
-    > "$APPLICATION_DIR/ai.pngshot.ControlCenter.desktop"
+    "$SRC_DIR/contrib/pngshot-tray.service" > "$SYSTEMD_DIR/pngshot-tray.service"
+# Remove the rejected full-size control-center entry from older installations.
+rm -f "$APPLICATION_DIR/ai.pngshot.ControlCenter.desktop"
 
 if command -v systemctl >/dev/null; then
     systemctl --user daemon-reload
     # `enable --now` does not replace an already-running daemon after an
     # upgrade. The CLI restart handshake also shuts down a previous directly
     # spawned instance before systemd starts the newly installed code.
-    if systemctl --user enable pngshot.service && "$LAUNCHER" restart; then
-        ok "截图服务已启动，并将在登录后自动运行"
+    if systemctl --user enable pngshot.service pngshot-tray.service \
+        && "$LAUNCHER" restart \
+        && systemctl --user restart pngshot-tray.service; then
+        ok "截图服务与系统托盘已启动，并将在登录后自动运行"
     else
         warn "截图服务暂未启动；快捷键调用时仍会自动拉起"
     fi
 else
     warn "未找到 systemctl；快捷键调用时会按需启动服务"
 fi
-ok "控制中心已加入应用菜单"
 
 # --- 4. 依赖检查 ----------------------------------------------------------
 info "检查系统依赖"
@@ -117,8 +119,8 @@ for mod in "${!PY_PKG[@]}"; do
 done
 # gtk4-layer-shell 是 .so，单独检查
 [[ -e /usr/lib/libgtk4-layer-shell.so ]] || missing+=(gtk4-layer-shell)
-python3 -c "import gi; gi.require_version('Adw', '1')" >/dev/null 2>&1 \
-    || missing+=(libadwaita)
+python3 -c "import gi; gi.require_version('AyatanaAppIndicator3', '0.1')" \
+    >/dev/null 2>&1 || missing+=(libayatana-appindicator)
 # tesseract 中英语言包（命令存在时才细查）
 if command -v tesseract >/dev/null; then
     langs="$(tesseract --list-langs 2>/dev/null || true)"
@@ -146,6 +148,6 @@ case ":$PATH:" in
 esac
 
 echo
-ok "安装完成。运行 'pngshot client' 打开控制中心。"
+ok "安装完成。Pngshot 相机图标已加入系统托盘。"
 info "状态检查：pngshotctl status；完整诊断：pngshotctl doctor"
 info "niri 键位与窗口规则示例见：$SRC_DIR/contrib/niri-pngshot.kdl"

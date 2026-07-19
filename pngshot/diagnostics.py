@@ -1,4 +1,4 @@
-"""Runtime health checks shared by the CLI and control center."""
+"""Runtime health checks shared by the CLI and system tray."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass

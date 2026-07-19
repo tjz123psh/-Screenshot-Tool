@@ -24,7 +24,7 @@
 ## 1. 运行架构（一句话版）
 
 - 用户命令先通过 `controller.py` 的私有 Unix socket 发给轻量 `pngshot.service`，服务立即确认并 spawn **一次性动作进程**：`pngshot region` 抓全屏 → 全屏 `wlr-layer-shell` 覆盖层选区 → 选完执行动作。服务不可用时 CLI 会自动拉起、重试，再失败才回退直接运行。
-- 后台服务不导入 GTK，只负责单实例、状态、日志和失败通知；`control_center.py` 是独立的可选 libadwaita 客户端，任何 socket/诊断调用都在线程中执行，结果用 `GLib.idle_add` 回主线程。
+- 后台服务不导入 GTK，只负责单实例、状态、日志和失败通知；`tray.py` 是独立 GTK3/Ayatana AppIndicator 进程（避免与截图窗口的 GTK4 混载），右键菜单提供动作与两个简单偏好。socket/诊断调用都在线程中执行，结果用 `GLib.idle_add` 回主线程。
 - 需要长期存活的窗口（钉图 / OCR / 翻译）由覆盖层进程 **spawn 独立子进程**（detached），临时图经临时 PNG 传递；子进程完整载入图片后立即用 `--cleanup` 删除临时文件，窗口后续只持有内存图像。
 - 长截图（`long`）**不 spawn**，留在本进程内：覆盖层选完区 → `app.hold()` 保活 → 后台线程按帧采样屏幕矩形 → 主线程拼接。
 
