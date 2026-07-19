@@ -119,6 +119,16 @@ install -m 0644 "$SRC_DIR/contrib/icons/ai.pngshot-warning-symbolic.svg" \
     "$ICON_STATUS_DIR/ai.pngshot-warning-symbolic.svg"
 # Remove the rejected full-size control-center entry from older installations.
 rm -f "$APPLICATION_DIR/ai.pngshot.ControlCenter.desktop"
+# Refresh user caches when the desktop provides the helpers.  Both commands
+# are best-effort: the files themselves remain valid without a cache, but a
+# running launcher may otherwise wait until the next login to notice them.
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" \
+        >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$APPLICATION_DIR" >/dev/null 2>&1 || true
+fi
 
 if command -v systemctl >/dev/null; then
     systemctl --user daemon-reload
