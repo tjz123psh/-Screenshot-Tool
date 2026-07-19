@@ -79,6 +79,25 @@ class ControllerTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"PNGSHOT_BYPASS_SERVICE": "1"}):
             self.assertEqual(controller.route_action("region", []), (False, 0))
 
+    def test_running_service_receives_action_without_preflight_ping(self):
+        response = {"accepted": True}
+        with mock.patch.object(controller, "request", return_value=response) as request:
+            with mock.patch.object(controller, "ensure_service") as ensure:
+                self.assertEqual(controller.route_action("region", []), (True, 0))
+        request.assert_called_once_with(
+            "action", action="region", args=[], timeout=0.7
+        )
+        ensure.assert_not_called()
+
+    def test_action_retries_after_starting_missing_service(self):
+        with mock.patch.object(
+            controller, "request", side_effect=[None, {"accepted": True}]
+        ) as request:
+            with mock.patch.object(controller, "ensure_service", return_value=True) as ensure:
+                self.assertEqual(controller.route_action("long", []), (True, 0))
+        self.assertEqual(request.call_count, 2)
+        ensure.assert_called_once_with()
+
     def test_niri_shortcut_check_follows_included_files(self):
         with tempfile.TemporaryDirectory() as directory:
             nested = Path(directory) / ".config/niri/dms"

@@ -27,17 +27,18 @@
 curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install.sh | bash
 ```
 
-脚本全程在用户目录内操作，**不需要 root**：
+脚本会把程序安装在用户目录；在 Arch Linux 上若检测到缺失的系统依赖，会仅在装包阶段请求一次 `sudo`：
 
-1. 把源码克隆/更新到 `~/.local/share/pngshot`
-2. 安装 `pngshot` / `pngshotctl` 启动器（内置 `PYTHONPATH` 与 `LD_PRELOAD` 修复）
-3. 安装并启动 systemd 用户服务与系统托盘
-4. 检查系统依赖，列出缺失项及对应的 `pacman` 安装命令
-5. 提示 `~/.local/bin` 是否在 `PATH` 中
+1. 用 `pacman` 自动安装实际缺失的运行依赖（已安装的包不会重复安装）
+2. 把源码克隆/更新到 `~/.local/share/pngshot`
+3. 安装 `pngshot` / `pngshotctl` 启动器（内置 `PYTHONPATH` 与 `LD_PRELOAD` 修复）
+4. 安装应用菜单入口、应用图标和系统托盘状态图标
+5. 安装并启动 systemd 用户服务与系统托盘
+6. 再次检查运行环境，并提示 `~/.local/bin` 是否在 `PATH` 中
 
 重复运行是幂等的：已安装则 `git pull` 更新后重装启动器。
 
-> 依赖是系统级 `pacman` 包，安装脚本只做检查、不代为安装（避免脚本索要 sudo）。按脚本给出的命令自行安装即可。
+> 不希望脚本自动装包时，可使用 `curl ... | PNGSHOT_SKIP_PACKAGES=1 bash`；脚本仍会检查环境并列出缺失项。非 Arch 系统没有 `pacman` 时也会自动跳过装包步骤。
 
 ## 依赖（均为 pacman 包）
 
@@ -138,7 +139,7 @@ pngshotctl tray            # 手动启动托盘（通常由 systemd 自动启动
 pngshot/
   __main__.py        CLI（region / long / pin-last / pin-file / text-file / debug）
   controller.py      Unix socket 后台服务、动作确认、自愈与失败通知
-  tray.py            GLib/Ayatana 系统托盘与简洁右键菜单
+  tray.py            GTK3/Ayatana 系统托盘与传统 dbusmenu 右键菜单
   diagnostics.py     Wayland/Niri/截图/OCR/翻译环境检查
   capture.py         grim 封装（全屏 / 指定输出 / 区域）
   config.py          ~/.config/pngshot/config.toml 加载器

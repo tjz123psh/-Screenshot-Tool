@@ -129,10 +129,16 @@ def route_action(action: str, args: list[str]) -> tuple[bool, int]:
     """
     if os.environ.get(_BYPASS_ENV) == "1":
         return False, 0
-    if not ensure_service():
-        notify("Pngshot 启动失败", "后台服务无法启动，正在尝试直接运行")
-        return False, 0
+
+    # Fast path for hotkeys: send the action immediately.  The old path sent a
+    # separate ping first, adding an avoidable Python/socket round trip to every
+    # screenshot even while the supervised service was healthy.
     response = request("action", action=action, args=args, timeout=0.7)
+    if response is None:
+        if not ensure_service():
+            notify("Pngshot 启动失败", "后台服务无法启动，正在尝试直接运行")
+            return False, 0
+        response = request("action", action=action, args=args, timeout=0.7)
     if response is None:
         notify("Pngshot 没有响应", "后台服务未确认快捷键请求")
         return False, 0

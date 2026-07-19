@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Pngshot
+GenericName=Screenshot Tool
+Comment=Capture, annotate, OCR, translate, and create long screenshots
+Comment[zh_CN]=截图、标注、OCR、翻译与长截图
+Exec=@PNGSHOT_LAUNCHER@ tray
+TryExec=@PNGSHOT_LAUNCHER@
+Icon=ai.pngshot
+Terminal=false
+Categories=Graphics;
+Keywords=Screenshot;Capture;OCR;Translate;Longshot;截图;长截图;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

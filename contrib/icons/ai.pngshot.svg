@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="24" y1="16" x2="104" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6d5dfc"/>
+      <stop offset="1" stop-color="#3557d8"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="50" y1="48" x2="79" y2="82" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d9e4ff"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="27" fill="url(#bg)"/>
+  <path d="M24 44a8 8 0 0 1 8-8h16l7-9h22l7 9h12a8 8 0 0 1 8 8v48a8 8 0 0 1-8 8H32a8 8 0 0 1-8-8z" fill="#f7f8ff"/>
+  <circle cx="66" cy="68" r="23" fill="#273b7a"/>
+  <circle cx="66" cy="68" r="14" fill="url(#lens)"/>
+  <circle cx="71" cy="62" r="5" fill="#ffffff" opacity=".9"/>
+  <circle cx="93" cy="48" r="4" fill="#ffb24a"/>
+  <path d="M17 39V23a6 6 0 0 1 6-6h16M89 17h16a6 6 0 0 1 6 6v16M111 89v16a6 6 0 0 1-6 6H89M39 111H23a6 6 0 0 1-6-6V89" fill="none" stroke="#ffbd59" stroke-width="6" stroke-linecap="round"/>
+</svg>
