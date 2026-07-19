@@ -39,11 +39,14 @@ window-rule {
 
 binds {
     // Interactive region screenshot (Stage 1 overlay: select → toolbar).
-    Print { spawn "pngshot" "region"; }
+    Print { spawn "pngshotctl" "region"; }
 
     // Region screenshot straight into long-shot mode.
-    Shift+Print { spawn "pngshot" "long"; }
+    Shift+Print { spawn "pngshotctl" "long"; }
 
     // Pin whatever image is currently on the clipboard.
-    Mod+Print { spawn "pngshot" "pin-last"; }
+    Mod+Print { spawn "pngshotctl" "pin-last"; }
+
+    // Open the optional status / diagnostics control center.
+    Mod+Alt+Print { spawn "pngshotctl" "client"; }
 }

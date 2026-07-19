@@ -1,16 +1,18 @@
 [project]
 name = "pngshot"
-version = "0.1.0"
+version = "0.2.0"
 description = "Region screenshot with pin, OCR, LLM translation, annotation, long-shot"
 requires-python = ">=3.11"
 # All runtime deps are pacman-managed system packages; nothing to pip-install:
 #   grim, wl-clipboard, tesseract, tesseract-data-{chi_sim,eng,osd},
 #   python-gobject, python-cairo, gtk4-layer-shell,
 #   python-pillow, python-opencv, python-numpy
+#   libadwaita (control center)
 dependencies = []
 
 [project.scripts]
 pngshot = "pngshot.__main__:main"
+pngshotctl = "pngshot.__main__:main"
 
 [build-system]
 requires = ["setuptools>=64"]

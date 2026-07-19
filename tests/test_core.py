@@ -1,14 +1,17 @@
 import tempfile
 import threading
+import time
 import unittest
 from collections import deque
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import cairo
 from PIL import Image
 
 from pngshot import config
+from pngshot import controller, diagnostics
 from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
 from pngshot.longshot.recorder import LongshotRecorder
@@ -40,6 +43,51 @@ class SelectorTests(unittest.TestCase):
         selector.release()
         self.assertEqual(selector.rect.x2, 100)
         self.assertEqual(selector.rect.y2, 80)
+
+
+class ControllerTests(unittest.TestCase):
+    def test_daemon_status_protocol_and_clean_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            state = Path(directory) / "state"
+            runtime.mkdir()
+            env = {
+                "XDG_RUNTIME_DIR": str(runtime),
+                "XDG_STATE_HOME": str(state),
+            }
+            with mock.patch.dict("os.environ", env, clear=False):
+                thread = threading.Thread(target=controller.run_daemon, daemon=True)
+                thread.start()
+                response = None
+                deadline = time.monotonic() + 2
+                while response is None and time.monotonic() < deadline:
+                    response = controller.request("status", timeout=0.1)
+                    if response is None:
+                        time.sleep(0.02)
+                self.assertIsNotNone(response)
+                self.assertTrue(response["running"])
+                self.assertEqual(response["state"], "idle")
+
+                rejected = controller.request("action", action="unknown", args=[])
+                self.assertFalse(rejected["accepted"])
+                self.assertTrue(controller.request("shutdown")["ok"])
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+
+    def test_service_bypass_preserves_direct_action_path(self):
+        with mock.patch.dict("os.environ", {"PNGSHOT_BYPASS_SERVICE": "1"}):
+            self.assertEqual(controller.route_action("region", []), (False, 0))
+
+    def test_niri_shortcut_check_follows_included_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            nested = Path(directory) / ".config/niri/dms"
+            nested.mkdir(parents=True)
+            (nested / "keybinds.kdl").write_text(
+                'Mod+Print { spawn "pngshotctl" "region"; }'
+            )
+            with mock.patch.dict("os.environ", {"HOME": directory}):
+                check = diagnostics._shortcut_check()
+            self.assertEqual(check.status, "ok")
 
 
 class StitcherTests(unittest.TestCase):

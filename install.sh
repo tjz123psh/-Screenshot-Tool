@@ -6,9 +6,10 @@
 #
 # 做的事（全部在用户目录内，不需要 root）：
 #   1. 把源码克隆/更新到 ~/.local/share/pngshot
-#   2. 在 ~/.local/bin/pngshot 生成启动器（内置 PNGSHOT_ROOT + LD_PRELOAD 修复）
-#   3. 检查系统依赖（pacman 包），列出缺失项和对应安装命令
-#   4. 提示 ~/.local/bin 是否在 PATH
+#   2. 安装 pngshot / pngshotctl 启动器
+#   3. 安装并启动 systemd 用户服务与控制中心桌面入口
+#   4. 检查系统依赖（pacman 包），列出缺失项和对应安装命令
+#   5. 提示 ~/.local/bin 是否在 PATH
 #
 # 重复运行是幂等的：已存在则 git pull 更新，再重装启动器。
 set -euo pipefail
@@ -17,6 +18,9 @@ REPO_URL="${PNGSHOT_REPO_URL:-https://github.com/tjz123psh/-Screenshot-Tool.git}
 SRC_DIR="${PNGSHOT_ROOT:-$HOME/.local/share/pngshot}"
 BIN_DIR="${PNGSHOT_BIN_DIR:-$HOME/.local/bin}"
 LAUNCHER="$BIN_DIR/pngshot"
+CTL_LAUNCHER="$BIN_DIR/pngshotctl"
+SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+APPLICATION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 
 info()  { printf '\033[1;34m::\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -58,15 +62,41 @@ fi
 exec python3 -m pngshot "\$@"
 EOF
 chmod +x "$LAUNCHER"
+ln -sfn "pngshot" "$CTL_LAUNCHER"
 ok "启动器已安装"
 
-# --- 3. 依赖检查 ----------------------------------------------------------
+# --- 3. 后台服务与控制中心 ------------------------------------------------
+info "安装截图服务与控制中心"
+mkdir -p "$SYSTEMD_DIR" "$APPLICATION_DIR"
+sed "s|@PNGSHOT_LAUNCHER@|$LAUNCHER|g" \
+    "$SRC_DIR/contrib/pngshot.service" > "$SYSTEMD_DIR/pngshot.service"
+sed "s|@PNGSHOT_LAUNCHER@|$LAUNCHER|g" \
+    "$SRC_DIR/contrib/ai.pngshot.ControlCenter.desktop" \
+    > "$APPLICATION_DIR/ai.pngshot.ControlCenter.desktop"
+
+if command -v systemctl >/dev/null; then
+    systemctl --user daemon-reload
+    # `enable --now` does not replace an already-running daemon after an
+    # upgrade. The CLI restart handshake also shuts down a previous directly
+    # spawned instance before systemd starts the newly installed code.
+    if systemctl --user enable pngshot.service && "$LAUNCHER" restart; then
+        ok "截图服务已启动，并将在登录后自动运行"
+    else
+        warn "截图服务暂未启动；快捷键调用时仍会自动拉起"
+    fi
+else
+    warn "未找到 systemctl；快捷键调用时会按需启动服务"
+fi
+ok "控制中心已加入应用菜单"
+
+# --- 4. 依赖检查 ----------------------------------------------------------
 info "检查系统依赖"
 
 # 命令行工具 -> 所属 pacman 包
 declare -A CMD_PKG=(
     [grim]=grim
     [wl-copy]=wl-clipboard
+    [notify-send]=libnotify
     [tesseract]=tesseract
 )
 # Python 模块 -> 所属 pacman 包
@@ -87,6 +117,8 @@ for mod in "${!PY_PKG[@]}"; do
 done
 # gtk4-layer-shell 是 .so，单独检查
 [[ -e /usr/lib/libgtk4-layer-shell.so ]] || missing+=(gtk4-layer-shell)
+python3 -c "import gi; gi.require_version('Adw', '1')" >/dev/null 2>&1 \
+    || missing+=(libadwaita)
 # tesseract 中英语言包（命令存在时才细查）
 if command -v tesseract >/dev/null; then
     langs="$(tesseract --list-langs 2>/dev/null || true)"
@@ -106,7 +138,7 @@ fi
 # opencode 是翻译功能的可选依赖
 command -v opencode >/dev/null || warn "未检测到 opencode（仅翻译功能需要，其它功能不受影响）"
 
-# --- 4. PATH 检查 ---------------------------------------------------------
+# --- 5. PATH 检查 ---------------------------------------------------------
 case ":$PATH:" in
     *":$BIN_DIR:"*) ok "$BIN_DIR 已在 PATH 中" ;;
     *) warn "$BIN_DIR 不在 PATH，请加入你的 shell 配置，例如：
@@ -114,5 +146,6 @@ case ":$PATH:" in
 esac
 
 echo
-ok "安装完成。运行 'pngshot region' 开始截图。"
+ok "安装完成。运行 'pngshot client' 打开控制中心。"
+info "状态检查：pngshotctl status；完整诊断：pngshotctl doctor"
 info "niri 键位与窗口规则示例见：$SRC_DIR/contrib/niri-pngshot.kdl"
