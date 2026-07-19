@@ -138,7 +138,7 @@ pngshotctl tray            # 手动启动托盘（通常由 systemd 自动启动
 pngshot/
   __main__.py        CLI（region / long / pin-last / pin-file / text-file / debug）
   controller.py      Unix socket 后台服务、动作确认、自愈与失败通知
-  tray.py            GTK3/Ayatana 系统托盘与简洁右键菜单
+  tray.py            GLib/Ayatana 系统托盘与简洁右键菜单
   diagnostics.py     Wayland/Niri/截图/OCR/翻译环境检查
   capture.py         grim 封装（全屏 / 指定输出 / 区域）
   config.py          ~/.config/pngshot/config.toml 加载器

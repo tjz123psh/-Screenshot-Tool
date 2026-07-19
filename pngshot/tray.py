@@ -1,8 +1,7 @@
 """Compact StatusNotifier/AppIndicator tray for pngshot.
 
-This process intentionally uses GTK 3 because Ayatana AppIndicator exposes a
-GTK 3 menu API. It stays separate from pngshot's GTK 4 capture windows, so the
-two major GTK versions are never loaded into one process.
+The tray uses the GLib-only Ayatana API with ``Gio.Menu`` and actions.  It does
+not load GTK at all; screenshot windows remain independent GTK 4 processes.
 """
 from __future__ import annotations
 
@@ -14,11 +13,10 @@ import threading
 
 import gi
 
-gi.require_version("Gtk", "3.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
+gi.require_version("AyatanaAppIndicatorGlib", "2.0")
 
-from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import AyatanaAppIndicatorGlib as AppIndicator  # noqa: E402
+from gi.repository import Gio, GLib  # noqa: E402
 
 from . import __version__
 from . import controller, diagnostics
@@ -33,6 +31,7 @@ class Tray:
     def __init__(self) -> None:
         self.preferences = load_preferences()
         self._refreshing = False
+        self.loop = GLib.MainLoop()
         self.indicator = AppIndicator.Indicator.new(
             INDICATOR_ID,
             "camera-photo-symbolic",
@@ -41,54 +40,69 @@ class Tray:
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("Pngshot")
 
-        menu = Gtk.Menu()
-        self.status_item = Gtk.MenuItem(label=f"Pngshot {__version__} · 正在连接")
-        self.status_item.set_sensitive(False)
-        menu.append(self.status_item)
-        menu.append(Gtk.SeparatorMenuItem())
+        self.actions = Gio.SimpleActionGroup()
+        self._add_action("region", lambda: self._run_action("region"))
+        self._add_action("long", lambda: self._run_action("long"))
+        self._add_action("pin-last", lambda: self._run_action("pin-last"))
+        self._add_toggle("save", self.preferences["save"])
+        self._add_toggle("copy", self.preferences["copy"])
+        self._add_action("doctor", self._run_diagnostics)
+        self._add_action("restart", self._restart_service)
+        self._add_action("quit", self.loop.quit)
 
-        menu.append(self._action_item("区域截图", "region"))
-        menu.append(self._action_item("长截图", "long"))
-        menu.append(self._action_item("钉住剪贴板", "pin-last"))
-        menu.append(Gtk.SeparatorMenuItem())
+        self.menu = Gio.Menu()
+        self.status_section = Gio.Menu()
+        self._set_status_label(f"Pngshot {__version__} · 正在连接")
+        self.menu.append_section(None, self.status_section)
+        self.menu.append_section(None, self._menu_section((
+            ("区域截图", "region"),
+            ("长截图", "long"),
+            ("钉住剪贴板", "pin-last"),
+        )))
+        self.menu.append_section(None, self._menu_section((
+            ("截图后保存", "save"),
+            ("截图后复制", "copy"),
+        )))
+        self.menu.append_section(None, self._menu_section((
+            ("运行诊断", "doctor"),
+            ("重启截图服务", "restart"),
+        )))
+        self.menu.append_section(None, self._menu_section((("退出托盘", "quit"),)))
 
-        save_item = Gtk.CheckMenuItem(label="截图后保存")
-        save_item.set_active(self.preferences["save"])
-        save_item.connect("toggled", self._toggle_preference, "save")
-        menu.append(save_item)
-
-        copy_item = Gtk.CheckMenuItem(label="截图后复制")
-        copy_item.set_active(self.preferences["copy"])
-        copy_item.connect("toggled", self._toggle_preference, "copy")
-        menu.append(copy_item)
-        menu.append(Gtk.SeparatorMenuItem())
-
-        doctor = Gtk.MenuItem(label="运行诊断")
-        doctor.connect("activate", lambda _item: self._run_diagnostics())
-        menu.append(doctor)
-
-        restart = Gtk.MenuItem(label="重启截图服务")
-        restart.connect("activate", lambda _item: self._restart_service())
-        menu.append(restart)
-
-        menu.append(Gtk.SeparatorMenuItem())
-
-        quit_item = Gtk.MenuItem(label="退出托盘")
-        quit_item.connect("activate", lambda _item: Gtk.main_quit())
-        menu.append(quit_item)
-
-        menu.show_all()
-        self.indicator.set_menu(menu)
+        self.indicator.set_actions(self.actions)
+        self.indicator.set_menu(self.menu)
         self._ensure_and_refresh()
         GLib.timeout_add_seconds(2, self._on_refresh_timer)
 
-    def _action_item(self, label: str, action: str) -> Gtk.MenuItem:
-        item = Gtk.MenuItem(label=label)
-        item.connect("activate", lambda _item: self._run_action(action))
-        return item
+    def _add_action(self, name: str, callback) -> None:
+        action = Gio.SimpleAction.new(name, None)
+        action.connect("activate", lambda _action, _parameter: callback())
+        self.actions.add_action(action)
 
-    def _toggle_preference(self, item: Gtk.CheckMenuItem, key: str) -> None:
-        self.preferences[key] = item.get_active()
+    def _add_toggle(self, key: str, active: bool) -> None:
+        action = Gio.SimpleAction.new_stateful(
+            key, None, GLib.Variant.new_boolean(active)
+        )
+        action.connect("change-state", self._toggle_preference, key)
+        self.actions.add_action(action)
+
+    @staticmethod
+    def _menu_section(items: tuple[tuple[str, str], ...]) -> Gio.Menu:
+        section = Gio.Menu()
+        for label, action in items:
+            section.append(label, f"indicator.{action}")
+        return section
+
+    def _set_status_label(self, label: str) -> None:
+        if self.status_section.get_n_items():
+            self.status_section.remove(0)
+        self.status_section.append(label, None)
+
+    def _toggle_preference(
+        self, action: Gio.SimpleAction, value: GLib.Variant, key: str
+    ) -> None:
+        self.preferences[key] = value.get_boolean()
+        action.set_state(value)
         try:
             save_preferences(self.preferences)
         except OSError:
@@ -161,8 +175,8 @@ class Tray:
             icon = "camera-photo-symbolic"
             label = f"Pngshot {__version__} · 服务已就绪"
             description = "Pngshot 截图服务已就绪"
-        self.status_item.set_label(label)
-        self.indicator.set_icon_full(icon, description)
+        self._set_status_label(label)
+        self.indicator.set_icon(icon, description)
         self.indicator.set_title(description)
         return False
 
@@ -202,7 +216,7 @@ def run() -> int:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return 0
-    Tray()
-    Gtk.main()
+    tray = Tray()
+    tray.loop.run()
     lock_file.close()
     return 0

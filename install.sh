@@ -119,7 +119,7 @@ for mod in "${!PY_PKG[@]}"; do
 done
 # gtk4-layer-shell 是 .so，单独检查
 [[ -e /usr/lib/libgtk4-layer-shell.so ]] || missing+=(gtk4-layer-shell)
-python3 -c "import gi; gi.require_version('AyatanaAppIndicator3', '0.1')" \
+python3 -c "import gi; gi.require_version('AyatanaAppIndicatorGlib', '2.0')" \
     >/dev/null 2>&1 || missing+=(libayatana-appindicator)
 # tesseract 中英语言包（命令存在时才细查）
 if command -v tesseract >/dev/null; then
