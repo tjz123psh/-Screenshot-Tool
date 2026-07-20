@@ -27,6 +27,7 @@ jobs:
           python-gobject
           python-numpy
           python-pillow
+          ripgrep
           ruff
 
       - name: Check out source
@@ -48,8 +49,10 @@ jobs:
 
       - name: Check whitespace
         run: |
-          empty_tree="$(git hash-object -t tree /dev/null)"
-          git diff --check "$empty_tree" HEAD -- .
+          if rg --line-number --hidden --glob '!.git/**' '[ \t]+$' .; then
+            echo '::error::Trailing whitespace found'
+            exit 1
+          fi
 
   release:
     name: Publish GitHub release
