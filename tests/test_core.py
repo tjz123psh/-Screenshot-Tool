@@ -1,3 +1,5 @@
+import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -138,6 +140,46 @@ class ControllerTests(unittest.TestCase):
             with mock.patch.object(fastctl, "_fallback", return_value=7) as fallback:
                 self.assertEqual(fastctl.main(["long"]), 7)
         fallback.assert_called_once_with(["long"])
+
+    def test_fast_hotkey_fallback_uses_safe_python_path(self):
+        with mock.patch.object(fastctl.os, "execv", return_value=None) as execv:
+            self.assertEqual(fastctl._fallback(["long"]), 1)
+        execv.assert_called_once_with(
+            fastctl.sys.executable,
+            [fastctl.sys.executable, "-P", "-m", "pngshot", "long"],
+        )
+
+    def test_launcher_ignores_a_cwd_package_shadow(self):
+        root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            shadow = Path(directory) / "pngshot"
+            shadow.mkdir()
+            (shadow / "__init__.py").write_text("")
+            (shadow / "__main__.py").write_text(
+                'raise SystemExit("cwd package shadowed PNGSHOT_ROOT")\n'
+            )
+            result = subprocess.run(
+                [root / "scripts/pngshot", "--help"],
+                cwd=directory,
+                env={
+                    **os.environ,
+                    "PNGSHOT_ROOT": str(root),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("interactive region screenshot", result.stdout)
+        self.assertNotIn("cwd package shadowed", result.stderr)
+
+    def test_installed_launcher_template_uses_safe_python_path(self):
+        installer = (Path(__file__).parents[1] / "install.sh").read_text()
+        self.assertIn(
+            'exec python3 -P -m pngshot.fastctl "\\$@"', installer
+        )
+        self.assertIn('exec python3 -P -m pngshot "\\$@"', installer)
 
     def test_shortcut_discovery_lists_action_and_source_line(self):
         with tempfile.TemporaryDirectory() as directory:

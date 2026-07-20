@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Offline long screenshot reconstruction now feather-blends aligned overlaps to
   reduce fixed-wallpaper seams behind translucent windows, while preserving a
   complete frame state for large local animation changes.
+- Python launchers now use safe-path mode so a same-named package in the current
+  directory cannot shadow the configured pngshot installation.
 
 ## [0.2.0] - 2026-07-20
 

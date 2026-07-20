@@ -55,7 +55,7 @@ def _fallback(argv: list[str]) -> int:
         entries = preload.split(":") if preload else []
         if layer_shell not in entries:
             os.environ["LD_PRELOAD"] = ":".join([layer_shell, *entries])
-    os.execv(sys.executable, [sys.executable, "-m", "pngshot", *argv])
+    os.execv(sys.executable, [sys.executable, "-P", "-m", "pngshot", *argv])
     return 1  # pragma: no cover - execv only returns after an OS-level failure
 
 

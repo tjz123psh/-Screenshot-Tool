@@ -10,7 +10,7 @@ export PYTHONPATH="$PNGSHOT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 case "${1:-}" in
     region|long|pin-last)
         if [[ "${PNGSHOT_BYPASS_SERVICE:-0}" != "1" ]]; then
-            exec python3 -m pngshot.fastctl "$@"
+            exec python3 -P -m pngshot.fastctl "$@"
         fi
         ;;
 esac
@@ -22,4 +22,4 @@ if [[ "${1:-}" != "tray" && -e "$_LAYER_SHELL_LIB" ]]; then
     export LD_PRELOAD="${_LAYER_SHELL_LIB}${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
-exec python3 -m pngshot "$@"
+exec python3 -P -m pngshot "$@"
