@@ -283,6 +283,42 @@ class StitcherTests(unittest.TestCase):
         self.assertEqual(stitcher.current_height(), 100)
         self.assertEqual(stitcher.frames_used, 3)
 
+    def test_local_animation_is_ignored_by_robust_overlap_fallback(self):
+        """A changing page strip must not break an otherwise exact overlap."""
+        rng = np.random.default_rng(7)
+        rows = rng.integers(20, 235, (180, 1, 3), dtype=np.uint8)
+        page = np.repeat(rows, 120, axis=1)
+        page[:, ::9, 1] = np.minimum(
+            page[:, ::9, 1].astype(np.int16) + 18, 255
+        ).astype(np.uint8)
+        first = page[0:100].copy()
+        animated = page[20:120].copy()
+        animated[30:40] = 255
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        stitcher.add(Image.fromarray(first, "RGB"))
+        diff = stitcher.add(Image.fromarray(animated, "RGB"))
+
+        self.assertLessEqual(diff, stitcher.max_diff)
+        self.assertTrue(stitcher.last_recovered)
+        self.assertEqual(stitcher.last_shift, 20)
+        self.assertEqual(stitcher.current_height(), 120)
+        self.assertEqual(stitcher.frames_used, 2)
+
+    def test_robust_overlap_does_not_accept_unrelated_frames(self):
+        rng = np.random.default_rng(11)
+        first = rng.integers(0, 256, (120, 100, 3), dtype=np.uint8)
+        unrelated = rng.integers(0, 256, (120, 100, 3), dtype=np.uint8)
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        stitcher.add(Image.fromarray(first, "RGB"))
+        stitcher.add(Image.fromarray(unrelated, "RGB"))
+
+        self.assertEqual(stitcher.last_shift, 0)
+        self.assertFalse(stitcher.last_recovered)
+        self.assertEqual(stitcher.current_height(), 120)
+        self.assertEqual(stitcher.frames_used, 1)
+
 
 class LongshotRecorderTests(unittest.TestCase):
     def test_drain_pending_frames_preserves_capture_order(self):

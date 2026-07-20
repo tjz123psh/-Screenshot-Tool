@@ -23,6 +23,10 @@ so every frame after the first was rejected. Instead we now:
      with an early exit, so a steady scroll usually matches on the first try.
   5. A per-frame down-sampled signature (``_frame_signature``) skips matching
      entirely when the view hasn't moved at all.
+  6. If the fast whole-overlap score fails, retry with a trimmed row score that
+     ignores a bounded set of locally-changing rows. This handles videos,
+     loading indicators, carets, and animated page sections without relaxing
+     the normal acceptance threshold for the whole frame.
 
 A frame is appended when the best overlap diff is <= ``max_diff`` (lower is
 better) and it contributes at least ``min_shift_px`` new rows. A diff above
@@ -47,6 +51,15 @@ from PIL import Image
 # mean per-channel absolute difference of the row signatures, so it is on the
 # same scale as 8-bit brightness units; ~9 matches wl-longshot's threshold.
 DEFAULT_MAX_DIFF = 9.0
+# Even a low row-signature score is insufficient on its own: photos and noisy
+# textures collapse to similar averages. Genuine overlapping screen pixels are
+# much closer than unrelated content, so enforce an absolute sparse-RGB check.
+MAX_PIXEL_DIFF = 32.0
+# The robust fallback has intentionally discarded its noisiest rows, so require
+# the remaining sparse real pixels to agree absolutely as well. Unrelated noisy
+# images can share similar row statistics by chance, but their RGB MAD is near
+# 85; genuine screen overlap is normally in the low single digits.
+ROBUST_MAX_PIXEL_DIFF = 24.0
 
 
 @dataclass
@@ -181,19 +194,34 @@ class Stitcher:
         # animation, a sticky header, or a periodic list pattern, retry against
         # a few recent accepted frames before declaring low overlap. This is
         # deliberately bounded so the hot path stays cheap.
-        matches: list[tuple[float, int, _TrackedFrame, bool]] = []
+        matches: list[tuple[float, int, _TrackedFrame, bool, bool]] = []
         history = list(reversed(self._history))
         for index, tracked in enumerate(history):
             predict = self._last_offset if index == 0 else 0
             shift, diff = self._find_shift_for(tracked.cols, cols, predict)
+            robust = False
+            if diff > self.max_diff:
+                robust_shift, robust_diff = self._find_shift_for(
+                    tracked.cols, cols, predict, robust=True
+                )
+                if robust_diff < diff:
+                    shift, diff = robust_shift, robust_diff
+                    robust = robust_diff <= self.max_diff
             if diff > self.max_diff and index == 0 and len(history) == 1:
-                matches.append((diff, shift, tracked, False))
+                matches.append((diff, shift, tracked, False, robust))
                 continue
             changed = _pixel_change_fraction(tracked.pixels, pixels)
-            aligned = _pixel_overlap_diff(tracked.pixels, pixels, shift)
-            stationary = _pixel_overlap_diff(tracked.pixels, pixels, 0)
-            false_motion = changed < 0.012 or stationary <= aligned + 0.2
-            matches.append((diff, shift, tracked, false_motion))
+            pixel_diff_fn = _robust_pixel_overlap_diff if robust else _pixel_overlap_diff
+            aligned = pixel_diff_fn(tracked.pixels, pixels, shift)
+            stationary = pixel_diff_fn(tracked.pixels, pixels, 0)
+            false_motion = (
+                changed < 0.012
+                or stationary <= aligned + 0.2
+                or aligned > (
+                    ROBUST_MAX_PIXEL_DIFF if robust else MAX_PIXEL_DIFF
+                )
+            )
+            matches.append((diff, shift, tracked, false_motion, robust))
             # A confident, meaningful match on the newest frame is the common
             # path. Older frames are only consulted for low confidence or a
             # sub-threshold shift.
@@ -205,10 +233,10 @@ class Stitcher:
                  and abs(m[1]) >= self.min_shift_px
                  and not m[3]]
         if valid:
-            diff, shift, tracked, _ = min(valid, key=lambda m: m[0])
-            recovered = tracked is not history[0] if history else False
+            diff, shift, tracked, _, robust = min(valid, key=lambda m: m[0])
+            recovered = robust or (tracked is not history[0] if history else False)
         else:
-            diff, shift, tracked, _ = min(matches, key=lambda m: m[0])
+            diff, shift, tracked, _, _ = min(matches, key=lambda m: m[0])
             recovered = False
         self.last_shift = shift
         self.last_added = 0
@@ -336,16 +364,17 @@ class Stitcher:
         return self._find_shift_for(last, cols, self._last_offset)
 
     def _find_shift_for(self, last: np.ndarray, cols: np.ndarray,
-                        predict: int) -> tuple[int, float]:
+                        predict: int, *, robust: bool = False) -> tuple[int, float]:
         h = len(last)
         min_overlap = _effective_min_overlap(h)
         max_offset = max(h - min_overlap, 0)
+        diff_fn = _robust_col_diff if robust else _col_diff
         if max_offset == 0:
-            return 0, float(_col_diff(last, cols, 0, min_overlap))
+            return 0, float(diff_fn(last, cols, 0, min_overlap))
 
         best_off, best_diff = 0, float("inf")
         for off in _offset_candidates(max_offset, predict):
-            d = _col_diff(last, cols, off, min_overlap)
+            d = diff_fn(last, cols, off, min_overlap)
             if d < best_diff:
                 best_diff, best_off = d, off
                 if best_diff < 0.25:  # essentially perfect, stop early
@@ -478,6 +507,29 @@ def _pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> float:
     return float(np.abs(aa - bb).mean())
 
 
+def _robust_pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> float:
+    """Sparse RGB overlap MAD after dropping the noisiest 20% of rows."""
+    h1, h2 = len(a), len(b)
+    if offset >= 0:
+        a_start, b_start, length = offset, 0, min(h1 - offset, h2)
+    else:
+        a_start, b_start, length = 0, -offset, min(h1, h2 + offset)
+    if length <= 0:
+        return float("inf")
+    top = _content_top_ignore(length)
+    bottom = _content_bottom_ignore(length)
+    end = length - bottom
+    if end <= top:
+        return float("inf")
+    aa = a[a_start + top:a_start + end].astype(np.int16)
+    bb = b[b_start + top:b_start + end].astype(np.int16)
+    row_scores = np.abs(aa - bb).mean(axis=(1, 2))
+    keep = max(1, (len(row_scores) * 4) // 5)
+    if keep == len(row_scores):
+        return float(row_scores.mean())
+    return float(np.partition(row_scores, keep - 1)[:keep].mean())
+
+
 def _pixel_change_fraction(a: np.ndarray, b: np.ndarray) -> float:
     """Fraction of sparse pixels with a perceptible change at zero offset."""
     h = min(len(a), len(b))
@@ -529,6 +581,38 @@ def _col_diff(a: np.ndarray, b: np.ndarray, offset: int, min_overlap: int) -> fl
     aa = a[a_start + top: a_start + end]
     bb = b[b_start + top: b_start + end]
     return float(np.abs(aa - bb).mean())
+
+
+def _robust_col_diff(a: np.ndarray, b: np.ndarray, offset: int,
+                     min_overlap: int) -> float:
+    """Overlap score that tolerates a small locally-changing page region.
+
+    This is deliberately only used after the ordinary mean score rejects a
+    frame. It drops the noisiest 20% of row scores, which is enough to ignore a
+    video strip, spinner, blinking caret, or lazy-loaded card while still
+    requiring most of the visible page to agree at one vertical offset.
+    """
+    h1, h2 = len(a), len(b)
+    if offset >= 0:
+        a_start, b_start, length = offset, 0, min(h1 - offset, h2)
+    else:
+        a_start, b_start, length = 0, -offset, min(h1, h2 + offset)
+    if length < min_overlap:
+        return float("inf")
+    top = _content_top_ignore(length)
+    bottom = _content_bottom_ignore(length)
+    if length < min_overlap + top + bottom:
+        return float("inf")
+    end = length - bottom
+    if end <= top:
+        return float("inf")
+    aa = a[a_start + top: a_start + end]
+    bb = b[b_start + top: b_start + end]
+    row_scores = np.abs(aa - bb).mean(axis=1)
+    keep = max(1, (len(row_scores) * 4) // 5)
+    if keep == len(row_scores):
+        return float(row_scores.mean())
+    return float(np.partition(row_scores, keep - 1)[:keep].mean())
 
 
 def _offset_candidates(max_offset: int, predict: int) -> Iterator[int]:
