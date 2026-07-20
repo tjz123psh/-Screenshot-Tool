@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Bounded lossless keyframe storage and end-of-capture global path rebuilding for
+  long screenshots, with a validated online-result fallback.
+
 ## [0.2.0] - 2026-07-20
 
 ### Added

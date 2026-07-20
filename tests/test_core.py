@@ -313,6 +313,9 @@ class StitcherTests(unittest.TestCase):
         self.assertEqual(stitcher.last_shift, 20)
         self.assertEqual(stitcher.current_height(), 120)
         self.assertEqual(stitcher.frames_used, 2)
+        result = stitcher.result()
+        self.assertTrue(result.rebuilt)
+        self.assertEqual(result.image.height, 120)
 
     def test_robust_overlap_does_not_accept_unrelated_frames(self):
         rng = np.random.default_rng(11)
@@ -327,6 +330,100 @@ class StitcherTests(unittest.TestCase):
         self.assertFalse(stitcher.last_recovered)
         self.assertEqual(stitcher.current_height(), 120)
         self.assertEqual(stitcher.frames_used, 1)
+
+    def test_offline_rebuild_repairs_damaged_online_canvas(self):
+        rng = np.random.default_rng(17)
+        rows = rng.integers(0, 256, (180, 1, 3), dtype=np.uint8)
+        page = np.repeat(rows, 24, axis=1)
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        for y in range(0, 81, 20):
+            stitcher.add(Image.fromarray(page[y:y + 40], "RGB"))
+
+        damaged = stitcher._blocks[-1].copy()
+        damaged[:] = 255
+        stitcher._blocks[-1] = damaged
+        result = stitcher.result()
+
+        self.assertTrue(result.rebuilt)
+        np.testing.assert_array_equal(
+            np.asarray(result.image.convert("RGB")), page[:120]
+        )
+
+    def test_offline_rebuild_skips_a_broken_bridge_frame(self):
+        rng = np.random.default_rng(19)
+        unrelated = rng.integers(0, 256, (80, 100, 3), dtype=np.uint8)
+        rows = rng.integers(10, 245, (180, 1, 3), dtype=np.uint8)
+        page = np.repeat(rows, 100, axis=1)
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        for frame in (page[0:80], unrelated, page[20:100], page[40:120]):
+            stitcher.add(Image.fromarray(frame, "RGB"))
+        result = stitcher.result()
+
+        self.assertTrue(result.rebuilt)
+        self.assertEqual(result.warnings, [])
+        np.testing.assert_array_equal(
+            np.asarray(result.image.convert("RGB")), page[:120]
+        )
+
+    def test_offline_rebuild_preserves_both_ends_after_round_trip(self):
+        rng = np.random.default_rng(23)
+        rows = rng.integers(10, 245, (200, 1, 3), dtype=np.uint8)
+        page = np.repeat(rows, 90, axis=1)
+        positions = (40, 20, 0, 20, 40, 60, 80)
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        for y in positions:
+            stitcher.add(Image.fromarray(page[y:y + 80], "RGB"))
+        result = stitcher.result()
+
+        self.assertTrue(result.rebuilt)
+        np.testing.assert_array_equal(
+            np.asarray(result.image.convert("RGB")), page[:160]
+        )
+
+    def test_offline_rebuild_includes_a_sub_interval_tail_frame(self):
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        stitcher.add(Image.fromarray(self.base[:40], "RGB"))
+        stitcher.add(Image.fromarray(self.base[10:50], "RGB"))
+
+        result = stitcher.result()
+
+        self.assertTrue(result.rebuilt)
+        np.testing.assert_array_equal(
+            np.asarray(result.image.convert("RGB")), self.base[:50]
+        )
+
+    def test_offline_failure_keeps_online_result_and_warns(self):
+        rng = np.random.default_rng(29)
+        unrelated = rng.integers(0, 256, (40, 24, 3), dtype=np.uint8)
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        stitcher.add(Image.fromarray(self.base[:40], "RGB"))
+        stitcher.add(Image.fromarray(self.base[10:50], "RGB"))
+        stitcher.add(Image.fromarray(unrelated, "RGB"))
+
+        result = stitcher.result()
+
+        self.assertFalse(result.rebuilt)
+        self.assertTrue(any("online result" in warning for warning in result.warnings))
+        np.testing.assert_array_equal(
+            np.asarray(result.image.convert("RGB")), self.base[:50]
+        )
+
+    def test_offline_keyframes_obey_the_memory_limit(self):
+        rng = np.random.default_rng(31)
+        page = rng.integers(0, 256, (400, 80, 3), dtype=np.uint8)
+        stitcher = Stitcher(
+            max_diff=9.0,
+            min_shift_px=2,
+            keyframe_memory_limit=160_000,
+        )
+        for y in range(0, 241, 20):
+            stitcher.add(Image.fromarray(page[y:y + 120], "RGB"))
+
+        stitcher.result()
+
+        self.assertLessEqual(stitcher.keyframe_memory_used, 160_000)
 
 
 class LongshotRecorderTests(unittest.TestCase):

@@ -27,6 +27,10 @@ so every frame after the first was rejected. Instead we now:
      ignores a bounded set of locally-changing rows. This handles videos,
      loading indicators, carets, and animated page sections without relaxing
      the normal acceptance threshold for the whole frame.
+  7. Keep a bounded set of lossless compressed keyframes. At the end of a
+     capture, build a small temporal match graph and rebuild the canvas from a
+     complete high-confidence path, skipping damaged bridge frames when
+     possible. If the path cannot be validated, the online canvas is retained.
 
 A frame is appended when the best overlap diff is <= ``max_diff`` (lower is
 better) and it contributes at least ``min_shift_px`` new rows. A diff above
@@ -43,6 +47,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+import zlib
 
 import numpy as np
 from PIL import Image
@@ -60,6 +65,13 @@ MAX_PIXEL_DIFF = 32.0
 # images can share similar row statistics by chance, but their RGB MAD is near
 # 85; genuine screen overlap is normally in the low single digits.
 ROBUST_MAX_PIXEL_DIFF = 24.0
+# Offline reconstruction retains losslessly-compressed full-resolution
+# keyframes. The cap excludes one pending raw accepted frame (at most one
+# selection-sized RGB image), which is needed to preserve a direction-change
+# extremum without compressing every capture on the live path.
+KEYFRAME_MEMORY_LIMIT = 48 * 1024 * 1024
+KEYFRAME_MAX_COUNT = 160
+OFFLINE_EDGE_LOOKBACK = 8
 
 
 @dataclass
@@ -67,6 +79,7 @@ class StitchResult:
     image: Image.Image
     frames_used: int
     warnings: list[str] = field(default_factory=list)
+    rebuilt: bool = False
 
 
 @dataclass
@@ -85,9 +98,49 @@ class _TrackedFrame:
     position: int
 
 
+@dataclass
+class _FrameCandidate:
+    arr: np.ndarray
+    cols: np.ndarray
+    pixels: np.ndarray
+    signature: np.ndarray
+    sequence: int
+    online_position: int | None
+
+
+@dataclass
+class _Keyframe:
+    data: bytes
+    shape: tuple[int, int, int]
+    cols: np.ndarray
+    pixels: np.ndarray
+    signature: np.ndarray
+    sequence: int
+    online_position: int | None
+    reason: str
+
+    @property
+    def memory_used(self) -> int:
+        return (
+            len(self.data)
+            + self.cols.nbytes
+            + self.pixels.nbytes
+            + self.signature.nbytes
+        )
+
+
+@dataclass(frozen=True)
+class _GraphEdge:
+    shift: int
+    diff: float
+    robust: bool
+    cost: float
+
+
 class Stitcher:
     def __init__(self, max_diff: float = DEFAULT_MAX_DIFF,
-                 min_shift_px: int = 4, *, preview: bool = True) -> None:
+                 min_shift_px: int = 4, *, preview: bool = True,
+                 keyframe_memory_limit: int = KEYFRAME_MEMORY_LIMIT) -> None:
         self.max_diff = max_diff
         self.min_shift_px = min_shift_px
         self._preview_enabled = preview
@@ -142,6 +195,14 @@ class Stitcher:
         self.last_diff = 0.0
         self.last_recovered = False
         self._history: deque[_TrackedFrame] = deque(maxlen=6)
+        self._sequence = 0
+        self._keyframe_memory_limit = max(0, keyframe_memory_limit)
+        self._keyframes: list[_Keyframe] = []
+        self._keyframe_memory_used = 0
+        self._offline_disabled = self._keyframe_memory_limit == 0
+        self._pending_motion: _FrameCandidate | None = None
+        self._last_motion_direction = 0
+        self._failure_run = 0
 
     # ------------------------------------------------------------------
 
@@ -153,6 +214,7 @@ class Stitcher:
         A confident match that simply didn't move far enough (< min_shift_px)
         is also not appended but returns a low diff.
         """
+        self._sequence += 1
         arr = _to_rgb_array(frame)
 
         if not self._blocks:
@@ -172,6 +234,12 @@ class Stitcher:
             self.last_diff = 0.0
             self.last_recovered = False
             self._history.append(_TrackedFrame(cols, pixels, signature, 0))
+            seed = _FrameCandidate(
+                arr, cols, pixels, signature, self._sequence, 0
+            )
+            self._remember_keyframe(seed, reason="seed")
+            if not self._offline_disabled:
+                self._pending_motion = self._copy_candidate(seed)
             return 0.0
 
         # Width must match; if a resize slipped in, letterbox/crop to canvas.
@@ -247,6 +315,7 @@ class Stitcher:
             # low-confidence overlap: keep the frame out of the canvas, but do
             # not advance the matching reference. The recorder can continue
             # collecting and a later frame may reconnect to history.
+            self._note_failure(arr, cols, pixels, sig)
             return diff
         if abs(shift) < self.min_shift_px:
             # confident match but essentially the same view — nothing new.
@@ -273,6 +342,7 @@ class Stitcher:
         self._history.append(
             _TrackedFrame(cols, pixels, sig, self._anchor_pos)
         )
+        self._note_motion(arr, cols, pixels, sig, shift)
         return diff
 
     def _extend_canvas(self, arr: np.ndarray, new_pos: int) -> None:
@@ -301,6 +371,12 @@ class Stitcher:
             self._append_block(arr[:over_top, :, :], side="top")
             for tracked in self._history:
                 tracked.position += over_top
+            for keyframe in self._keyframes:
+                if keyframe.online_position is not None:
+                    keyframe.online_position += over_top
+            if (self._pending_motion is not None
+                    and self._pending_motion.online_position is not None):
+                self._pending_motion.online_position += over_top
             self._anchor_pos = 0
             self.last_added = over_top
         else:
@@ -383,14 +459,317 @@ class Stitcher:
 
     # ------------------------------------------------------------------
 
+    @property
+    def keyframe_memory_used(self) -> int:
+        return self._keyframe_memory_used
+
     def result(self) -> StitchResult:
         if not self._blocks:
             raise ValueError("no frames added")
         # The single full-height copy we deliberately deferred from every add().
         canvas = self._blocks[0] if len(self._blocks) == 1 else np.vstack(self._blocks)
+        warnings = list(self.warnings)
+        self._flush_pending_motion()
+        rebuilt = self._offline_rebuild()
+        if rebuilt is not None:
+            canvas = rebuilt
+        elif self._offline_disabled:
+            warnings.append(
+                "offline reconstruction skipped: keyframe memory limit reached; "
+                "kept online result"
+            )
+        elif len(self._keyframes) >= 2:
+            warnings.append(
+                "offline reconstruction could not validate a complete path; "
+                "kept online result"
+            )
         img = Image.fromarray(canvas, mode="RGB").convert("RGBA")
-        return StitchResult(image=img, frames_used=self.frames_used,
-                            warnings=list(self.warnings))
+        return StitchResult(
+            image=img,
+            frames_used=self.frames_used,
+            warnings=warnings,
+            rebuilt=rebuilt is not None,
+        )
+
+    # ------------------------------------------------------------------
+    # bounded keyframes + end-of-capture global reconstruction
+
+    def _copy_candidate(self, candidate: _FrameCandidate) -> _FrameCandidate:
+        return _FrameCandidate(
+            np.ascontiguousarray(candidate.arr).copy(),
+            candidate.cols,
+            candidate.pixels,
+            candidate.signature,
+            candidate.sequence,
+            candidate.online_position,
+        )
+
+    def _note_motion(self, arr: np.ndarray, cols: np.ndarray,
+                     pixels: np.ndarray, signature: np.ndarray,
+                     shift: int) -> None:
+        direction = 1 if shift > 0 else -1
+        turned = (
+            self._last_motion_direction != 0
+            and direction != self._last_motion_direction
+        )
+        if turned and self._pending_motion is not None:
+            self._remember_keyframe(self._pending_motion, reason="turn")
+
+        candidate = _FrameCandidate(
+            arr, cols, pixels, signature, self._sequence, self._anchor_pos
+        )
+        positioned = [
+            keyframe for keyframe in reversed(self._keyframes)
+            if keyframe.online_position is not None
+        ]
+        previous_position = (
+            positioned[0].online_position if positioned else None
+        )
+        interval = max(16, arr.shape[0] // 3)
+        far_enough = (
+            previous_position is None
+            or abs(self._anchor_pos - previous_position) >= interval
+        )
+        if turned or self.last_recovered or far_enough:
+            reason = "turn" if turned else (
+                "recovered" if self.last_recovered else "motion"
+            )
+            self._remember_keyframe(candidate, reason=reason)
+
+        self._pending_motion = (
+            None if self._offline_disabled else self._copy_candidate(candidate)
+        )
+        self._last_motion_direction = direction
+        self._failure_run = 0
+
+    def _note_failure(self, arr: np.ndarray, cols: np.ndarray,
+                      pixels: np.ndarray, signature: np.ndarray) -> None:
+        self._failure_run += 1
+        if self._failure_run != 1 and self._failure_run % 4 != 0:
+            return
+        candidate = _FrameCandidate(
+            arr, cols, pixels, signature, self._sequence, None
+        )
+        self._remember_keyframe(candidate, reason="failure")
+
+    def _flush_pending_motion(self) -> None:
+        pending = self._pending_motion
+        self._pending_motion = None
+        if pending is not None:
+            self._remember_keyframe(pending, reason="tail")
+
+    def _remember_keyframe(self, candidate: _FrameCandidate, *, reason: str) -> None:
+        if self._offline_disabled:
+            return
+        if any(frame.sequence == candidate.sequence for frame in self._keyframes):
+            return
+        contiguous = np.ascontiguousarray(candidate.arr, dtype=np.uint8)
+        payload = zlib.compress(contiguous.tobytes(), level=1)
+        keyframe = _Keyframe(
+            payload,
+            contiguous.shape,
+            candidate.cols,
+            candidate.pixels,
+            candidate.signature,
+            candidate.sequence,
+            candidate.online_position,
+            reason,
+        )
+        # If two endpoints cannot fit, there is no useful bounded global graph.
+        # Disable it instead of silently exceeding the documented memory cap.
+        if keyframe.memory_used > self._keyframe_memory_limit // 2:
+            self._disable_offline_rebuild()
+            return
+        self._keyframes.append(keyframe)
+        self._keyframes.sort(key=lambda frame: frame.sequence)
+        self._keyframe_memory_used += keyframe.memory_used
+        self._trim_keyframes()
+
+    def _trim_keyframes(self) -> None:
+        while (
+            self._keyframe_memory_used > self._keyframe_memory_limit
+            or len(self._keyframes) > KEYFRAME_MAX_COUNT
+        ):
+            if len(self._keyframes) <= 2:
+                self._disable_offline_rebuild()
+                return
+            candidates = list(range(1, len(self._keyframes) - 1))
+            normal = [
+                index for index in candidates
+                if self._keyframes[index].reason in {"motion", "tail"}
+            ]
+            pool = normal or candidates
+
+            def removal_cost(index: int) -> tuple[int, int]:
+                frame = self._keyframes[index]
+                priority = {
+                    "motion": 0,
+                    "tail": 1,
+                    "recovered": 2,
+                    "turn": 3,
+                    "failure": 4,
+                }.get(frame.reason, 2)
+                span = (
+                    self._keyframes[index + 1].sequence
+                    - self._keyframes[index - 1].sequence
+                )
+                return priority, span
+
+            remove_at = min(pool, key=removal_cost)
+            removed = self._keyframes.pop(remove_at)
+            self._keyframe_memory_used -= removed.memory_used
+
+    def _disable_offline_rebuild(self) -> None:
+        self._keyframes.clear()
+        self._keyframe_memory_used = 0
+        self._pending_motion = None
+        self._offline_disabled = True
+
+    def _offline_rebuild(self) -> np.ndarray | None:
+        frames = self._keyframes
+        if self._offline_disabled or len(frames) < 2:
+            return None
+
+        count = len(frames)
+        scores = [float("inf")] * count
+        parents: list[tuple[int, _GraphEdge] | None] = [None] * count
+        scores[0] = 0.0
+        skip_penalty = self.max_diff * 1.5
+
+        for current in range(1, count):
+            edge_cache: dict[int, _GraphEdge | None] = {}
+
+            def edge_for(previous: int) -> _GraphEdge | None:
+                if previous not in edge_cache:
+                    edge_cache[previous] = self._offline_edge(
+                        frames[previous], frames[current]
+                    )
+                return edge_cache[previous]
+
+            previous_indices = [current - 1]
+            adjacent = edge_for(current - 1)
+            # The adjacent path is the common case. Probe an older node only
+            # when animation/low confidence makes that edge questionable, plus
+            # one periodic probe to catch a locally attractive wrong offset.
+            if adjacent is None or adjacent.robust or adjacent.diff > self.max_diff * 0.65:
+                previous_indices.extend(
+                    range(max(0, current - OFFLINE_EDGE_LOOKBACK), current - 1)
+                )
+            elif current % 4 == 0 and current > 4:
+                previous_indices.append(current - 4)
+
+            for previous in dict.fromkeys(previous_indices):
+                if not np.isfinite(scores[previous]):
+                    continue
+                edge = edge_for(previous)
+                if edge is None:
+                    continue
+                skipped = current - previous - 1
+                candidate_score = (
+                    scores[previous] + edge.cost + skipped * skip_penalty
+                )
+                if candidate_score < scores[current]:
+                    scores[current] = candidate_score
+                    parents[current] = (previous, edge)
+
+        if parents[-1] is None:
+            return None
+
+        cursor = count - 1
+        position = 0
+        reverse_positions: list[tuple[int, int]] = [(cursor, position)]
+        while cursor != 0:
+            parent = parents[cursor]
+            if parent is None:
+                return None
+            previous, edge = parent
+            position -= edge.shift
+            reverse_positions.append((previous, position))
+            cursor = previous
+        path = list(reversed(reverse_positions))
+
+        min_position = min(position for _, position in path)
+        max_position = max(
+            position + frames[index].shape[0] for index, position in path
+        )
+        output_height = max_position - min_position
+        if output_height <= 0:
+            return None
+        canvas = np.empty((output_height, self._width, 3), dtype=np.uint8)
+        covered = np.zeros(output_height, dtype=bool)
+
+        for index, position in path:
+            frame = frames[index]
+            try:
+                raw = zlib.decompress(frame.data)
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(frame.shape)
+            except (ValueError, zlib.error):
+                return None
+            start = position - min_position
+            end = start + arr.shape[0]
+            if start < 0 or end > output_height or arr.shape[1] != self._width:
+                return None
+            missing = ~covered[start:end]
+            if np.any(missing):
+                canvas[start:end][missing] = arr[missing]
+                covered[start:end][missing] = True
+
+        if not bool(covered.all()):
+            return None
+        return canvas
+
+    def _offline_edge(self, previous: _Keyframe,
+                      current: _Keyframe) -> _GraphEdge | None:
+        predictions = [0]
+        if (previous.online_position is not None
+                and current.online_position is not None):
+            predictions.insert(
+                0, current.online_position - previous.online_position
+            )
+
+        candidates: list[_GraphEdge] = []
+        for predict in dict.fromkeys(predictions):
+            shift, diff = self._find_shift_for(
+                previous.cols, current.cols, predict
+            )
+            robust = False
+            if diff > self.max_diff:
+                robust_shift, robust_diff = self._find_shift_for(
+                    previous.cols, current.cols, predict, robust=True
+                )
+                if robust_diff < diff:
+                    shift, diff = robust_shift, robust_diff
+                    robust = robust_diff <= self.max_diff
+            if diff > self.max_diff:
+                continue
+
+            if abs(shift) < self.min_shift_px:
+                if not _is_duplicate(previous.signature, current.signature):
+                    continue
+                candidates.append(_GraphEdge(0, diff, robust, diff + 0.25))
+                continue
+
+            pixel_diff_fn = (
+                _robust_pixel_overlap_diff if robust else _pixel_overlap_diff
+            )
+            aligned = pixel_diff_fn(previous.pixels, current.pixels, shift)
+            stationary = pixel_diff_fn(previous.pixels, current.pixels, 0)
+            changed = _pixel_change_fraction(previous.pixels, current.pixels)
+            pixel_limit = (
+                ROBUST_MAX_PIXEL_DIFF if robust else MAX_PIXEL_DIFF
+            )
+            if (
+                changed < 0.012
+                or stationary <= aligned + 0.2
+                or aligned > pixel_limit
+            ):
+                continue
+            cost = diff + (1.0 if robust else 0.0)
+            candidates.append(_GraphEdge(shift, diff, robust, cost))
+
+        if not candidates:
+            return None
+        return min(candidates, key=lambda edge: edge.cost)
 
     # ------------------------------------------------------------------
     # live preview (for the recorder UI)
