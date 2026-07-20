@@ -9,7 +9,7 @@ import shutil
 import subprocess
 
 from .controller import service_status
-from .shortcuts import discover
+from .shortcuts import discover_active
 
 
 @dataclass
@@ -126,7 +126,7 @@ def _shortcut_check() -> Check:
     config_dir = Path.home() / ".config/niri"
     if not config_dir.exists():
         return Check("shortcuts", "Niri 快捷键", "warning", "无法读取 niri 配置", False)
-    bindings = discover(config_dir)
+    bindings = discover_active(config_dir)
     found = bool(bindings)
     detail = "配置中已发现 " + ", ".join(
         f"{item.key}→{item.action}" for item in bindings[:4]

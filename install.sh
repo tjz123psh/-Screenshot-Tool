@@ -8,9 +8,10 @@
 #   1. 在 Arch Linux 上自动安装缺失的运行依赖（只在确实缺包时请求 sudo）
 #   2. 把源码克隆/更新到 ~/.local/share/pngshot
 #   3. 安装 pngshot / pngshotctl 启动器与应用菜单入口
-#   4. 安装并启动 systemd 用户服务与系统托盘
-#   5. 检查依赖与环境，列出仍缺失的项目
-#   6. 提示 ~/.local/bin 是否在 PATH
+#   4. 尝试把默认快捷键写入用户自定义的 Niri keybinds.kdl
+#   5. 安装并启动 systemd 用户服务与系统托盘
+#   6. 检查依赖与环境，列出仍缺失的项目
+#   7. 提示 ~/.local/bin 是否在 PATH
 #
 # 重复运行是幂等的：已存在则 git pull 更新，再重装启动器。
 set -euo pipefail
@@ -108,6 +109,27 @@ EOF
 chmod +x "$LAUNCHER"
 ln -sfn "pngshot" "$CTL_LAUNCHER"
 ok "启动器已安装"
+
+# --- 2.5 Niri 快捷键（可降级） -------------------------------------------
+# 快捷键属于用户的 Niri 配置，不应成为主安装的硬依赖：冲突、缺少
+# config.kdl 或配置校验失败时只提示手动示例，继续完成服务和托盘安装。
+if [[ "${PNGSHOT_SKIP_SHORTCUTS:-0}" == "1" ]]; then
+    info "已跳过 Niri 快捷键自动配置（PNGSHOT_SKIP_SHORTCUTS=1）"
+elif [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl" ]]; then
+    shortcut_output=""
+    if shortcut_output=$("$LAUNCHER" shortcuts install 2>&1); then
+        printf '%s\n' "$shortcut_output"
+        ok "Niri 快捷键已自动配置或已存在"
+    else
+        shortcut_status=$?
+        printf '%s\n' "$shortcut_output"
+        warn "Niri 快捷键自动配置未完成（状态 $shortcut_status）；不影响 pngshot 安装"
+        warn "请参考：$SRC_DIR/contrib/niri-pngshot.kdl"
+    fi
+else
+    warn "未找到 Niri config.kdl，跳过快捷键自动配置"
+    warn "安装后可参考：$SRC_DIR/contrib/niri-pngshot.kdl"
+fi
 
 # --- 3. 后台服务与系统托盘 ------------------------------------------------
 info "安装截图服务与系统托盘"

@@ -30,3 +30,6 @@ config.toml
 .ruff_cache/
 htmlcov/
 .coverage
+
+# Local agent handoff / private working notes.  Keep these out of releases.
+HANDOFF.md

@@ -132,10 +132,45 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(found[1].action, "region")
         self.assertEqual(found[1].line, 3)
 
+    def test_shortcut_install_is_idempotent_and_removable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "dms").mkdir()
+            (root / "config.kdl").write_text('include "dms/keybinds.kdl"\n')
+            keybinds = root / "dms/keybinds.kdl"
+            keybinds.write_text("// user bindings\nbinds {\n}\n")
+
+            installed = shortcuts.install_shortcuts(root)
+            self.assertEqual(installed.status, "installed")
+            self.assertEqual(len(installed.added), 3)
+            self.assertEqual(len(shortcuts.discover(root)), 3)
+            self.assertEqual(shortcuts.install_shortcuts(root).status, "ok")
+
+            removed = shortcuts.remove_managed_shortcuts(root)
+            self.assertEqual(removed.status, "removed")
+            self.assertEqual(shortcuts.discover(root), [])
+
+    def test_shortcut_install_conflict_is_atomic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "dms").mkdir()
+            (root / "config.kdl").write_text('include "dms/keybinds.kdl"\n')
+            keybinds = root / "dms/keybinds.kdl"
+            original = 'binds {\n  Mod+Print { spawn "dms" "something"; }\n}\n'
+            keybinds.write_text(original)
+
+            result = shortcuts.install_shortcuts(root)
+            self.assertEqual(result.status, "conflict")
+            self.assertIn("Mod+Print", result.conflicts[0])
+            self.assertEqual(keybinds.read_text(), original)
+
     def test_niri_shortcut_check_follows_included_files(self):
         with tempfile.TemporaryDirectory() as directory:
             nested = Path(directory) / ".config/niri/dms"
             nested.mkdir(parents=True)
+            (nested.parent / "config.kdl").write_text(
+                'include "dms/keybinds.kdl"\n'
+            )
             (nested / "keybinds.kdl").write_text(
                 'Mod+Print { spawn "pngshotctl" "region"; }'
             )

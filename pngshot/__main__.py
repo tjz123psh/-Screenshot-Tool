@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 
 
@@ -136,11 +137,40 @@ def _cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_shortcuts(_args: argparse.Namespace) -> int:
-    from .shortcuts import action_label, config_dir, discover
+def _cmd_shortcuts(args: argparse.Namespace) -> int:
+    from .shortcuts import (
+        action_label, config_dir, discover_active, install_shortcuts,
+        remove_managed_shortcuts,
+    )
 
     root = config_dir()
-    bindings = discover(root)
+    if args.operation == "install":
+        result = install_shortcuts()
+        if result.target:
+            print(f"Niri 快捷键文件：{result.target}")
+        if result.added:
+            print("已自动配置：" + ", ".join(result.added))
+        if result.conflicts:
+            print("快捷键冲突：" + ", ".join(result.conflicts), file=sys.stderr)
+        if result.detail:
+            print(result.detail)
+        if result.status in {"installed", "ok"} and not result.conflicts:
+            return 0
+        example = Path(__file__).resolve().parent.parent / "contrib/niri-pngshot.kdl"
+        print(f"请参考 {example} 手动配置快捷键。", file=sys.stderr)
+        return 2
+    if args.operation == "remove":
+        result = remove_managed_shortcuts(root)
+        if result.target:
+            print(f"Niri 快捷键文件：{result.target}")
+        if result.detail:
+            print(result.detail)
+        if result.status == "removed":
+            print("已移除 pngshot 自动管理的快捷键；手动配置未修改")
+            return 0
+        return 0 if result.status == "ok" else 1
+
+    bindings = discover_active(root)
     print(f"Niri 快捷键配置：{root}")
     if not bindings:
         print("未发现 pngshot 快捷键。请参考 contrib/niri-pngshot.kdl")
@@ -246,7 +276,11 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--lines", type=int, default=50)
     logs.set_defaults(func=_cmd_logs)
 
-    shortcuts = sub.add_parser("shortcuts", help="list configured Niri shortcuts")
+    shortcuts = sub.add_parser("shortcuts", help="inspect or manage Niri shortcuts")
+    shortcuts.add_argument(
+        "operation", nargs="?", choices=("list", "install", "remove"),
+        default="list", help="list, install, or remove managed shortcuts",
+    )
     shortcuts.set_defaults(func=_cmd_shortcuts)
 
     tray = sub.add_parser("tray", help="run the Pngshot system tray")

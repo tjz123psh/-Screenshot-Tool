@@ -1,6 +1,9 @@
-// pngshot — niri integration snippet
-// Merge the pieces you want into ~/.config/niri/config.kdl, then reload niri.
-// Nothing here is applied automatically by pngshot.
+// pngshot — Niri integration example
+//
+// The installer tries to add the keybinds automatically to the active,
+// user-owned dms/keybinds.kdl. If that is not possible (for example because
+// a key is already occupied), merge the relevant lines into that file and
+// reload Niri. This file is an example; it is never sourced automatically.
 
 // ---------------------------------------------------------------------------
 // 1) Deskpin window rule
@@ -35,16 +38,23 @@ window-rule {
 // ---------------------------------------------------------------------------
 // 2) Keybinds
 //
-// Put these inside your existing `binds { ... }` block.
+// Put these inside your existing `binds { ... }` block in
+// ~/.config/niri/dms/keybinds.kdl.
 
 binds {
-    // Interactive region screenshot (Stage 1 overlay: select → toolbar).
-    Print { spawn "pngshotctl" "region"; }
+    // Super+Print: interactive region screenshot.
+    Mod+Print hotkey-overlay-title="pngshot 框选" {
+        spawn-sh "$HOME/.local/bin/pngshot region";
+    }
 
-    // Region screenshot straight into long-shot mode.
-    Shift+Print { spawn "pngshotctl" "long"; }
+    // Super+Shift+Print: region screenshot straight into long-shot mode.
+    Mod+Shift+Print hotkey-overlay-title="pngshot 长截图" {
+        spawn-sh "$HOME/.local/bin/pngshot long";
+    }
 
-    // Pin whatever image is currently on the clipboard.
-    Mod+Print { spawn "pngshotctl" "pin-last"; }
+    // Super+Ctrl+Print: pin the current clipboard image.
+    Mod+Ctrl+Print hotkey-overlay-title="pngshot 钉图" {
+        spawn-sh "$HOME/.local/bin/pngshot pin-last";
+    }
 
 }

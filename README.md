@@ -32,13 +32,16 @@ curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/ins
 1. 用 `pacman` 自动安装实际缺失的运行依赖（已安装的包不会重复安装）
 2. 把源码克隆/更新到 `~/.local/share/pngshot`
 3. 安装 `pngshot` / `pngshotctl` 启动器（内置 `PYTHONPATH` 与 `LD_PRELOAD` 修复）
-4. 安装应用菜单入口、应用图标和系统托盘状态图标
-5. 安装并启动 systemd 用户服务与系统托盘
-6. 再次检查运行环境，并提示 `~/.local/bin` 是否在 `PATH` 中
+4. 尝试把默认快捷键写入 `config.kdl` 已 include 的用户 `dms/keybinds.kdl`
+5. 安装应用菜单入口、应用图标和系统托盘状态图标
+6. 安装并启动 systemd 用户服务与系统托盘
+7. 再次检查运行环境，并提示 `~/.local/bin` 是否在 `PATH` 中
 
 重复运行是幂等的：已安装则 `git pull` 更新后重装启动器。
 
 > 不希望脚本自动装包时，可使用 `curl ... | PNGSHOT_SKIP_PACKAGES=1 bash`；脚本仍会检查环境并列出缺失项。非 Arch 系统没有 `pacman` 时也会自动跳过装包步骤。
+>
+> 不希望安装程序修改 Niri 快捷键时，可使用 `curl ... | PNGSHOT_SKIP_SHORTCUTS=1 bash`。快捷键冲突、配置缺失或校验失败只会产生提示，不会中断 pngshot 主安装。
 
 ## 依赖（均为 pacman 包）
 
@@ -74,22 +77,29 @@ pngshot region
 
 ## niri 集成
 
-`contrib/niri-pngshot.kdl` 提供了窗口规则（保持钉图窗口整洁）和键位示例。脚本不会自动应用，请自行把需要的部分合并进 `~/.config/niri/config.kdl`。
+`contrib/niri-pngshot.kdl` 提供了窗口规则（保持钉图窗口整洁）和键位示例。安装程序会优先把默认键位自动写入当前 `config.kdl` 已 include 的用户自定义 `dms/keybinds.kdl`；如果检测到快捷键冲突或无法安全修改，主安装仍会继续，并提示你参考该示例手动配置。
 
 推荐键位：
 
 | 按键 | 动作 |
 |-----|--------|
-| `Print` | `pngshot region` |
-| `Shift+Print` | `pngshot long` |
-| `Mod+Print` | `pngshot pin-last` |
+| `Mod+Print` | `pngshot region` |
+| `Mod+Shift+Print` | `pngshot long` |
+| `Mod+Ctrl+Print` | `pngshot pin-last` |
 
 `pngshot` 与 `pngshotctl` 都会走同一套确认协议。新配置推荐使用 `pngshotctl`，便于区分“向服务发送动作”和内部一次性窗口进程。
 
-快捷键由 Niri 的 `binds {}` 负责注册，pngshot 不会抢占全局键盘，也不会自动改写你的 Niri 配置。要改按键，只需编辑实际被 include 的 `.kdl` 文件，把 `spawn-sh`（或 `spawn`）后面的动作保持为 `region`、`long`、`pin-last` 之一；修改后按你的 Niri 配置方式 reload。查看当前实际生效的 pngshot 绑定可以运行：
+快捷键由 Niri 的 `binds {}` 负责注册，pngshot 不会抢占全局键盘。安装时只会在用户自定义的 `keybinds.kdl` 中写入带有明确开始/结束标记的 pngshot 区域，不会修改 DMS 的 `binds.kdl`。要改按键，只需编辑实际被 include 的 `.kdl` 文件，把 `spawn-sh`（或 `spawn`）后面的动作保持为 `region`、`long`、`pin-last` 之一；修改后按你的 Niri 配置方式 reload。查看当前实际生效的 pngshot 绑定可以运行：
 
 ```sh
 pngshotctl shortcuts
+```
+
+也可以手动管理自动配置区域：
+
+```sh
+pngshotctl shortcuts install   # 幂等安装，发现冲突时给出手动示例
+pngshotctl shortcuts remove    # 只移除 pngshot 自动管理区域
 ```
 
 ### 服务状态
