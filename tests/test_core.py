@@ -18,6 +18,7 @@ from pngshot.__main__ import _load_image_file
 from pngshot.longshot.stitcher import Stitcher
 from pngshot.longshot.recorder import LongshotRecorder
 from pngshot.longshot.highlight import edge_rects
+from pngshot.longshot.fixed_regions import FixedRegionDetector
 from pngshot.overlay.model import Mode, Rect
 from pngshot.overlay.annotate import Annotator
 from pngshot.overlay.selector import Selector
@@ -424,6 +425,68 @@ class StitcherTests(unittest.TestCase):
         stitcher.result()
 
         self.assertLessEqual(stitcher.keyframe_memory_used, 160_000)
+
+    def test_fixed_regions_require_multi_frame_edge_consensus(self):
+        rng = np.random.default_rng(37)
+        detector = FixedRegionDetector(60, 20)
+        previous = rng.integers(0, 256, (60, 20, 3), dtype=np.uint8)
+        fixed = previous.copy()
+
+        for observation in range(4):
+            current = rng.integers(0, 256, (60, 20, 3), dtype=np.uint8)
+            current[:8] = fixed[:8]
+            current[-6:] = fixed[-6:]
+            current[:, :3] = fixed[:, :3]
+            detector.observe(previous, current)
+            previous = current
+            if observation < 2:
+                self.assertFalse(detector.ready)
+
+        self.assertTrue(detector.ready)
+        bands = detector.bands(200)
+        self.assertEqual((bands.top, bands.bottom), (8, 6))
+        self.assertGreaterEqual(bands.left, 20)
+        self.assertLessEqual(bands.left, 35)
+        self.assertEqual(bands.right, 0)
+
+    def test_fixed_header_and_footer_are_kept_once(self):
+        rng = np.random.default_rng(41)
+        content_rows = rng.integers(10, 245, (220, 1, 3), dtype=np.uint8)
+        content = np.repeat(content_rows, 80, axis=1)
+        header = rng.integers(0, 256, (10, 80, 3), dtype=np.uint8)
+        footer = rng.integers(0, 256, (8, 80, 3), dtype=np.uint8)
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        for y in (0, 20, 40, 60, 80):
+            frame = np.vstack([header, content[y:y + 82], footer])
+            stitcher.add(Image.fromarray(frame, "RGB"))
+        result = np.asarray(stitcher.result().image.convert("RGB"))
+
+        self.assertEqual(result.shape, (180, 80, 3))
+        np.testing.assert_array_equal(result[:10], header)
+        np.testing.assert_array_equal(result[10:172], content[:162])
+        np.testing.assert_array_equal(result[-8:], footer)
+
+    def test_fixed_sidebar_is_kept_once(self):
+        rng = np.random.default_rng(43)
+        height, width = 80, 80
+        content_rows = rng.integers(10, 245, (145, 70, 3), dtype=np.uint8)
+        sidebar = np.zeros((height, 10, 3), dtype=np.uint8)
+        sidebar[:, :, 0] = 230
+        sidebar[:, :, 1] = np.arange(height, dtype=np.uint8)[:, None]
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        for y in (0, 15, 30, 45, 60):
+            frame = np.empty((height, width, 3), dtype=np.uint8)
+            frame[:, :10] = sidebar
+            frame[:, 10:] = content_rows[y:y + height]
+            stitcher.add(Image.fromarray(frame, "RGB"))
+
+        result = np.asarray(stitcher.result().image.convert("RGB"))
+        self.assertEqual(result.shape, (140, width, 3))
+        np.testing.assert_array_equal(result[:height, :10], sidebar)
+        self.assertFalse(np.array_equal(result[height:, :10], sidebar[:40]))
+        np.testing.assert_array_equal(result[:, 10:], content_rows[:140])
 
 
 class LongshotRecorderTests(unittest.TestCase):

@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bounded lossless keyframe storage and end-of-capture global path rebuilding for
   long screenshots, with a validated online-result fallback.
+- Multi-frame detection of viewport-fixed headers, footers, and sidebars, which
+  are excluded from overlap matching and retained only once in the final image.
 
 ## [0.2.0] - 2026-07-20
 

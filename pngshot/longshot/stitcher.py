@@ -31,6 +31,9 @@ so every frame after the first was rejected. Instead we now:
      capture, build a small temporal match graph and rebuild the canvas from a
      complete high-confidence path, skipping damaged bridge frames when
      possible. If the path cannot be validated, the online canvas is retained.
+  8. Learn viewport-fixed edge bands from at least three accepted scrolling
+     transitions. Exclude those rows and columns while matching, then retain a
+     fixed header, footer, or sidebar only once in the offline result.
 
 A frame is appended when the best overlap diff is <= ``max_diff`` (lower is
 better) and it contributes at least ``min_shift_px`` new rows. A diff above
@@ -39,7 +42,6 @@ collecting and retries against recent history before showing a slow-down hint.
 
 Constraints (documented for the user):
   - Vertical scroll only. Horizontal movement breaks matching.
-  - Sticky headers/footers repeat; the user should avoid framing them.
   - Animated content between frames raises the diff and may be rejected.
 """
 from __future__ import annotations
@@ -51,6 +53,8 @@ import zlib
 
 import numpy as np
 from PIL import Image
+
+from .fixed_regions import FixedBands, FixedRegionDetector
 
 # Below this overlap diff a frame is considered a confident match. This is a
 # mean per-channel absolute difference of the row signatures, so it is on the
@@ -203,6 +207,7 @@ class Stitcher:
         self._pending_motion: _FrameCandidate | None = None
         self._last_motion_direction = 0
         self._failure_run = 0
+        self._fixed_regions: FixedRegionDetector | None = None
 
     # ------------------------------------------------------------------
 
@@ -223,6 +228,9 @@ class Stitcher:
             cols = _compute_cols(arr)
             pixels = _sample_pixels(arr)
             signature = _frame_signature(arr)
+            self._fixed_regions = FixedRegionDetector(
+                arr.shape[0], pixels.shape[1]
+            )
             self._last_cols = cols
             self._last_pixels = pixels
             self._last_signature = signature
@@ -264,13 +272,28 @@ class Stitcher:
         # deliberately bounded so the hot path stays cheap.
         matches: list[tuple[float, int, _TrackedFrame, bool, bool]] = []
         history = list(reversed(self._history))
+        excluded_rows = self._fixed_row_mask()
+        excluded_columns = self._fixed_column_mask()
+        current_match_cols = self._matching_cols(cols, pixels, excluded_columns)
         for index, tracked in enumerate(history):
             predict = self._last_offset if index == 0 else 0
-            shift, diff = self._find_shift_for(tracked.cols, cols, predict)
+            tracked_match_cols = self._matching_cols(
+                tracked.cols, tracked.pixels, excluded_columns
+            )
+            shift, diff = self._find_shift_for(
+                tracked_match_cols,
+                current_match_cols,
+                predict,
+                excluded_rows=excluded_rows,
+            )
             robust = False
             if diff > self.max_diff:
                 robust_shift, robust_diff = self._find_shift_for(
-                    tracked.cols, cols, predict, robust=True
+                    tracked_match_cols,
+                    current_match_cols,
+                    predict,
+                    robust=True,
+                    excluded_rows=excluded_rows,
                 )
                 if robust_diff < diff:
                     shift, diff = robust_shift, robust_diff
@@ -278,10 +301,27 @@ class Stitcher:
             if diff > self.max_diff and index == 0 and len(history) == 1:
                 matches.append((diff, shift, tracked, False, robust))
                 continue
-            changed = _pixel_change_fraction(tracked.pixels, pixels)
+            changed = _pixel_change_fraction(
+                tracked.pixels,
+                pixels,
+                excluded_rows=excluded_rows,
+                excluded_columns=excluded_columns,
+            )
             pixel_diff_fn = _robust_pixel_overlap_diff if robust else _pixel_overlap_diff
-            aligned = pixel_diff_fn(tracked.pixels, pixels, shift)
-            stationary = pixel_diff_fn(tracked.pixels, pixels, 0)
+            aligned = pixel_diff_fn(
+                tracked.pixels,
+                pixels,
+                shift,
+                excluded_rows=excluded_rows,
+                excluded_columns=excluded_columns,
+            )
+            stationary = pixel_diff_fn(
+                tracked.pixels,
+                pixels,
+                0,
+                excluded_rows=excluded_rows,
+                excluded_columns=excluded_columns,
+            )
             false_motion = (
                 changed < 0.012
                 or stationary <= aligned + 0.2
@@ -339,6 +379,8 @@ class Stitcher:
         self._last_signature = sig
         self._last_offset = shift
         self.frames_used += 1
+        if self._fixed_regions is not None and self._history:
+            self._fixed_regions.observe(self._history[-1].pixels, pixels)
         self._history.append(
             _TrackedFrame(cols, pixels, sig, self._anchor_pos)
         )
@@ -440,22 +482,50 @@ class Stitcher:
         return self._find_shift_for(last, cols, self._last_offset)
 
     def _find_shift_for(self, last: np.ndarray, cols: np.ndarray,
-                        predict: int, *, robust: bool = False) -> tuple[int, float]:
+                        predict: int, *, robust: bool = False,
+                        excluded_rows: np.ndarray | None = None) -> tuple[int, float]:
         h = len(last)
         min_overlap = _effective_min_overlap(h)
         max_offset = max(h - min_overlap, 0)
         diff_fn = _robust_col_diff if robust else _col_diff
         if max_offset == 0:
-            return 0, float(diff_fn(last, cols, 0, min_overlap))
+            return 0, float(diff_fn(
+                last, cols, 0, min_overlap, excluded_rows=excluded_rows
+            ))
 
         best_off, best_diff = 0, float("inf")
         for off in _offset_candidates(max_offset, predict):
-            d = diff_fn(last, cols, off, min_overlap)
+            d = diff_fn(
+                last, cols, off, min_overlap,
+                excluded_rows=excluded_rows,
+            )
             if d < best_diff:
                 best_diff, best_off = d, off
                 if best_diff < 0.25:  # essentially perfect, stop early
                     break
         return best_off, best_diff
+
+    def _fixed_row_mask(self) -> np.ndarray | None:
+        if self._fixed_regions is None or not self._fixed_regions.ready:
+            return None
+        mask = self._fixed_regions.row_mask()
+        return mask if bool(mask.any()) else None
+
+    def _fixed_column_mask(self) -> np.ndarray | None:
+        if self._fixed_regions is None or not self._fixed_regions.ready:
+            return None
+        mask = self._fixed_regions.column_mask()
+        return mask if bool(mask.any()) else None
+
+    @staticmethod
+    def _matching_cols(fallback: np.ndarray, pixels: np.ndarray,
+                       excluded_columns: np.ndarray | None) -> np.ndarray:
+        if excluded_columns is None or excluded_columns.shape != (pixels.shape[1],):
+            return fallback
+        active = ~excluded_columns
+        if int(active.sum()) < 4:
+            return fallback
+        return _compute_cols_from_pixels(pixels[:, active, :])
 
     # ------------------------------------------------------------------
 
@@ -688,16 +758,7 @@ class Stitcher:
             cursor = previous
         path = list(reversed(reverse_positions))
 
-        min_position = min(position for _, position in path)
-        max_position = max(
-            position + frames[index].shape[0] for index, position in path
-        )
-        output_height = max_position - min_position
-        if output_height <= 0:
-            return None
-        canvas = np.empty((output_height, self._width, 3), dtype=np.uint8)
-        covered = np.zeros(output_height, dtype=bool)
-
+        decoded: list[tuple[int, np.ndarray]] = []
         for index, position in path:
             frame = frames[index]
             try:
@@ -705,21 +766,89 @@ class Stitcher:
                 arr = np.frombuffer(raw, dtype=np.uint8).reshape(frame.shape)
             except (ValueError, zlib.error):
                 return None
-            start = position - min_position
-            end = start + arr.shape[0]
-            if start < 0 or end > output_height or arr.shape[1] != self._width:
+            if arr.shape[1] != self._width:
+                return None
+            decoded.append((position, arr))
+
+        bands = FixedBands()
+        if self._fixed_regions is not None and self._fixed_regions.ready:
+            bands = self._fixed_regions.bands(self._width)
+        frame_height = decoded[0][1].shape[0]
+        if bands.top + bands.bottom >= frame_height:
+            bands = FixedBands(left=bands.left, right=bands.right)
+        if bands.left + bands.right >= self._width:
+            bands = FixedBands(top=bands.top, bottom=bands.bottom)
+
+        min_position = min(position + bands.top for position, _ in decoded)
+        max_position = max(
+            position + arr.shape[0] - bands.bottom
+            for position, arr in decoded
+        )
+        content_height = max_position - min_position
+        center_start = bands.left
+        center_end = self._width - bands.right
+        if content_height <= 0 or center_end <= center_start:
+            return None
+        canvas = np.empty((content_height, self._width, 3), dtype=np.uint8)
+        covered = np.zeros(content_height, dtype=bool)
+
+        for position, arr in decoded:
+            content = arr[bands.top:arr.shape[0] - bands.bottom]
+            start = position + bands.top - min_position
+            end = start + content.shape[0]
+            if start < 0 or end > content_height:
                 return None
             missing = ~covered[start:end]
             if np.any(missing):
-                canvas[start:end][missing] = arr[missing]
+                target = canvas[start:end]
+                target[missing, center_start:center_end] = (
+                    content[missing, center_start:center_end]
+                )
                 covered[start:end][missing] = True
 
         if not bool(covered.all()):
             return None
-        return canvas
+
+        # Fixed sidebars cannot be repeated down the page. Extend the nearest
+        # scrolling pixel as a neutral background, then paste the first
+        # viewport's fixed sidebar once at its real vertical position.
+        if bands.left:
+            canvas[:, :bands.left] = canvas[:, bands.left:bands.left + 1]
+        if bands.right:
+            canvas[:, center_end:] = canvas[:, center_end - 1:center_end]
+        if bands.left or bands.right:
+            first_position, first_arr = decoded[0]
+            first_content = first_arr[
+                bands.top:first_arr.shape[0] - bands.bottom
+            ]
+            start = first_position + bands.top - min_position
+            end = start + first_content.shape[0]
+            if start < 0 or end > content_height:
+                return None
+            if bands.left:
+                canvas[start:end, :bands.left] = first_content[:, :bands.left]
+            if bands.right:
+                canvas[start:end, center_end:] = first_content[:, center_end:]
+
+        parts = []
+        first_arr = decoded[0][1]
+        if bands.top:
+            parts.append(first_arr[:bands.top])
+        parts.append(canvas)
+        if bands.bottom:
+            parts.append(first_arr[-bands.bottom:])
+        return parts[0] if len(parts) == 1 else np.vstack(parts)
 
     def _offline_edge(self, previous: _Keyframe,
                       current: _Keyframe) -> _GraphEdge | None:
+        excluded_rows = self._fixed_row_mask()
+        excluded_columns = self._fixed_column_mask()
+        previous_cols = self._matching_cols(
+            previous.cols, previous.pixels, excluded_columns
+        )
+        current_cols = self._matching_cols(
+            current.cols, current.pixels, excluded_columns
+        )
         predictions = [0]
         if (previous.online_position is not None
                 and current.online_position is not None):
@@ -730,12 +859,19 @@ class Stitcher:
         candidates: list[_GraphEdge] = []
         for predict in dict.fromkeys(predictions):
             shift, diff = self._find_shift_for(
-                previous.cols, current.cols, predict
+                previous_cols,
+                current_cols,
+                predict,
+                excluded_rows=excluded_rows,
             )
             robust = False
             if diff > self.max_diff:
                 robust_shift, robust_diff = self._find_shift_for(
-                    previous.cols, current.cols, predict, robust=True
+                    previous_cols,
+                    current_cols,
+                    predict,
+                    robust=True,
+                    excluded_rows=excluded_rows,
                 )
                 if robust_diff < diff:
                     shift, diff = robust_shift, robust_diff
@@ -752,9 +888,26 @@ class Stitcher:
             pixel_diff_fn = (
                 _robust_pixel_overlap_diff if robust else _pixel_overlap_diff
             )
-            aligned = pixel_diff_fn(previous.pixels, current.pixels, shift)
-            stationary = pixel_diff_fn(previous.pixels, current.pixels, 0)
-            changed = _pixel_change_fraction(previous.pixels, current.pixels)
+            aligned = pixel_diff_fn(
+                previous.pixels,
+                current.pixels,
+                shift,
+                excluded_rows=excluded_rows,
+                excluded_columns=excluded_columns,
+            )
+            stationary = pixel_diff_fn(
+                previous.pixels,
+                current.pixels,
+                0,
+                excluded_rows=excluded_rows,
+                excluded_columns=excluded_columns,
+            )
+            changed = _pixel_change_fraction(
+                previous.pixels,
+                current.pixels,
+                excluded_rows=excluded_rows,
+                excluded_columns=excluded_columns,
+            )
             pixel_limit = (
                 ROBUST_MAX_PIXEL_DIFF if robust else MAX_PIXEL_DIFF
             )
@@ -847,10 +1000,14 @@ def _sample_columns(width: int) -> np.ndarray:
 
 def _compute_cols(arr: np.ndarray) -> np.ndarray:
     """Reduce each row to [mean*2, contrast, bright+edges]; returns [H, 3]."""
-    h, w = arr.shape[:2]
-    xs = _sample_columns(w)
-    g = (0.299 * arr[:, xs, 0] + 0.587 * arr[:, xs, 1]
-         + 0.114 * arr[:, xs, 2]).astype(np.float32)  # [H, count]
+    return _compute_cols_from_pixels(_sample_pixels(arr))
+
+
+def _compute_cols_from_pixels(pixels: np.ndarray) -> np.ndarray:
+    """Build row signatures from an already-selected set of RGB columns."""
+    h = pixels.shape[0]
+    g = (0.299 * pixels[:, :, 0] + 0.587 * pixels[:, :, 1]
+         + 0.114 * pixels[:, :, 2]).astype(np.float32)  # [H, count]
     mean = g.mean(axis=1)                              # [H]
     centered = g - mean[:, None]
     contrast = np.abs(centered).mean(axis=1)
@@ -867,7 +1024,14 @@ def _sample_pixels(arr: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr[:, _sample_columns(arr.shape[1]), :])
 
 
-def _pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> float:
+def _pixel_overlap_diff(
+    a: np.ndarray,
+    b: np.ndarray,
+    offset: int,
+    *,
+    excluded_rows: np.ndarray | None = None,
+    excluded_columns: np.ndarray | None = None,
+) -> float:
     """Raw-pixel overlap MAD using the same ignored edge bands as matching."""
     h1, h2 = len(a), len(b)
     if offset >= 0:
@@ -881,12 +1045,26 @@ def _pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> float:
     end = length - bottom
     if end <= top:
         return float("inf")
-    aa = a[a_start + top:a_start + end].astype(np.int16)
-    bb = b[b_start + top:b_start + end].astype(np.int16)
+    aa, bb = _masked_overlap(
+        a, b, a_start, b_start, top, end,
+        excluded_rows=excluded_rows,
+        excluded_columns=excluded_columns,
+    )
+    if aa.size == 0:
+        return float("inf")
+    aa = aa.astype(np.int16)
+    bb = bb.astype(np.int16)
     return float(np.abs(aa - bb).mean())
 
 
-def _robust_pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> float:
+def _robust_pixel_overlap_diff(
+    a: np.ndarray,
+    b: np.ndarray,
+    offset: int,
+    *,
+    excluded_rows: np.ndarray | None = None,
+    excluded_columns: np.ndarray | None = None,
+) -> float:
     """Sparse RGB overlap MAD after dropping the noisiest 20% of rows."""
     h1, h2 = len(a), len(b)
     if offset >= 0:
@@ -900,8 +1078,15 @@ def _robust_pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> flo
     end = length - bottom
     if end <= top:
         return float("inf")
-    aa = a[a_start + top:a_start + end].astype(np.int16)
-    bb = b[b_start + top:b_start + end].astype(np.int16)
+    aa, bb = _masked_overlap(
+        a, b, a_start, b_start, top, end,
+        excluded_rows=excluded_rows,
+        excluded_columns=excluded_columns,
+    )
+    if aa.size == 0:
+        return float("inf")
+    aa = aa.astype(np.int16)
+    bb = bb.astype(np.int16)
     row_scores = np.abs(aa - bb).mean(axis=(1, 2))
     keep = max(1, (len(row_scores) * 4) // 5)
     if keep == len(row_scores):
@@ -909,16 +1094,64 @@ def _robust_pixel_overlap_diff(a: np.ndarray, b: np.ndarray, offset: int) -> flo
     return float(np.partition(row_scores, keep - 1)[:keep].mean())
 
 
-def _pixel_change_fraction(a: np.ndarray, b: np.ndarray) -> float:
+def _pixel_change_fraction(
+    a: np.ndarray,
+    b: np.ndarray,
+    *,
+    excluded_rows: np.ndarray | None = None,
+    excluded_columns: np.ndarray | None = None,
+) -> float:
     """Fraction of sparse pixels with a perceptible change at zero offset."""
     h = min(len(a), len(b))
     w = min(a.shape[1], b.shape[1])
     if h <= 0 or w <= 0:
         return 1.0
-    delta = np.abs(
-        a[:h, :w].astype(np.int16) - b[:h, :w].astype(np.int16)
-    )
+    rows = np.ones(h, dtype=bool)
+    if excluded_rows is not None and excluded_rows.shape == (h,):
+        rows &= ~excluded_rows
+    columns = np.ones(w, dtype=bool)
+    if excluded_columns is not None and excluded_columns.shape == (w,):
+        columns &= ~excluded_columns
+    if not bool(rows.any()) or not bool(columns.any()):
+        return 1.0
+    aa = a[:h, :w][rows][:, columns]
+    bb = b[:h, :w][rows][:, columns]
+    delta = np.abs(aa.astype(np.int16) - bb.astype(np.int16))
     return float((delta.max(axis=2) > 6).mean())
+
+
+def _masked_overlap(
+    a: np.ndarray,
+    b: np.ndarray,
+    a_start: int,
+    b_start: int,
+    top: int,
+    end: int,
+    *,
+    excluded_rows: np.ndarray | None,
+    excluded_columns: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return an overlap with viewport-fixed rows/columns removed."""
+    if excluded_rows is None and excluded_columns is None:
+        return (
+            a[a_start + top:a_start + end],
+            b[b_start + top:b_start + end],
+        )
+    a_rows = np.arange(a_start + top, a_start + end)
+    b_rows = np.arange(b_start + top, b_start + end)
+    active_rows = np.ones(len(a_rows), dtype=bool)
+    if excluded_rows is not None:
+        if excluded_rows.shape == (len(a),) and len(a) == len(b):
+            active_rows &= ~(excluded_rows[a_rows] | excluded_rows[b_rows])
+    columns = np.ones(min(a.shape[1], b.shape[1]), dtype=bool)
+    if excluded_columns is not None and excluded_columns.shape == columns.shape:
+        active_columns = ~excluded_columns
+        if int(active_columns.sum()) >= 4:
+            columns = active_columns
+    return (
+        a[a_rows[active_rows], :len(columns)][:, columns],
+        b[b_rows[active_rows], :len(columns)][:, columns],
+    )
 
 
 def _content_top_ignore(length: int) -> int:
@@ -937,7 +1170,14 @@ def _effective_min_overlap(frame_height: int) -> int:
     return min(100, max(12, frame_height // 4))
 
 
-def _col_diff(a: np.ndarray, b: np.ndarray, offset: int, min_overlap: int) -> float:
+def _col_diff(
+    a: np.ndarray,
+    b: np.ndarray,
+    offset: int,
+    min_overlap: int,
+    *,
+    excluded_rows: np.ndarray | None = None,
+) -> float:
     """Mean per-channel abs diff of the overlap when b is shifted by offset.
 
     offset >= 0 aligns a[offset:] with b[:...]; offset < 0 the reverse.
@@ -952,18 +1192,24 @@ def _col_diff(a: np.ndarray, b: np.ndarray, offset: int, min_overlap: int) -> fl
         return float("inf")
     top = _content_top_ignore(length)
     bottom = _content_bottom_ignore(length)
-    if length < min_overlap + top + bottom:
-        return float("inf")
     end = length - bottom
     if end <= top:
         return float("inf")
-    aa = a[a_start + top: a_start + end]
-    bb = b[b_start + top: b_start + end]
+    aa, bb = _masked_overlap(
+        a, b, a_start, b_start, top, end,
+        excluded_rows=excluded_rows,
+    )
+    required = min_overlap
+    if excluded_rows is not None:
+        required = max(12, min_overlap - int(excluded_rows.sum()))
+    if len(aa) < required:
+        return float("inf")
     return float(np.abs(aa - bb).mean())
 
 
 def _robust_col_diff(a: np.ndarray, b: np.ndarray, offset: int,
-                     min_overlap: int) -> float:
+                     min_overlap: int, *,
+                     excluded_rows: np.ndarray | None = None) -> float:
     """Overlap score that tolerates a small locally-changing page region.
 
     This is deliberately only used after the ordinary mean score rejects a
@@ -980,13 +1226,18 @@ def _robust_col_diff(a: np.ndarray, b: np.ndarray, offset: int,
         return float("inf")
     top = _content_top_ignore(length)
     bottom = _content_bottom_ignore(length)
-    if length < min_overlap + top + bottom:
-        return float("inf")
     end = length - bottom
     if end <= top:
         return float("inf")
-    aa = a[a_start + top: a_start + end]
-    bb = b[b_start + top: b_start + end]
+    aa, bb = _masked_overlap(
+        a, b, a_start, b_start, top, end,
+        excluded_rows=excluded_rows,
+    )
+    required = min_overlap
+    if excluded_rows is not None:
+        required = max(12, min_overlap - int(excluded_rows.sum()))
+    if len(aa) < required:
+        return float("inf")
     row_scores = np.abs(aa - bb).mean(axis=1)
     keep = max(1, (len(row_scores) * 4) // 5)
     if keep == len(row_scores):
