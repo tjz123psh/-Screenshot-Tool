@@ -266,4 +266,4 @@ pngshot/
 
 ## 许可证
 
-当前仓库未声明开源许可证。如果你要分发或二次开发，请先确认项目所有者为仓库补充明确的 LICENSE 文件。
+本项目使用 [MIT 许可证](LICENSE)。版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。

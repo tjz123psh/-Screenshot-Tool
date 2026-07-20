@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 from collections import deque
 from pathlib import Path
@@ -10,7 +11,7 @@ import numpy as np
 import cairo
 from PIL import Image
 
-from pngshot import config
+from pngshot import __version__, config
 from pngshot import controller, diagnostics, fastctl, shortcuts
 from pngshot import tray_config
 from pngshot.__main__ import _load_image_file
@@ -23,6 +24,14 @@ from pngshot.overlay.selector import Selector
 from pngshot.overlay.surface import OverlaySurface
 from pngshot.overlay.toolbar import ANNOTATE_BUTTONS, Toolbar
 from pngshot.services import llm, ocr, saver
+
+
+class MetadataTests(unittest.TestCase):
+    def test_runtime_and_package_versions_match(self):
+        project = tomllib.loads(
+            (Path(__file__).parents[1] / "pyproject.toml").read_text()
+        )
+        self.assertEqual(__version__, project["project"]["version"])
 
 
 class SelectorTests(unittest.TestCase):

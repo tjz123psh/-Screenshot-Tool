@@ -3,6 +3,7 @@ name = "pngshot"
 version = "0.2.0"
 description = "Region screenshot with pin, OCR, LLM translation, annotation, long-shot"
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
 # All runtime deps are pacman-managed system packages; nothing to pip-install:
 #   grim, wl-clipboard, tesseract, tesseract-data-{chi_sim,eng,osd},
 #   python-gobject, python-cairo, gtk4-layer-shell,
