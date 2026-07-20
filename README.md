@@ -1,185 +1,263 @@
 # pngshot
 
-面向 niri 的 Wayland 区域截图工具。框选一块区域后，紧贴选区下方会浮出一排工具栏，可直接复制、保存、标注、OCR、大模型翻译、钉到桌面，或进行长截图（滚动拼接）。
+面向 [niri](https://github.com/YaLTeR/niri) 的 Wayland 截图工具：框选区域后，在选区下方直接完成保存、复制、标注、OCR、翻译、钉图和长截图。
 
-适用环境：Arch Linux + niri（Wayland），GTK4 + gtk4-layer-shell。
+适用环境：Arch Linux、Wayland、niri、GTK4。项目不创建大型客户端，常驻部分只有一个轻量系统托盘和一个后台控制服务。
 
-## 功能
+## 功能概览
 
-- **区域截图** —— 拖拽框选，8 个缩放手柄，可拖动移动选区。
-- **选区下方工具栏** —— 像素级精确，因为整个选区阶段是一整块全屏 `wlr-layer-shell` 覆盖层（而非独立窗口）。
-- **确认 → 剪贴板**（`wl-copy -t image/png`）、**保存**、**取消**。
-- **OCR** —— 默认走 tesseract（本地、快、无需联网），会先对截图做放大/灰度/深色主题自动反色的预处理，明显改善屏幕小字的识别。也可在配置里切到 `engine = "vision"`，用 opencode 视觉模型识别（小字、中英混排、低对比度更强，标点更准），失败会自动回退 tesseract。结果显示在可编辑窗口中。
-- **翻译** —— 走本机 opencode 免费模型（`opencode run --format json`），也支持通过 `OPENAI_API_KEY` 使用 OpenAI 兼容接口。
-- **标注** —— 画笔 / 箭头 / 矩形 / 文字，可循环切换颜色与粗细，支持撤销。文字通过 Pango 渲染，中文正常显示。
-- **桌面钉图** —— 无边框浮动窗口（在 niri 中「置顶」即浮动）：
-  - 滚轮 = 缩放图片内容（窗口大小不变，以光标为锚点）
-  - Ctrl + 滚轮 = 缩放窗口本身
-  - 任意位置拖动 = 移动窗口
-  - `c` 复制，`s` 保存，`0` 重置缩放，`q`/`Esc` 关闭，右键菜单
-- **长截图** —— 半自动。Wayland 禁止合成滚动事件，所以由你手动滚动目标窗口，pngshot 按定时采样选区，并用 OpenCV 模板匹配拼接各帧。`Space` 强制取一帧，`Enter` 完成，`Esc` 取消。
-- **可靠的快捷键服务** —— 轻量后台服务确认每次调用；`pngshotctl` 的截图热键走精简 socket 客户端，健康服务下不加载完整 CLI，异常时自动拉起并回退；动作启动失败会显示桌面通知并记录日志。
-- **系统托盘** —— 常驻相机图标显示就绪/截图中/异常；菜单直接提供区域截图、长截图、钉图、保存/复制偏好、诊断和重启。
+- 区域截图：拖拽选区、移动和调整大小，工具栏贴近选区显示。
+- 标注：画笔、箭头、矩形、文字，支持颜色、粗细和撤销。
+- OCR：默认使用本地 Tesseract；可选用 opencode 视觉模型识别小字和低对比度内容。
+- 翻译：优先复用本机 `opencode serve`，不可用时自动回退到一次性 CLI 调用。
+- 长截图：手动滚动目标窗口，pngshot 连续采样并拼接垂直内容。
+- 钉图：把截图作为无边框浮动窗口固定在桌面，支持缩放、移动、复制和保存。
+- 系统托盘：右键菜单提供截图、长截图、钉图、保存/复制偏好、诊断、重启和退出。
+- 快捷键热路径：健康服务下使用轻量 Unix socket 客户端，减少第一次加载后的启动开销；服务异常时自动拉起并回退。
 
-## 一键安装
+## 快速开始
+
+### 一键安装
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install.sh | bash
 ```
 
-脚本会把程序安装在用户目录；在 Arch Linux 上若检测到缺失的系统依赖，会仅在装包阶段请求一次 `sudo`：
+安装脚本会：
 
-1. 用 `pacman` 自动安装实际缺失的运行依赖（已安装的包不会重复安装）
-2. 把源码克隆/更新到 `~/.local/share/pngshot`
-3. 安装 `pngshot` / `pngshotctl` 启动器（内置 `PYTHONPATH` 与 `LD_PRELOAD` 修复）
-4. 尝试把默认快捷键写入 `config.kdl` 已 include 的用户 `dms/keybinds.kdl`
-5. 安装应用菜单入口、应用图标和系统托盘状态图标
-6. 安装并启动 systemd 用户服务与系统托盘
-7. 再次检查运行环境，并提示 `~/.local/bin` 是否在 `PATH` 中
+1. 在 Arch Linux 上安装缺失的系统依赖（只在确实缺包时请求 `sudo`）。
+2. 把源码安装到 `~/.local/share/pngshot`。
+3. 安装 `pngshot`、`pngshotctl`、应用菜单入口、图标和系统托盘服务。
+4. 尝试把默认快捷键写入 `config.kdl` 实际 include 的用户自定义 `dms/keybinds.kdl`。
+5. 启动并启用 `pngshot.service` 和 `pngshot-tray.service`。
 
-重复运行是幂等的：已安装则 `git pull` 更新后重装启动器。
+安装完成后建议立即检查：
 
-> 不希望脚本自动装包时，可使用 `curl ... | PNGSHOT_SKIP_PACKAGES=1 bash`；脚本仍会检查环境并列出缺失项。非 Arch 系统没有 `pacman` 时也会自动跳过装包步骤。
->
-> 不希望安装程序修改 Niri 快捷键时，可使用 `curl ... | PNGSHOT_SKIP_SHORTCUTS=1 bash`。快捷键冲突、配置缺失或校验失败只会产生提示，不会中断 pngshot 主安装。
-
-## 依赖（均为 pacman 包）
-
+```sh
+pngshotctl status
+pngshotctl doctor
+pngshotctl shortcuts
 ```
-grim wl-clipboard libnotify tesseract tesseract-data-chi_sim tesseract-data-eng
+
+安装是幂等的，重复执行会更新源码并重新安装启动器。快捷键冲突、Niri 配置缺失或验证失败只会产生提示，不会中断 pngshot 主安装。
+
+如果需要跳过某一步：
+
+```sh
+# 不自动安装 pacman 依赖
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install.sh \
+  | PNGSHOT_SKIP_PACKAGES=1 bash
+
+# 不修改 Niri 快捷键配置
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install.sh \
+  | PNGSHOT_SKIP_SHORTCUTS=1 bash
+```
+
+### 手动安装
+
+```sh
+git clone https://github.com/tjz123psh/-Screenshot-Tool.git ~/Projects/pngshot
+mkdir -p ~/.local/bin
+ln -sfn ~/Projects/pngshot/scripts/pngshot ~/.local/bin/pngshot
+ln -sfn pngshot ~/.local/bin/pngshotctl
+pngshot region
+```
+
+手动安装不会自动安装系统依赖、systemd 服务或托盘服务；需要时请参考 `contrib/` 中的 service、desktop 和 Niri 示例文件。若源码放在其他目录，请设置 `PNGSHOT_ROOT` 后再运行启动器。
+
+## 快捷键与 Niri/DMS
+
+快捷键由 Niri 的 `binds {}` 注册，pngshot 本身不监听全局键盘。当前推荐绑定：
+
+| 快捷键 | 动作 |
+| --- | --- |
+| `Mod+Print` | 区域截图 |
+| `Mod+Shift+Print` | 区域截图并进入长截图 |
+| `Mod+Ctrl+Print` | 钉住当前剪贴板图片 |
+
+当前项目使用用户自定义的：
+
+```text
+~/.config/niri/dms/keybinds.kdl
+```
+
+`config.kdl` 已 include 该文件时，安装程序会在现有 `binds {}` 内写入带有开始/结束标记的 pngshot 区域。它不会修改 DMS 管理的 `dms/binds.kdl`，也不会覆盖其他快捷键。
+
+快捷键自动配置是安全的、可回滚的：
+
+- 检测到任意冲突时，不写入部分快捷键，直接提示手动配置。
+- 写入前保存 `keybinds.kdl.pngshot-backup`。
+- 写入后运行 `niri validate`；验证失败会恢复原文件。
+- Niri 正在运行时会尝试自动 reload。
+
+查看、安装或移除 pngshot 自己的托管区域：
+
+```sh
+pngshotctl shortcuts
+pngshotctl shortcuts install
+pngshotctl shortcuts remove
+```
+
+冲突或无法自动接入时，手动示例位于：
+
+```text
+~/.local/share/pngshot/contrib/niri-pngshot.kdl
+```
+
+## 使用方式
+
+### 区域截图
+
+按 `Mod+Print`，拖拽选区后使用选区下方工具栏：
+
+- 确认：保存并复制（可在托盘中分别关闭保存或复制）。
+- 标注：选择画笔、箭头、矩形或文字；颜色和粗细可单独选择。
+- OCR：识别选区中的文字并打开可编辑结果窗口。
+- 翻译：先 OCR，再使用配置的 LLM 翻译。
+- 长截图：把当前选区交给滚动采集器。
+- 钉图：把当前结果作为桌面浮动图片。
+
+### 长截图
+
+长截图是半自动流程：Wayland 不允许普通应用合成滚动事件，因此需要用户手动滚动目标窗口，pngshot 负责连续采样和拼接。
+
+```text
+Space  强制采集一帧
+Enter  完成并生成长图
+Esc    取消
+```
+
+为获得稳定结果：
+
+- 只做垂直滚动，保持选区宽度不变。
+- 避开吸顶、吸底和固定侧栏，否则固定内容可能重复。
+- 滚动时尽量保持连续、匀速，减少动画和页面跳动。
+- 选区外侧的蓝色边界用于提示采集范围，不会进入最终图片。
+
+### 钉图
+
+钉图窗口在 niri 中使用 floating 布局：
+
+| 操作 | 功能 |
+| --- | --- |
+| 滚轮 | 缩放图片内容 |
+| `Ctrl` + 滚轮 | 缩放窗口 |
+| 拖动 | 移动窗口 |
+| `c` / `s` | 复制 / 保存 |
+| `0` | 重置缩放 |
+| `q` / `Esc` | 关闭 |
+
+### 系统托盘
+
+托盘图标状态：
+
+- 相机：服务就绪。
+- 录制点：正在截图或采集长截图。
+- 警告：服务异常。
+
+右键菜单包含区域截图、长截图、钉图、截图后保存、截图后复制、运行诊断、重启服务和退出托盘。
+
+## 依赖
+
+项目面向 Arch Linux，运行依赖由 pacman 管理：
+
+```text
+git python grim wl-clipboard libnotify tesseract
+tesseract-data-chi_sim tesseract-data-eng
 python-gobject python-cairo gtk4-layer-shell libayatana-appindicator
 python-pillow python-opencv python-numpy
 ```
 
-翻译功能使用 PATH 上的 `opencode`（免费模型，无需登录）；不装也不影响其它功能。
-
-一次装齐：
-
-```sh
-sudo pacman -S grim wl-clipboard libnotify tesseract tesseract-data-chi_sim \
-    tesseract-data-eng python-gobject python-cairo gtk4-layer-shell \
-    libayatana-appindicator python-pillow python-opencv python-numpy
-```
-
-## 手动安装
-
-不想用一键脚本，也可以手动来：
-
-```sh
-git clone https://github.com/tjz123psh/-Screenshot-Tool.git ~/.local/share/pngshot
-ln -s ~/.local/share/pngshot/scripts/pngshot ~/.local/bin/pngshot
-# scripts/pngshot 默认从 ~/Projects/pngshot 找源码，若放在别处需设 PNGSHOT_ROOT：
-#   export PNGSHOT_ROOT=~/.local/share/pngshot
-pngshot region
-```
-
-> **关于 LD_PRELOAD**：PyGObject 会在 gtk4-layer-shell 之前链接 libwayland，导致 layer surface 失效。启动器通过预加载 `/usr/lib/libgtk4-layer-shell.so` 修复此问题，详见 <https://github.com/wmww/gtk4-layer-shell/blob/main/linking.md>。
-
-## niri 集成
-
-`contrib/niri-pngshot.kdl` 提供了窗口规则（保持钉图窗口整洁）和键位示例。安装程序会优先把默认键位自动写入当前 `config.kdl` 已 include 的用户自定义 `dms/keybinds.kdl`；如果检测到快捷键冲突或无法安全修改，主安装仍会继续，并提示你参考该示例手动配置。
-
-推荐键位：
-
-| 按键 | 动作 |
-|-----|--------|
-| `Mod+Print` | `pngshot region` |
-| `Mod+Shift+Print` | `pngshot long` |
-| `Mod+Ctrl+Print` | `pngshot pin-last` |
-
-`pngshot` 与 `pngshotctl` 都会走同一套确认协议。新配置推荐使用 `pngshotctl`，便于区分“向服务发送动作”和内部一次性窗口进程。
-
-快捷键由 Niri 的 `binds {}` 负责注册，pngshot 不会抢占全局键盘。安装时只会在用户自定义的 `keybinds.kdl` 中写入带有明确开始/结束标记的 pngshot 区域，不会修改 DMS 的 `binds.kdl`。要改按键，只需编辑实际被 include 的 `.kdl` 文件，把 `spawn-sh`（或 `spawn`）后面的动作保持为 `region`、`long`、`pin-last` 之一；修改后按你的 Niri 配置方式 reload。查看当前实际生效的 pngshot 绑定可以运行：
-
-```sh
-pngshotctl shortcuts
-```
-
-也可以手动管理自动配置区域：
-
-```sh
-pngshotctl shortcuts install   # 幂等安装，发现冲突时给出手动示例
-pngshotctl shortcuts remove    # 只移除 pngshot 自动管理区域
-```
-
-### 服务状态
-
-安装后 `pngshot.service` 由 systemd 用户会话监管。即使服务没有运行，截图命令也会先自动拉起并重试；服务仍不可用时才回退原来的直接启动路径，因此不会因为后台服务故障而完全失去截图能力。
-
-```sh
-pngshotctl status          # 人类可读状态
-pngshotctl status --json   # Niri/Waybar/QuickShell 状态模块
-pngshotctl doctor          # 依赖、环境、OCR 语言、快捷键诊断
-pngshotctl restart         # 重启服务
-pngshotctl logs            # 最近 50 行日志
-pngshotctl shortcuts       # 列出 Niri 中实际配置的截图快捷键
-pngshotctl tray            # 手动启动托盘（通常由 systemd 自动启动）
-```
-
-托盘图标会按状态切换：相机（就绪）、录制点（正在截图）、警告（服务异常）。若使用自定义状态模块，也可按 JSON 的 `state` 字段显示：`idle`、`busy`、`stopped`。
+翻译和可选视觉 OCR 需要 PATH 中存在 `opencode`；不安装它不影响截图、标注、本地 OCR 和长截图。
 
 ## 配置
 
-可选的 `~/.config/pngshot/config.toml`（参见 `config.toml.example`），可覆盖大模型的模型/目标语言、OCR 引擎与预处理（`engine`、`preprocess`、`upscale`、`vision_model`）、以及长截图调优参数（`poll_ms`、`min_shift_px`、`max_diff`）。若 `serve_port` 上已有 `opencode serve`，翻译会直接复用其 HTTP API；否则自动回退一次性 CLI，不需要手动切换。
+复制配置示例：
 
-经常使用免费模型翻译时，可在登录会话中启动 `opencode serve --pure --port 47823`，后续翻译会复用已加载的服务；不启动也不影响功能。
+```sh
+mkdir -p ~/.config/pngshot
+cp ~/.local/share/pngshot/config.toml.example ~/.config/pngshot/config.toml
+```
+
+配置文件为 `~/.config/pngshot/config.toml`，示例包含：
+
+| 区块 | 常用字段 | 用途 |
+| --- | --- | --- |
+| `[llm]` | `provider`, `model`, `target_lang`, `serve_port` | 翻译后端、模型、目标语言和服务端口 |
+| `[ocr]` | `engine`, `langs`, `preprocess`, `upscale` | Tesseract/视觉 OCR、语言和预处理 |
+| `[longshot]` | `poll_ms`, `min_shift_px`, `max_diff` | 长截图采样和重叠匹配参数 |
+
+默认配置优先使用本地 Tesseract 和 `opencode/deepseek-v4-flash-free`。如果经常翻译，可以预先启动：
+
+```sh
+opencode serve --pure --port 47823
+```
+
+pngshot 会优先复用该服务；服务不可用时自动回退到一次性调用。
 
 ## 命令行
 
 | 命令 | 作用 |
-|---------|------|
-| `pngshot region` | 交互式区域截图 |
-| `pngshot long` | 区域 → 长截图模式 |
-| `pngshot pin-last` | 把当前剪贴板图片钉到桌面 |
-| `pngshot tray` | 手动启动系统托盘（通常无需手动执行） |
-| `pngshot status --json` | 输出后台服务状态，供状态栏读取 |
-| `pngshot doctor` | 检查截图、OCR、通知、翻译和快捷键环境 |
-| `pngshot restart` | 重新启动后台服务 |
-| `pngshot logs` | 查看最近服务与动作日志 |
-| `pngshot debug-capture` | 抓取全屏并复制（冒烟测试） |
+| --- | --- |
+| `pngshot region` | 区域截图 |
+| `pngshot long` | 区域截图并进入长截图 |
+| `pngshot pin-last` | 钉住当前剪贴板图片 |
+| `pngshotctl status` | 查看后台服务状态 |
+| `pngshotctl doctor` | 检查依赖、Wayland、Niri、OCR、翻译和快捷键 |
+| `pngshotctl shortcuts` | 查看实际生效的 pngshot 快捷键 |
+| `pngshotctl shortcuts install` | 自动安装快捷键托管区域 |
+| `pngshotctl shortcuts remove` | 移除自动管理区域 |
+| `pngshotctl restart` | 重启截图服务 |
+| `pngshotctl logs` | 查看最近日志 |
+| `pngshotctl tray` | 手动启动托盘 |
 
-`region` 和 `long` 默认保存到 `~/Pictures/Screenshots` 并复制到剪贴板；可用
-`--no-save` 或 `--no-copy` 分别关闭其中一项。
+`region` 和 `long` 默认保存到 `~/Pictures/Screenshots` 并复制到剪贴板，可使用 `--no-save` 或 `--no-copy` 关闭对应行为。
 
-内部命令（由覆盖层派生，不供直接调用）：`pin-file`、`text-file`，均带 `--cleanup`。
+## 故障排查
 
-## 长截图的限制
+### 按快捷键没有反应
 
-- 采集中会在选区**外侧**显示蓝色边界；边界不遮挡内容，也不会进入最终长图。
-- **仅支持垂直滚动。** 横向移动会破坏匹配。
-- **吸顶/吸底栏会重复。** 请框住滚动内容本身，避开固定栏。
-- **帧间动画内容**会降低匹配得分；采集器会保留连续中间帧，确实无法建立重叠时状态栏才会提示调整。
-
-## 架构
-
+```sh
+pngshotctl status
+pngshotctl shortcuts
+pngshotctl doctor
 ```
+
+确认 `keybinds.kdl` 仍被 `config.kdl` include，并确认绑定中的命令是 `pngshot` 或 `pngshotctl` 的 `region`、`long`、`pin-last` 动作。快捷键由 Niri 管理，修改后需要 reload Niri。
+
+### 第一次启动较慢
+
+第一次调用会加载 GTK、GI、Cairo、字体和图像库；后续调用会受 Linux 页缓存和常驻截图服务帮助，通常更快。这不是截图内容缓存，也不会复用上一次选区。
+
+### 托盘菜单为空
+
+确认 `pngshot-tray.service` 正在运行，并使用支持传统 StatusNotifier/dbusmenu 的托盘宿主。可以先执行：
+
+```sh
+systemctl --user restart pngshot-tray.service
+pngshotctl doctor
+```
+
+### 图形覆盖层异常
+
+启动器会预加载 `/usr/lib/libgtk4-layer-shell.so`，修复 PyGObject 与 Wayland 客户端的链接顺序问题。若系统库路径不同，请确认 `gtk4-layer-shell` 已安装。
+
+## 项目结构
+
+```text
 pngshot/
-  __main__.py        CLI（region / long / pin-last / pin-file / text-file / debug）
-  fastctl.py         快捷键热路径的精简 Unix socket 客户端
-  controller.py      Unix socket 后台服务、动作确认、自愈与失败通知
-  tray.py            GTK3/Ayatana 系统托盘与传统 dbusmenu 右键菜单
-  diagnostics.py     Wayland/Niri/截图/OCR/翻译环境检查
-  capture.py         grim 封装（全屏 / 指定输出 / 区域）
-  config.py          ~/.config/pngshot/config.toml 加载器
-  overlay/           阶段一：全屏 layer-shell 覆盖层
-    surface.py         layer-shell 窗口、Cairo 渲染、事件分发
-    selector.py        选区矩形 + 缩放/移动状态机
-    toolbar.py         区域工具栏 + 标注工具栏（Pango 文字）
-    annotate.py        画笔/箭头/矩形/文字笔画 + 烘焙进图片
-    model.py           Rect、Mode、手柄几何
-    app.py             捕获 → 覆盖层 → 动作流水线；长截图交接
-  pin/window.py      桌面钉图浮动窗口（内容/窗口缩放、移动）
-  longshot/
-    recorder.py        后台连续采样 + 有序队列 + 控制栏
-    highlight.py       采集区外侧 layer-shell 高亮边界
-    stitcher.py        OpenCV 垂直拼接 + 重叠复检
-  services/
-    clipboard.py       wl-copy / wl-paste
-    ocr.py             tesseract（预处理）/ vision 双引擎 + 中文空格清理
-    llm.py             opencode serve 快速通道 / CLI 回退 + OpenAI 兜底
-    saver.py           ~/Pictures/Screenshots
-  util/
-    niri.py            niri msg action 辅助（浮动等）
-    imaging.py         PIL <-> Cairo surface
-    result_win.py      OCR/翻译结果窗口
+├── overlay/       区域选择、工具栏、标注和 OCR/翻译入口
+├── longshot/      连续采样、滚动高亮和图像拼接
+├── pin/           桌面钉图窗口
+├── services/      剪贴板、保存、OCR 和 LLM 服务
+├── fastctl.py     快捷键热路径客户端
+├── controller.py  Unix socket 后台服务
+├── shortcuts.py   Niri 快捷键检测和安全配置
+└── tray.py        GTK3/Ayatana 系统托盘
 ```
+
+公开安装、服务、desktop、图标和 Niri 示例文件位于 `contrib/`；真实用户配置和运行时文件不应提交到仓库。
+
+## 许可证
+
+当前仓库未声明开源许可证。如果你要分发或二次开发，请先确认项目所有者为仓库补充明确的 LICENSE 文件。
