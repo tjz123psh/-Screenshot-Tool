@@ -26,8 +26,8 @@ so every frame after the first was rejected. Instead we now:
 
 A frame is appended when the best overlap diff is <= ``max_diff`` (lower is
 better) and it contributes at least ``min_shift_px`` new rows. A diff above
-``max_diff`` means the frames don't overlap confidently -> the recorder tells
-the user to scroll back a little.
+``max_diff`` means the frames don't overlap confidently. The recorder keeps
+collecting and retries against recent history before showing a slow-down hint.
 
 Constraints (documented for the user):
   - Vertical scroll only. Horizontal movement breaks matching.
@@ -56,11 +56,28 @@ class StitchResult:
     warnings: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _TrackedFrame:
+    """Small matching state for a recently accepted frame.
+
+    Keeping a handful of these costs only the row signatures plus sparse pixel
+    samples, but lets us recover when the newest frame is animated or its
+    signature lands on a bad periodic match.  ``position`` is the frame top in
+    canvas coordinates.
+    """
+
+    cols: np.ndarray
+    pixels: np.ndarray
+    signature: np.ndarray
+    position: int
+
+
 class Stitcher:
     def __init__(self, max_diff: float = DEFAULT_MAX_DIFF,
-                 min_shift_px: int = 4) -> None:
+                 min_shift_px: int = 4, *, preview: bool = True) -> None:
         self.max_diff = max_diff
         self.min_shift_px = min_shift_px
+        self._preview_enabled = preview
 
         # Canvas storage as an ordered list of row-blocks (top -> bottom) rather
         # than one big array. Appending/prepending a block is O(1); we only pay
@@ -110,6 +127,8 @@ class Stitcher:
         self.last_shift = 0
         self.last_added = 0
         self.last_diff = 0.0
+        self.last_recovered = False
+        self._history: deque[_TrackedFrame] = deque(maxlen=6)
 
     # ------------------------------------------------------------------
 
@@ -117,7 +136,7 @@ class Stitcher:
         """Add a frame. Returns the overlap diff (LOWER is better; 0 = first).
 
         A return value > ``max_diff`` means the frame was NOT appended
-        (low-confidence overlap); the caller may prompt the user to scroll back.
+        (low-confidence overlap); a later frame may reconnect to recent history.
         A confident match that simply didn't move far enough (< min_shift_px)
         is also not appended but returns a low diff.
         """
@@ -126,15 +145,20 @@ class Stitcher:
         if not self._blocks:
             self._width = arr.shape[1]
             self._append_block(arr, side="bottom")
-            self._last_cols = _compute_cols(arr)
-            self._last_pixels = _sample_pixels(arr)
-            self._last_signature = _frame_signature(arr)
+            cols = _compute_cols(arr)
+            pixels = _sample_pixels(arr)
+            signature = _frame_signature(arr)
+            self._last_cols = cols
+            self._last_pixels = pixels
+            self._last_signature = signature
             self._last_offset = 0
             self._anchor_pos = 0
             self.frames_used = 1
             self.last_shift = 0
             self.last_added = arr.shape[0]
             self.last_diff = 0.0
+            self.last_recovered = False
+            self._history.append(_TrackedFrame(cols, pixels, signature, 0))
             return 0.0
 
         # Width must match; if a resize slipped in, letterbox/crop to canvas.
@@ -151,13 +175,50 @@ class Stitcher:
             return 0.0
 
         cols = _compute_cols(arr)
-        shift, diff = self._find_shift(cols)
+        pixels = _sample_pixels(arr)
+
+        # Normally the newest frame is enough. If it is briefly corrupted by
+        # animation, a sticky header, or a periodic list pattern, retry against
+        # a few recent accepted frames before declaring low overlap. This is
+        # deliberately bounded so the hot path stays cheap.
+        matches: list[tuple[float, int, _TrackedFrame, bool]] = []
+        history = list(reversed(self._history))
+        for index, tracked in enumerate(history):
+            predict = self._last_offset if index == 0 else 0
+            shift, diff = self._find_shift_for(tracked.cols, cols, predict)
+            if diff > self.max_diff and index == 0 and len(history) == 1:
+                matches.append((diff, shift, tracked, False))
+                continue
+            changed = _pixel_change_fraction(tracked.pixels, pixels)
+            aligned = _pixel_overlap_diff(tracked.pixels, pixels, shift)
+            stationary = _pixel_overlap_diff(tracked.pixels, pixels, 0)
+            false_motion = changed < 0.012 or stationary <= aligned + 0.2
+            matches.append((diff, shift, tracked, false_motion))
+            # A confident, meaningful match on the newest frame is the common
+            # path. Older frames are only consulted for low confidence or a
+            # sub-threshold shift.
+            if diff <= self.max_diff and abs(shift) >= self.min_shift_px and not false_motion:
+                break
+
+        valid = [m for m in matches
+                 if m[0] <= self.max_diff
+                 and abs(m[1]) >= self.min_shift_px
+                 and not m[3]]
+        if valid:
+            diff, shift, tracked, _ = min(valid, key=lambda m: m[0])
+            recovered = tracked is not history[0] if history else False
+        else:
+            diff, shift, tracked, _ = min(matches, key=lambda m: m[0])
+            recovered = False
         self.last_shift = shift
         self.last_added = 0
         self.last_diff = diff
+        self.last_recovered = recovered
 
         if diff > self.max_diff:
-            # low-confidence overlap: scrolled too fast, don't append
+            # low-confidence overlap: keep the frame out of the canvas, but do
+            # not advance the matching reference. The recorder can continue
+            # collecting and a later frame may reconnect to history.
             return diff
         if abs(shift) < self.min_shift_px:
             # confident match but essentially the same view — nothing new.
@@ -165,23 +226,15 @@ class Stitcher:
             # scrolls accumulate against a fixed reference and eventually append.
             return diff
 
-        pixels = _sample_pixels(arr)
-        if self._last_pixels is not None:
-            aligned = _pixel_overlap_diff(self._last_pixels, pixels, shift)
-            stationary = _pixel_overlap_diff(self._last_pixels, pixels, 0)
-            changed = _pixel_change_fraction(self._last_pixels, pixels)
-            if changed < 0.012 or stationary <= aligned + 0.2:
-                # The current screen is closer at its original position than
-                # at the proposed scroll offset, or fewer than 1.2% of sampled
-                # pixels changed at all. This is usually a blinking badge/caret
-                # over a periodic list, not actual page movement.
-                self.last_shift = 0
-                self.last_diff = stationary
-                return stationary
+        # All valid candidates have already passed the sparse pixel check.
+        if not valid:
+            self.last_shift = 0
+            self.last_diff = diff
+            return diff
 
         # `shift` is signed: +down / -up. Convert to the incoming frame's
         # position within the canvas and grow whichever edge it overhangs.
-        new_pos = self._anchor_pos + shift
+        new_pos = tracked.position + shift
         self._extend_canvas(arr, new_pos)
 
         self._last_cols = cols
@@ -189,6 +242,9 @@ class Stitcher:
         self._last_signature = sig
         self._last_offset = shift
         self.frames_used += 1
+        self._history.append(
+            _TrackedFrame(cols, pixels, sig, self._anchor_pos)
+        )
         return diff
 
     def _extend_canvas(self, arr: np.ndarray, new_pos: int) -> None:
@@ -215,6 +271,8 @@ class Stitcher:
         if over_top > 0:
             # top `over_top` rows of the frame are new; prepend and re-anchor
             self._append_block(arr[:over_top, :, :], side="top")
+            for tracked in self._history:
+                tracked.position += over_top
             self._anchor_pos = 0
             self.last_added = over_top
         else:
@@ -235,7 +293,8 @@ class Stitcher:
         else:  # top
             self._blocks.appendleft(block)
         self._height += block.shape[0]
-        self._thumb_add_block(block, side=side)
+        if self._preview_enabled:
+            self._thumb_add_block(block, side=side)
 
     def _thumb_add_block(self, block: np.ndarray, *, side: str) -> None:
         """Scale just this block once (~2 ms) and cache it as a preview block.
@@ -274,6 +333,10 @@ class Stitcher:
         """
         last = self._last_cols
         assert last is not None
+        return self._find_shift_for(last, cols, self._last_offset)
+
+    def _find_shift_for(self, last: np.ndarray, cols: np.ndarray,
+                        predict: int) -> tuple[int, float]:
         h = len(last)
         min_overlap = _effective_min_overlap(h)
         max_offset = max(h - min_overlap, 0)
@@ -281,7 +344,7 @@ class Stitcher:
             return 0, float(_col_diff(last, cols, 0, min_overlap))
 
         best_off, best_diff = 0, float("inf")
-        for off in _offset_candidates(max_offset, self._last_offset):
+        for off in _offset_candidates(max_offset, predict):
             d = _col_diff(last, cols, off, min_overlap)
             if d < best_diff:
                 best_diff, best_off = d, off

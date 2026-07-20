@@ -8,14 +8,14 @@ Design goals (after first-round usability feedback):
   - DON'T steal the keyboard. The control panel uses ON_DEMAND keyboard mode
     and anchors to a screen corner, so the target window keeps focus and the
     user can scroll / PageDown / space-to-scroll it normally.
-  - Give live feedback. A shrinking preview thumbnail of the stitched result
-    grows as the user scrolls, so they are never scrolling blind, plus a
-    height / frame-count readout.
+  - Give live feedback through a compact state + height readout while keeping
+    the sampled window visible. The selected rectangle itself stays outlined.
   - Make the primary actions clickable buttons (完成 / 取消), not hidden
     keyboard shortcuts — clicking a button doesn't fight the target window
     for keyboard focus.
-  - Loud, sticky warning when overlap confidence drops (scroll back a little)
-    instead of a one-frame flash.
+  - Treat short matching failures as recoverable sampling noise. The recorder
+    keeps collecting and only asks the user to slow down after a sustained run
+    of uncertain frames; it never requires an immediate rollback.
 
 Flow:
   1. The overlay hands us the fixed screen rect to sample.
@@ -23,7 +23,8 @@ Flow:
   3. A *background thread* grabs the region back-to-back as fast as grim allows
      (~25 fps) and hands each frame to the main thread via ``GLib.idle_add``.
      The stitcher runs on the main thread only.
-  4. The preview + readout update live; low-overlap flips the panel red.
+  4. The readout updates live; temporary low-overlap is retried using
+     recent frame history instead of interrupting the user's scroll.
   5. 完成 button (or Enter, when the panel happens to have focus) stitches and
      returns the tall image; 取消 (or Esc) aborts.
 
@@ -45,9 +46,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("Gdk", "4.0")
-gi.require_version("GdkPixbuf", "2.0")
 
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Gtk4LayerShell  # noqa: E402
+from gi.repository import Gdk, GLib, Gtk, Gtk4LayerShell  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from .. import capture
@@ -58,9 +58,6 @@ from .stitcher import Stitcher
 
 # Callback fired when recording ends. (image | None, warnings)
 DoneCallback = Callable[["Image.Image | None", list], None]
-
-PREVIEW_W = 220
-PREVIEW_H = 300
 
 # Set PNGSHOT_LONGSHOT_DEBUG=1 to print per-frame score/shift to the terminal.
 import os  # noqa: E402
@@ -85,12 +82,18 @@ class LongshotRecorder:
         self.stitcher = Stitcher(
             max_diff=cfg.max_diff,
             min_shift_px=cfg.min_shift_px,
+            preview=False,
         )
         self._sampling = True
         self._last_diff = 0.0
         self._captured_height = rect.h
-        # None | "low_overlap" | "no_move" — drives the status hint colour/text
+        # None | "recovering" | "recovered" | "slow_down" | "no_move" — drives the status
+        # hint colour/text. A single bad frame is normal during scroll animation
+        # and must not be turned into a user-visible error.
         self._hint: str | None = None
+        self._consecutive_low = 0
+        self._low_since: float | None = None
+        self._recoveries = 0
         self._finished = False
 
         # Background capture: grim takes ~36 ms per grab, which would freeze the
@@ -108,6 +111,10 @@ class LongshotRecorder:
         self._pending_lock = threading.Lock()
         self._pending_condition = threading.Condition(self._pending_lock)
         self._idle_queued = False
+        # Always retain the newest completed grab independently of the work
+        # queue. When the user clicks 完成, this closes the small race where grim
+        # has captured the final scroll position but GTK has not processed it.
+        self._latest_frame: Image.Image | None = None
 
         self._build_panel()
         self.highlight = SelectionHighlight(app, rect, screen_size)
@@ -169,18 +176,9 @@ class LongshotRecorder:
         header.append(self.state)
         content.append(header)
 
-        # live preview of the stitched result
-        self.preview = Gtk.Picture()
-        self.preview.set_size_request(PREVIEW_W, PREVIEW_H)
-        self.preview.set_content_fit(Gtk.ContentFit.CONTAIN)
-        frame = Gtk.Frame()
-        frame.add_css_class("pngshot-preview")
-        frame.set_child(self.preview)
-        content.append(frame)
-
         # Direction and measurements are separate typographic roles: the user
         # sees what to do first, then the current capture facts.
-        self.status = Gtk.Label(label="预览会随滚动实时增长")
+        self.status = Gtk.Label(label="保持平稳滚动，画面会自动拼接")
         self.status.add_css_class("pngshot-title")
         self.status.set_wrap(True)
         self.status.set_max_width_chars(28)
@@ -193,7 +191,7 @@ class LongshotRecorder:
         content.append(self.metrics)
 
         # instructions
-        hint = Gtk.Label(label="保持目标窗口在前台，向上或向下滚动")
+        hint = Gtk.Label(label="保持目标窗口在前台滚动；再次按长截图快捷键即可完成")
         hint.add_css_class("pngshot-caption")
         hint.set_wrap(True)
         hint.set_max_width_chars(28)
@@ -244,10 +242,9 @@ class LongshotRecorder:
         # A side is only usable if the panel fits *entirely* in the gap there,
         # otherwise the panel would still poke into the sampled rect. Horizontal
         # sides must clear the panel's width, vertical sides its height. These
-        # are conservative estimates of the built panel's footprint (preview +
-        # readout + hint + buttons + margins).
-        panel_w = PREVIEW_W + 60      # ~250 in practice
-        panel_h = PREVIEW_H + 220     # ~490 in practice
+        # are conservative estimates of the compact readout + buttons + margins.
+        panel_w = 320
+        panel_h = 190
         # (side -> free space, room the panel needs on that side)
         sides = {
             "top": (r.y, panel_h),
@@ -324,6 +321,7 @@ class LongshotRecorder:
                 time.sleep(0.1)
                 continue
             with self._pending_condition:
+                self._latest_frame = frame
                 # Never discard an intermediate scroll position: one dropped
                 # bridge frame is enough to force the user to roll back.  Under
                 # exceptional GTK load, pause sampling until ordered work has
@@ -372,42 +370,60 @@ class LongshotRecorder:
                 f"added={self.stitcher.last_added}px grew={grew}"
             )
 
-        # Classify *why* a frame was not appended so the panel can give the
-        # right advice. After the first frame, a non-growing sample is either
-        #   - high diff  -> the views don't overlap: user scrolled too fast
-        #   - small shift -> the view barely moved: user hasn't scrolled yet
+        # Classify *why* a frame was not appended. Low-confidence samples are
+        # expected during kinetic scrolling and local animation, so debounce
+        # them instead of immediately telling the user to roll backward.
         # (diff is a mean signature difference; LOWER is a better match.)
         if not first and not grew:
             if self.stitcher.last_diff > self.cfg.max_diff:
-                self._hint = "low_overlap"
+                now = time.monotonic()
+                self._consecutive_low += 1
+                if self._low_since is None:
+                    self._low_since = now
+                sustained = (
+                    self._consecutive_low >= 12
+                    and now - self._low_since >= 0.55
+                )
+                self._hint = "slow_down" if sustained else "recovering"
             else:
+                self._consecutive_low = 0
+                self._low_since = None
                 self._hint = "no_move"
         else:
-            self._hint = None
+            recovered = getattr(self.stitcher, "last_recovered", False)
+            if recovered:
+                self._recoveries += 1
+            self._consecutive_low = 0
+            self._low_since = None
+            self._hint = "recovered" if recovered else None
             if grew or first:
-                # seed the preview on the very first frame so the panel isn't
-                # blank before the user starts scrolling.
                 self._captured_height = new_h
-                self._refresh_preview()
-        self._update_status()
+        if not getattr(self, "_finished", False):
+            self._update_status()
 
     # ------------------------------------------------------------------
-
-    def _refresh_preview(self) -> None:
-        thumb = self.stitcher.preview_thumbnail(PREVIEW_W, PREVIEW_H)
-        if thumb is None:
-            return
-        self.preview.set_pixbuf(_pil_to_pixbuf(thumb))
 
     def _update_status(self) -> None:
         tail = f"{self._captured_height:,} px  ·  {self.stitcher.frames_used} 帧"
         self.metrics.set_text(tail)
-        if self._hint == "low_overlap":
-            self.root.add_css_class("pngshot-alert")
-            self.state.set_text("需调整")
-            self.state.add_css_class("pngshot-error")
-            self.status.set_text("向回滚一点，恢复重叠后继续")
-            self.status.add_css_class("pngshot-error")
+        if self._hint == "slow_down":
+            self.root.remove_css_class("pngshot-alert")
+            self.state.set_text("请慢一些")
+            self.state.remove_css_class("pngshot-error")
+            self.status.set_text("减慢滚动即可，程序会继续寻找重叠")
+            self.status.remove_css_class("pngshot-error")
+        elif self._hint == "recovering":
+            self.root.remove_css_class("pngshot-alert")
+            self.state.set_text("校准中")
+            self.state.remove_css_class("pngshot-error")
+            self.status.set_text("正在自动寻找重叠，可继续滚动")
+            self.status.remove_css_class("pngshot-error")
+        elif self._hint == "recovered":
+            self.root.remove_css_class("pngshot-alert")
+            self.state.set_text("已恢复")
+            self.state.remove_css_class("pngshot-error")
+            self.status.set_text("已自动接回画面，继续滚动即可")
+            self.status.remove_css_class("pngshot-error")
         elif self._hint == "no_move":
             self.root.remove_css_class("pngshot-alert")
             self.state.set_text("等待滚动")
@@ -418,7 +434,7 @@ class LongshotRecorder:
             self.root.remove_css_class("pngshot-alert")
             self.state.set_text("采集中")
             self.state.remove_css_class("pngshot-error")
-            self.status.set_text("预览会随滚动实时增长")
+            self.status.set_text("保持平稳滚动，画面会自动拼接")
             self.status.remove_css_class("pngshot-error")
 
     # ------------------------------------------------------------------
@@ -449,12 +465,22 @@ class LongshotRecorder:
             self.on_done(None, [])
             return
         try:
+            # A grab may already be in flight when 完成 is clicked. Waiting for
+            # at most a fraction of a second after closing the panel lets that
+            # final frame land without leaving the saved image one scroll-step
+            # short. This only happens after the UI has disappeared.
+            capture_thread = getattr(self, "_capture_thread", None)
+            if capture_thread is not None and capture_thread.is_alive():
+                capture_thread.join(timeout=0.25)
             # The worker may have captured several frames while the main loop
-            # was busy repainting the preview or while the user clicked
-            # 完成.  Stitch those already-owned frames before taking the final
+            # was updating status or while the user clicked 完成. Stitch those
+            # already-owned frames before taking the final
             # snapshot; otherwise the saved image silently stops short of the
             # last visible scroll position.
             self._drain_pending_frames()
+            latest = getattr(self, "_latest_frame", None)
+            if latest is not None:
+                self._process_frame(latest)
             res = self.stitcher.result()
             self.on_done(res.image, res.warnings)
         except ValueError:
@@ -471,15 +497,3 @@ class LongshotRecorder:
                 if condition is not None:
                     condition.notify()
             self._process_frame(frame)
-
-
-# ---------------------------------------------------------------------------
-# helpers
-
-def _pil_to_pixbuf(img: Image.Image) -> GdkPixbuf.Pixbuf:
-    img = img.convert("RGBA")
-    w, h = img.size
-    data = GLib.Bytes.new(img.tobytes())
-    return GdkPixbuf.Pixbuf.new_from_bytes(
-        data, GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4
-    )

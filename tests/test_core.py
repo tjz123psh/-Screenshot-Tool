@@ -89,6 +89,22 @@ class ControllerTests(unittest.TestCase):
         )
         ensure.assert_not_called()
 
+    def test_second_longshot_action_finishes_active_capture(self):
+        state = controller._ServiceState(mock.Mock())
+        child = mock.Mock()
+        child.pid = 4242
+        child.poll.return_value = None
+        state.child = child
+        state.action = "long"
+
+        with mock.patch.object(controller.os, "kill") as kill:
+            response = state.launch("long", [])
+
+        self.assertTrue(response["accepted"])
+        self.assertTrue(response["toggled"])
+        kill.assert_called_once_with(4242, controller.signal.SIGUSR1)
+        self.assertIs(state.child, child)
+
     def test_action_retries_after_starting_missing_service(self):
         with mock.patch.object(
             controller, "request", side_effect=[None, {"accepted": True}]
@@ -242,6 +258,30 @@ class StitcherTests(unittest.TestCase):
         self.assertEqual(stitcher.current_height(), 500)
         self.assertEqual(stitcher.frames_used, 1)
         self.assertEqual(stitcher.last_shift, 0)
+
+    def test_recent_history_recovers_from_animated_reference(self):
+        """A damaged newest frame must not force the user to roll backward."""
+        rng = np.random.default_rng(2)
+        row_values = rng.integers(20, 230, 220, dtype=np.uint8)
+        page = np.repeat(row_values[:, None, None], 100, axis=1)
+        page = np.repeat(page, 3, axis=2)
+        page[:, ::7, 1] = np.minimum(
+            page[:, ::7, 1].astype(np.int16) + 20, 255
+        ).astype(np.uint8)
+
+        first = page[0:80].copy()
+        animated = page[10:90].copy()
+        animated[67:80] = 255
+        clean = page[20:100].copy()
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2)
+        stitcher.add(Image.fromarray(first, "RGB"))
+        stitcher.add(Image.fromarray(animated, "RGB"))
+        stitcher.add(Image.fromarray(clean, "RGB"))
+
+        self.assertTrue(stitcher.last_recovered)
+        self.assertEqual(stitcher.current_height(), 100)
+        self.assertEqual(stitcher.frames_used, 3)
 
 
 class LongshotRecorderTests(unittest.TestCase):

@@ -54,7 +54,8 @@ class Tray:
         menu.append(Gtk.SeparatorMenuItem())
 
         menu.append(self._action_item("区域截图", "region"))
-        menu.append(self._action_item("长截图", "long"))
+        self.longshot_item = self._action_item("长截图", "long")
+        menu.append(self.longshot_item)
         menu.append(self._action_item("钉住剪贴板", "pin-last"))
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -167,6 +168,7 @@ class Tray:
             icon = _READY_ICON
             label = f"Pngshot {__version__} · 服务已就绪"
             description = "Pngshot 截图服务已就绪"
+        self.longshot_item.set_label("完成长截图" if action == "long" else "长截图")
         self.status_item.set_label(label)
         self.indicator.set_icon_full(icon, description)
         self.indicator.set_title(description)

@@ -13,6 +13,7 @@ stay in-process because they need the live GTK loop and the on-screen region:
 from __future__ import annotations
 
 import gi
+import signal
 
 gi.require_version("Gtk", "4.0")
 
@@ -54,7 +55,27 @@ def run_region(*, save: bool = True, copy: bool = True, long_shot: bool = False)
         "long_shot": long_shot,
         "screen_size": bg.size,  # (w, h) — lets the recorder park its panel off the selection
         "exit_code": 0,
+        "finish_requested": False,
     }
+    recorder_ref: dict[str, object] = {"value": None}
+    state["recorder_ref"] = recorder_ref
+
+    def _on_finish_signal(_signum, _frame) -> None:
+        # Python delivers signal handlers on GTK's main thread. Keep the
+        # handler tiny and hand the actual recorder action to the main loop.
+        recorder = recorder_ref.get("value")
+        if recorder is not None:
+            GLib.idle_add(recorder._finish, cancel=False)  # type: ignore[attr-defined]
+        elif state.get("action") == "long":
+            # The selection was confirmed and the 250 ms overlay hand-off is
+            # in progress. Buffer only this narrow race; a second press while
+            # the user is still drawing the selection is intentionally ignored.
+            state["finish_requested"] = True
+
+    # SIGUSR1 is used only by the supervised controller for the second
+    # long-shot shortcut. Install it before the selection overlay appears so a
+    # rapid second press cannot terminate the process during the hand-off.
+    signal.signal(signal.SIGUSR1, _on_finish_signal)
 
     def on_result(action: str, cropped: Image.Image | None, rect: Rect | None) -> None:
         # If the user confirmed a plain region but we were launched in long-shot
@@ -116,7 +137,12 @@ def _begin_longshot(app: Gtk.Application, rect: Rect, state: dict) -> bool:
     try:
         rec = LongshotRecorder(app, rect, cfg.longshot, on_done,
                                screen_size=screen_size)
+        recorder_ref = state.get("recorder_ref")
+        if isinstance(recorder_ref, dict):
+            recorder_ref["value"] = rec
         rec.present()
+        if state.get("finish_requested"):
+            GLib.idle_add(rec._finish, cancel=False)
     except Exception as e:  # noqa: BLE001
         print(f"[pngshot] long-shot failed to start: {e}")
         state["action"] = "cancel"

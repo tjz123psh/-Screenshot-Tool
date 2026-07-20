@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import socket
 import socketserver
+import signal
 import subprocess
 import sys
 import threading
@@ -251,6 +252,25 @@ class _ServiceState:
         exclusive = action in EXCLUSIVE_ACTIONS
         with self.lock:
             self._clear_finished_locked()
+            # Long-shot is intentionally a toggle: pressing the same global
+            # shortcut again finishes the active capture. This avoids forcing
+            # the user to move the pointer back to the floating control panel,
+            # and keeps the panel small enough to stay out of the sampled area.
+            if action == "long" and self.child is not None and self.action == "long":
+                try:
+                    os.kill(self.child.pid, signal.SIGUSR1)
+                except OSError:
+                    return {
+                        "ok": True, "accepted": False, "busy": True,
+                        "message": "长截图进程已结束，请重新启动",
+                    }
+                self.last_event = "正在完成长截图"
+                self.last_event_at = time.time()
+                self.logger.info("requested long-shot finish child=%s", self.child.pid)
+                return {
+                    "ok": True, "accepted": True, "toggled": True,
+                    "pid": self.child.pid, "action": action,
+                }
             if exclusive and self.child is not None:
                 return {
                     "ok": True, "accepted": False, "busy": True,
