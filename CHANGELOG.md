@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Multi-frame detection of viewport-fixed headers, footers, and sidebars, which
   are excluded from overlap matching and retained only once in the final image.
 
+### Changed
+
+- Offline long screenshot reconstruction now feather-blends aligned overlaps to
+  reduce fixed-wallpaper seams behind translucent windows, while preserving a
+  complete frame state for large local animation changes.
+
 ## [0.2.0] - 2026-07-20
 
 ### Added

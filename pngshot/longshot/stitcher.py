@@ -34,6 +34,10 @@ so every frame after the first was rejected. Instead we now:
   8. Learn viewport-fixed edge bands from at least three accepted scrolling
      transitions. Exclude those rows and columns while matching, then retain a
      fixed header, footer, or sidebar only once in the offline result.
+  9. Feather aligned offline overlaps with viewport-centred weights so a
+     screen-fixed wallpaper behind a translucent window does not switch at
+     hard frame boundaries. Large local pixel changes keep one frame state to
+     avoid animation ghosts.
 
 A frame is appended when the best overlap diff is <= ``max_diff`` (lower is
 better) and it contributes at least ``min_shift_px`` new rows. A diff above
@@ -69,6 +73,11 @@ MAX_PIXEL_DIFF = 32.0
 # images can share similar row statistics by chance, but their RGB MAD is near
 # 85; genuine screen overlap is normally in the low single digits.
 ROBUST_MAX_PIXEL_DIFF = 24.0
+# During offline fusion, pixels that differ by more than this amount are
+# usually a local animation/caret or an opaque foreground change rather than
+# the translucent background we are trying to smooth. Keep one complete frame
+# state for those pixels instead of averaging an obvious ghost.
+FUSION_MAX_PIXEL_DELTA = 48
 # Offline reconstruction retains losslessly-compressed full-resolution
 # keyframes. The cap excludes one pending raw accepted frame (at most one
 # selection-sized RGB image), which is needed to preserve a direction-change
@@ -790,7 +799,21 @@ class Stitcher:
         if content_height <= 0 or center_end <= center_start:
             return None
         canvas = np.empty((content_height, self._width, 3), dtype=np.uint8)
-        covered = np.zeros(content_height, dtype=bool)
+        # A translucent application can keep its wallpaper/background fixed in
+        # screen coordinates while the foreground document scrolls. Keeping
+        # only the first pixel written makes that stationary layer jump at
+        # every frame boundary. Fuse aligned rows with a feathered viewport
+        # weight: pixels near the viewport centre carry most of the weight,
+        # while pixels entering/leaving at the edges taper to one. This makes
+        # the background transition gradually instead of switching at a hard
+        # frame boundary. The accumulator stays bounded to one uint32 per row.
+        weights = np.minimum(
+            np.arange(frame_height, dtype=np.uint32) + 1,
+            np.arange(frame_height, 0, -1, dtype=np.uint32),
+        )
+        content_weights = weights[bands.top:frame_height - bands.bottom]
+        weight_sum = np.zeros(content_height, dtype=np.uint32)
+        peak_weight = np.zeros(content_height, dtype=np.uint32)
 
         for position, arr in decoded:
             content = arr[bands.top:arr.shape[0] - bands.bottom]
@@ -798,15 +821,51 @@ class Stitcher:
             end = start + content.shape[0]
             if start < 0 or end > content_height:
                 return None
-            missing = ~covered[start:end]
+            target = canvas[start:end]
+            if content.shape[0] != content_weights.shape[0]:
+                return None
+            incoming_weights = content_weights
+            row_weights = weight_sum[start:end]
+            incoming_peak = peak_weight[start:end]
+            missing = row_weights == 0
             if np.any(missing):
-                target = canvas[start:end]
                 target[missing, center_start:center_end] = (
                     content[missing, center_start:center_end]
                 )
-                covered[start:end][missing] = True
+            overlap = ~missing
+            if np.any(overlap):
+                old_weight = row_weights[overlap].astype(np.uint64)[:, None, None]
+                new_weight = incoming_weights[overlap].astype(np.uint64)[:, None, None]
+                old = target[overlap, center_start:center_end].astype(np.uint32)
+                incoming = content[overlap, center_start:center_end].astype(np.uint32)
+                total_weight = old_weight + new_weight
+                blended = (
+                    old.astype(np.uint64) * old_weight
+                    + incoming.astype(np.uint64) * new_weight
+                    + total_weight // 2
+                ) // total_weight
+                fused = old.astype(np.uint8)
+                delta = np.max(
+                    np.abs(old.astype(np.int16) - incoming.astype(np.int16)),
+                    axis=2,
+                )
+                smooth = delta <= FUSION_MAX_PIXEL_DELTA
+                fused[smooth] = blended.astype(np.uint8)[smooth]
+                # Keep a complete state for high-contrast local changes. A
+                # frame nearer the viewport centre wins, which avoids turning
+                # a blinking caret/video tile into a translucent ghost.
+                prefer_incoming = (
+                    incoming_weights[overlap] >= incoming_peak[overlap]
+                )[:, None]
+                replace = (~smooth) & prefer_incoming
+                fused[replace] = incoming[replace]
+                target[overlap, center_start:center_end] = fused
+            weight_sum[start:end] += incoming_weights
+            peak_weight[start:end] = np.maximum(
+                peak_weight[start:end], incoming_weights
+            )
 
-        if not bool(covered.all()):
+        if not bool((weight_sum > 0).all()):
             return None
 
         # Fixed sidebars cannot be repeated down the page. Extend the nearest

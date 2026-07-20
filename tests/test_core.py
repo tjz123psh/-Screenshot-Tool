@@ -395,6 +395,96 @@ class StitcherTests(unittest.TestCase):
             np.asarray(result.image.convert("RGB")), self.base[:50]
         )
 
+    def test_offline_rebuild_feathers_a_screen_fixed_translucent_background(self):
+        rng = np.random.default_rng(47)
+        height, width, viewport = 220, 100, 60
+        page = rng.integers(20, 220, (height, width, 3), dtype=np.uint8)
+        # A quiet pane exposes the screen-fixed wallpaper clearly enough to
+        # measure seams, while the surrounding document texture anchors scroll
+        # matching. Bright strips stand in for opaque foreground text.
+        page[:, 45:55] = (35, 30, 32)
+        for y in range(10, height, 28):
+            page[y:y + 3, 8:42] = 245
+
+        screen_y = np.arange(viewport)[:, None]
+        wallpaper = np.empty((viewport, width, 3), dtype=np.uint8)
+        wallpaper[:, :, 0] = 120 + 80 * np.sin(screen_y / 7)
+        wallpaper[:, :, 1] = 100 + 70 * np.sin(screen_y / 11 + 1)
+        wallpaper[:, :, 2] = 100 + 70 * np.cos(screen_y / 9)
+
+        frames = []
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2, preview=False)
+        for position in range(0, height - viewport + 1, 20):
+            foreground = page[position:position + viewport].astype(np.float32)
+            alpha = np.full((viewport, width, 1), 0.90, dtype=np.float32)
+            alpha = np.where(
+                foreground.mean(axis=2, keepdims=True) > 225,
+                0.99,
+                alpha,
+            )
+            frame = np.rint(
+                foreground * alpha + wallpaper * (1 - alpha)
+            ).astype(np.uint8)
+            frames.append((position, frame))
+            stitcher.add(Image.fromarray(frame, "RGB"))
+
+        result = stitcher.result()
+        output = np.asarray(result.image.convert("RGB"))
+        self.assertTrue(result.rebuilt)
+        self.assertEqual(output.shape, (height, width, 3))
+
+        first_write = np.empty_like(output)
+        covered = np.zeros(height, dtype=bool)
+        for position, frame in frames:
+            missing = ~covered[position:position + viewport]
+            first_write[position:position + viewport][missing] = frame[missing]
+            covered[position:position + viewport] = True
+
+        boundaries = [
+            position + viewport
+            for position, _ in frames[:-1]
+            if position + viewport < height
+        ]
+
+        def seam_score(image):
+            return np.mean([
+                np.abs(
+                    image[y, 46:54].astype(np.int16)
+                    - image[y - 1, 46:54].astype(np.int16)
+                ).mean()
+                for y in boundaries
+            ])
+
+        self.assertLess(seam_score(output), seam_score(first_write) * 0.35)
+        self.assertGreater(output[10:13, 8:42].mean(), 235)
+
+    def test_offline_fusion_does_not_average_a_large_local_animation(self):
+        rng = np.random.default_rng(53)
+        height, width, viewport = 220, 100, 60
+        page = rng.integers(20, 220, (height, width, 3), dtype=np.uint8)
+        animated_color = np.array([255, 15, 20], dtype=np.uint8)
+
+        stitcher = Stitcher(max_diff=9.0, min_shift_px=2, preview=False)
+        for position in range(0, height - viewport + 1, 20):
+            frame = page[position:position + viewport].copy()
+            if position == 80:
+                frame[20:28, 45:53] = animated_color
+            stitcher.add(Image.fromarray(frame, "RGB"))
+
+        result = stitcher.result()
+        output = np.asarray(result.image.convert("RGB"))
+        self.assertTrue(result.rebuilt)
+        self.assertEqual(output.shape, page.shape)
+
+        patch = output[100:108, 45:53].astype(np.int16)
+        clean = page[100:108, 45:53].astype(np.int16)
+        animated = np.broadcast_to(animated_color, patch.shape).astype(np.int16)
+        clean_distance = np.abs(patch - clean).max(axis=2)
+        animated_distance = np.abs(patch - animated).max(axis=2)
+        self.assertLessEqual(
+            int(np.minimum(clean_distance, animated_distance).max()), 1
+        )
+
     def test_offline_failure_keeps_online_result_and_warns(self):
         rng = np.random.default_rng(29)
         unrelated = rng.integers(0, 256, (40, 24, 3), dtype=np.uint8)
