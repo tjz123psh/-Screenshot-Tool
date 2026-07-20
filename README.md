@@ -1,5 +1,7 @@
 # pngshot
 
+[![CI](https://github.com/tjz123psh/-Screenshot-Tool/actions/workflows/ci.yml/badge.svg)](https://github.com/tjz123psh/-Screenshot-Tool/actions/workflows/ci.yml)
+
 面向 [niri](https://github.com/YaLTeR/niri) 的 Wayland 截图工具：框选区域后，在选区下方直接完成保存、复制、标注、OCR、翻译、钉图和长截图。
 
 适用环境：Arch Linux、Wayland、niri、GTK4。项目不创建大型客户端，常驻部分只有一个轻量系统托盘和一个后台控制服务。
