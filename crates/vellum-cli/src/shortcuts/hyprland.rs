@@ -19,7 +19,7 @@
 //! option: `hyprctl binds` reports every Lua binding as `dispatcher: __lua`
 //! with an opaque numeric `arg`, so it cannot say which chord runs vellum.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -54,6 +54,15 @@ static BIND_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// `hl.bind("...", ...)` or `hl.bind(mainMod .. " + Print", ...)`.
 static LUA_BIND_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*hl\.bind\s*\(\s*(.+?)\s*,\s*hl\.").unwrap());
+
+/// `local mainMod = "SUPER"` - a string constant used to build chords.
+///
+/// A trailing comment is allowed and must be: real configs annotate these, and
+/// anchoring at the closing quote silently matched nothing on the machine this
+/// was written for.
+static LUA_CONST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*local\s+([A-Za-z_]\w*)\s*=\s*"([^"]*)"\s*(?:--.*)?$"#).unwrap()
+});
 
 /// `$XDG_CONFIG_HOME/hypr` or `~/.config/hypr`.
 pub fn config_dir() -> PathBuf {
@@ -387,14 +396,57 @@ fn remove_conf(root: &Path, testing: bool) -> InstallResult {
     InstallResult::new(Status::Removed, Some(target), detail)
 }
 
+/// Renders a Lua chord expression as the key combination it produces.
+///
+/// Chords are built by concatenation, typically `mainMod .. " + Print"`. Showing
+/// that source text to someone asking "which key takes a screenshot?" answers a
+/// different question than the one they asked, so string literals and any
+/// `local NAME = "..."` constants from the same file are substituted.
+///
+/// Anything that is not a literal or a known constant is left as written: a
+/// chord assembled by a function call cannot be resolved without a Lua
+/// interpreter, and inventing a plausible key would be worse than showing the
+/// expression.
+fn render_lua_chord(expression: &str, constants: &HashMap<String, String>) -> String {
+    let mut parts = Vec::new();
+    for piece in expression.split("..") {
+        let piece = piece.trim();
+        if let Some(literal) = piece
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            parts.push(literal.to_string());
+        } else if let Some(value) = constants.get(piece) {
+            parts.push(value.clone());
+        } else {
+            return expression.to_string();
+        }
+    }
+    // Collapse the spacing the concatenation produced: "SUPER" + " + Print"
+    // arrives as "SUPER + Print" with the separators already embedded.
+    parts
+        .join("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collects `local NAME = "value"` string constants declared in one file.
+fn lua_constants(text: &str) -> HashMap<String, String> {
+    LUA_CONST_RE
+        .captures_iter(text)
+        .map(|capture| (capture[1].to_string(), capture[2].to_string()))
+        .collect()
+}
+
 /// Finds vellum bindings in one config file's text.
 ///
 /// Handles both dialects in one pass: a `bind =` line yields its real chord,
-/// while a Lua `hl.bind` line yields the chord expression verbatim (it may be
-/// `mainMod .. " + Print"`, which only Lua can evaluate — showing the source
-/// text is more honest than guessing what `mainMod` holds).
+/// while a Lua `hl.bind` line has its chord expression resolved against the
+/// string constants declared in the same file.
 fn discover_in(path: &Path, text: &str) -> Vec<Binding> {
     let mut found = Vec::new();
+    let constants = lua_constants(text);
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') || trimmed.starts_with("--") {
@@ -406,7 +458,7 @@ fn discover_in(path: &Path, text: &str) -> Vec<Binding> {
         let key = if let Some(capture) = BIND_LINE_RE.captures(line) {
             format!("{}, {}", capture[1].trim(), capture[2].trim())
         } else if let Some(capture) = LUA_BIND_RE.captures(line) {
-            capture[1].trim().trim_matches('"').to_string()
+            render_lua_chord(capture[1].trim(), &constants)
         } else {
             continue;
         };
@@ -604,6 +656,47 @@ mod tests {
         let actions: HashSet<&str> = found.iter().map(|b| b.action.as_str()).collect();
         assert!(actions.contains("region"), "conf binding not found");
         assert!(actions.contains("long"), "lua binding not found");
+    }
+
+    #[test]
+    fn a_lua_chord_resolves_its_local_constants() {
+        // Shape taken from a real config: the chord is built from a `mainMod`
+        // local, so the raw expression answers a different question than "which
+        // key is it".
+        //
+        // The trailing comment is load bearing. A first version of the constant
+        // pattern anchored the closing quote to end-of-line, which matched a
+        // stripped-down fixture but not the real declaration, so discovery kept
+        // printing `mainMod .. " + Print"` while this test passed.
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.path().join("keybinds.lua"),
+            "local mainMod = \"SUPER\" -- Sets \"Windows\" key as main modifier\n\
+             hl.bind(mainMod .. \" + Print\", hl.dsp.exec_cmd(\"$HOME/.local/bin/vellumctl region\"))\n",
+        )
+        .unwrap();
+
+        let found = discover(Some(dir.path()));
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, "SUPER + Print");
+    }
+
+    #[test]
+    fn an_unresolvable_chord_is_shown_as_written() {
+        // No `mainMod` declaration anywhere, so there is nothing to substitute.
+        // Inventing a key would be worse than showing the source.
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.path().join("keybinds.lua"),
+            "hl.bind(pick_mod() .. \" + Print\", hl.dsp.exec_cmd(\"vellumctl long\"))\n",
+        )
+        .unwrap();
+
+        let found = discover(Some(dir.path()));
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, "pick_mod() .. \" + Print\"");
     }
 
     #[test]

@@ -27,12 +27,19 @@ const TRADITIONAL_MARKERS: &str = "後臺裡這個為與從會發現時過還讓
 pub enum TranslateError {
     NotFound(String),
     Failed(String),
+    /// The model or its provider refused the request, and said so.
+    ///
+    /// Separate from [`TranslateError::Failed`] because retrying is pointless:
+    /// the backend was reachable and answered, it just will not serve this
+    /// model. Falling back to another transport with the same model would only
+    /// spend the timeout again.
+    Upstream(String),
 }
 
 impl std::fmt::Display for TranslateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound(msg) | Self::Failed(msg) => f.write_str(msg),
+            Self::NotFound(msg) | Self::Failed(msg) | Self::Upstream(msg) => f.write_str(msg),
         }
     }
 }
@@ -103,10 +110,19 @@ fn already_target_language(text: &str, target_lang: &str) -> bool {
 }
 
 fn translate_opencode(prompt: &str, cfg: &LlmConfig) -> Result<String, TranslateError> {
-    if server_available(cfg.serve_port)
-        && let Ok(text) = translate_opencode_server(prompt, cfg)
-    {
-        return Ok(text);
+    if server_available(cfg.serve_port) {
+        match translate_opencode_server(prompt, cfg) {
+            Ok(text) => return Ok(text),
+            // The model or its provider refused. The CLI would ask the same
+            // model through the same account, so retrying only doubles the
+            // wait: measured 29 s on the server plus 30 s on the CLI for one
+            // 401. Report the real reason instead.
+            Err(err @ TranslateError::Upstream(_)) => return Err(err),
+            // Anything else means the server itself was unhelpful (stale build,
+            // protocol drift, transport error). The CLI is a genuine second
+            // chance, so take it silently.
+            Err(_) => {}
+        }
     }
     translate_opencode_cli(prompt, cfg)
 }
@@ -138,6 +154,17 @@ fn translate_opencode_cli(prompt: &str, cfg: &LlmConfig) -> Result<String, Trans
             )));
         }
     };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Check for an upstream error event before anything else. opencode exits 0
+    // and prints a perfectly well-formed stream even when the model call failed,
+    // so status alone cannot tell the two apart. Reporting the model's own
+    // message is the difference between "翻译失败: No provider available (401)"
+    // and a bare timeout that blames the wrong component.
+    if let Some(reason) = extract_error(&stdout) {
+        return Err(TranslateError::Upstream(reason));
+    }
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let clipped: String = stderr.trim().chars().take(400).collect();
@@ -145,13 +172,68 @@ fn translate_opencode_cli(prompt: &str, cfg: &LlmConfig) -> Result<String, Trans
             "opencode run failed: {clipped}"
         )));
     }
-    let text = extract_text(&String::from_utf8_lossy(&output.stdout));
+    let text = extract_text(&stdout);
     if text.is_empty() {
         return Err(TranslateError::Failed(
             "no translation text in opencode output".into(),
         ));
     }
     Ok(text)
+}
+
+/// Extract an upstream error out of opencode's nd-JSON event stream.
+///
+/// opencode reports a refused request as an `error` event and then keeps the
+/// process alive, so a caller that only looks for `text` events sees nothing and
+/// blames its own timeout. Measured on this machine: the free `zen` pool answers
+/// `No provider available` with status 401 after about 27 s, which used to
+/// surface as "opencode run timed out after 30s" - a message that sent the user
+/// looking in the wrong place entirely.
+pub(crate) fn extract_error(stream: &str) -> Option<String> {
+    stream.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let event = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        if event.get("type").and_then(|v| v.as_str()) != Some("error") {
+            return None;
+        }
+        describe_error(event.get("error")?)
+    })
+}
+
+/// Extract an upstream error out of a server message response.
+///
+/// The HTTP transport reports a refused request differently from the CLI: the
+/// request itself succeeds with status 200 and the failure is nested under
+/// `info.error`, with `parts` left empty. Without this, a refusal surfaced as
+/// "no translation text in opencode server response", which describes the
+/// symptom rather than the cause.
+pub(crate) fn upstream_error(info: Option<&serde_json::Value>) -> Option<String> {
+    describe_error(info?.get("error")?)
+}
+
+/// Render one opencode error object as a user-facing reason.
+///
+/// Shared by both transports so the same refusal reads the same way whichever
+/// path produced it.
+fn describe_error(error: &serde_json::Value) -> Option<String> {
+    let data = error.get("data");
+    // The human-readable reason lives in `data.message`; `error.name` is a
+    // class like `APIError` and is useless on its own.
+    let message = data
+        .and_then(|d| d.get("message"))
+        .and_then(|v| v.as_str())
+        .or_else(|| error.get("message").and_then(|v| v.as_str()))
+        .unwrap_or("unknown error");
+    let status = data
+        .and_then(|d| d.get("statusCode"))
+        .and_then(serde_json::Value::as_u64);
+    Some(match status {
+        Some(code) => format!("{message}（HTTP {code}）"),
+        None => message.to_string(),
+    })
 }
 
 /// Collect `text` parts out of opencode's nd-JSON event stream.
@@ -227,6 +309,13 @@ fn translate_opencode_server(prompt: &str, cfg: &LlmConfig) -> Result<String, Tr
         "POST",
     )
     .and_then(|response| {
+        // The server answers HTTP 200 even when the model refused: the reason
+        // lives in `info.error` and `parts` comes back empty. Reporting "no
+        // translation text" there would hide an upstream 401 behind a message
+        // that reads like our own bug.
+        if let Some(message) = upstream_error(response.get("info")) {
+            return Err(TranslateError::Upstream(message));
+        }
         let text = response
             .get("parts")
             .and_then(|v| v.as_array())
@@ -438,6 +527,46 @@ mod tests {
             "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"第二行\"}}\n",
         );
         assert_eq!(extract_text(stream), "第一行\n第二行");
+    }
+
+    #[test]
+    fn an_upstream_refusal_is_reported_with_its_status() {
+        // Verbatim shape captured from `opencode run` on this machine when the
+        // free zen pool had no provider for the model. This used to be invisible
+        // to us, which is how a 401 came out as "timed out after 30s".
+        let stream = concat!(
+            "{\"type\":\"step\",\"part\":{\"type\":\"step-start\"}}\n",
+            "{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"No provider available\",\"statusCode\":401,\"isRetryable\":false}}}\n",
+        );
+        assert_eq!(
+            extract_error(stream).as_deref(),
+            Some("No provider available（HTTP 401）")
+        );
+    }
+
+    #[test]
+    fn a_clean_stream_reports_no_error() {
+        let stream = "{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"ok\"}}\n";
+        assert!(extract_error(stream).is_none());
+    }
+
+    #[test]
+    fn the_server_reports_the_same_refusal_as_the_cli() {
+        // The HTTP transport answers 200 and buries the failure in `info.error`
+        // with an empty `parts` array, so without this the user was told "no
+        // translation text" for what is really an authentication problem.
+        let info = serde_json::json!({
+            "error": {
+                "name": "APIError",
+                "data": { "message": "No provider available", "statusCode": 401 }
+            }
+        });
+        assert_eq!(
+            upstream_error(Some(&info)).as_deref(),
+            Some("No provider available（HTTP 401）")
+        );
+        assert!(upstream_error(Some(&serde_json::json!({ "cost": 0 }))).is_none());
+        assert!(upstream_error(None).is_none());
     }
 
     #[test]
