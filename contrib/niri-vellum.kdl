@@ -1,0 +1,44 @@
+// Example Niri configuration for vellum.
+//
+// This file is never read automatically. Copy the parts you want into your own
+// Niri config, or `include` it from config.kdl. `install.sh` only ever touches
+// an already-included keybinds.kdl, and never this file.
+
+// The pin window and the OCR/translation result window are reference overlays:
+// they should float above the scrolling layout instead of joining a column.
+//
+// Both windows also ask Niri to float them from code (move-window-to-floating,
+// 60 ms after map), so these rules are optional. Keeping them removes the brief
+// tiled flash before that call lands, and lets you pin down a default size.
+//
+// Match on app-id, not title: the titles are localized ("vellum 钉图",
+// "提取的文字") and would break the moment the UI language changes. The app-id
+// comes from the GTK application_id and is stable.
+window-rule {
+    match app-id="^ai\\.vellum\\.pin$"
+    open-floating true
+    focus-ring {
+        off
+    }
+    border {
+        off
+    }
+    // default-column-width { fixed 800; }
+    // default-window-height { fixed 600; }
+}
+
+window-rule {
+    match app-id="^ai\\.vellum\\.result$"
+    open-floating true
+}
+
+// The stage-1 selection overlay, the long-shot panel and the selection
+// highlight are layer-shell surfaces (namespaces vellum-overlay,
+// vellum-longshot, vellum-longshot-highlight), not toplevel windows, so they
+// need no window-rule at all.
+
+binds {
+    Mod+Print hotkey-overlay-title="vellum 框选" { spawn-sh "$HOME/.local/bin/vellumctl region"; }
+    Mod+Shift+Print hotkey-overlay-title="vellum 长截图" { spawn-sh "$HOME/.local/bin/vellumctl long"; }
+    Mod+Ctrl+Print hotkey-overlay-title="vellum 钉图" { spawn-sh "$HOME/.local/bin/vellumctl pin-last"; }
+}

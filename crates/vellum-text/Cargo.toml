@@ -1,0 +1,17 @@
+[package]
+name = "vellum-text"
+description = "OCR and translation backends for vellum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Deliberately GTK-free. The result window runs OCR and translation on a worker
+# thread, and the same code has to be reachable from tests and from non-UI
+# processes, so nothing here may pull in a toolkit.
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+vellum-core.workspace = true

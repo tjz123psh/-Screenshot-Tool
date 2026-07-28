@@ -1,0 +1,30 @@
+[package]
+name = "vellum-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command line front end and control daemon entry point for vellum"
+
+# The hot path binary is separate from the full CLI on purpose: niri runs it on
+# every keypress, so it must not pull in clap, regex or (later) GTK.
+[[bin]]
+name = "vellum"
+path = "src/main.rs"
+
+[[bin]]
+name = "vellumctl"
+path = "src/bin/vellumctl.rs"
+
+[lib]
+name = "vellum_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+vellum-core.workspace = true
+vellum-ipc.workspace = true

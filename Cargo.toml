@@ -1,0 +1,69 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/vellum-cli",
+  "crates/vellum-core",
+  "crates/vellum-ipc",
+  "crates/vellum-stitch",
+  "crates/vellum-text",
+  "crates/vellum-tray",
+  "crates/vellum-ui",
+]
+
+[workspace.package]
+# Fresh version line: vellum is a rewrite, not a continuation of the Python
+# release series, and it must not be published to the predecessor's remote.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+
+# Exact pins: this tool is installed as a daily driver, so a silent minor
+# upgrade of a Wayland/GTK binding is never wanted between local builds.
+[workspace.dependencies]
+anyhow = "=1.0.103"
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "=4.6.1", features = ["derive"] }
+flate2 = "=1.1.9"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+libc = "=0.2.186"
+rayon = "=1.12.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+regex = "=1.13.1"
+serde_json = "=1.0.151"
+toml = "=1.1.2"
+ureq = { version = "=3.3.0", features = ["json"] }
+
+# GTK stack. These seven versions must move as a set: gtk4 0.11.4 builds on
+# glib 0.22 / cairo-sys 0.22, and the default resolve of pangocairo picks 0.21,
+# which drags in a second cairo-rs. Two cairo-rs versions means the surface
+# type pango draws onto is not the type gtk accepts, so text rendering breaks
+# at compile time. Verified together with a real `cargo build`.
+# v4_12 unlocks `CssProvider::load_from_string`; the deprecated
+# `load_from_data` is the only alternative below that baseline. The system here
+# ships GTK 4.22, and gtk4-sys enforces the floor at build time.
+gtk4 = { version = "=0.11.4", features = ["v4_12"] }
+gtk4-layer-shell = "=0.8.0"
+gdk4 = "=0.11.4"
+glib = "=0.22.8"
+cairo = { package = "cairo-rs", version = "=0.22.0" }
+pango = "=0.22.8"
+pangocairo = "=0.22.8"
+
+vellum-core = { path = "crates/vellum-core" }
+vellum-ipc = { path = "crates/vellum-ipc" }
+vellum-stitch = { path = "crates/vellum-stitch" }
+vellum-text = { path = "crates/vellum-text" }
+
+[profile.release]
+# Startup latency is a hard requirement (ARCHITECTURE.md §6): one codegen unit
+# plus LTO measurably shortens both binary init and the stitch hot loops.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+panic = "unwind"

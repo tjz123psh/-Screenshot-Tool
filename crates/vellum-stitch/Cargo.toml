@@ -1,0 +1,17 @@
+[package]
+name = "vellum-stitch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vellum-core.workspace = true
+flate2.workspace = true
+rayon.workspace = true
+
+# Plain `main`, no sampling harness: the number that matters is one run of the
+# whole 101-frame workload, including the final merge. See benches/longshot.rs.
+[[bench]]
+name = "longshot"
+harness = false

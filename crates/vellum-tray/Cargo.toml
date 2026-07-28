@@ -1,0 +1,22 @@
+[package]
+name = "vellum-tray"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "StatusNotifierItem tray for vellum, exporting the legacy dbusmenu interface"
+
+[[bin]]
+name = "vellum-tray"
+path = "src/main.rs"
+
+[dependencies]
+# ksni exports org.kde.StatusNotifierItem *and* com.canonical.dbusmenu from the
+# same object, which is the part QuickShell/niri hosts actually read. The
+# `blocking` feature lets this stay an ordinary sync binary: no tokio in our own
+# code, no async main.
+ksni = { version = "=0.3.6", features = ["blocking"] }
+libc.workspace = true
+serde_json.workspace = true
+vellum-core.workspace = true
+vellum-ipc.workspace = true

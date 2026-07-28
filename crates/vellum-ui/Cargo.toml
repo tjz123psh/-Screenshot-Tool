@@ -1,0 +1,28 @@
+[package]
+name = "vellum-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GTK4 layer-shell overlay, annotation, long-shot recorder and pin window for vellum"
+
+# The only binary in the workspace that links GTK. `vellum` and `vellumctl`
+# hand over to it with execv so the hotkey path stays free of GTK startup cost.
+[[bin]]
+name = "vellum-ui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+cairo.workspace = true
+gdk4.workspace = true
+glib.workspace = true
+gtk4.workspace = true
+gtk4-layer-shell.workspace = true
+libc.workspace = true
+pango.workspace = true
+pangocairo.workspace = true
+serde_json.workspace = true
+vellum-core.workspace = true
+vellum-stitch.workspace = true
+vellum-text.workspace = true

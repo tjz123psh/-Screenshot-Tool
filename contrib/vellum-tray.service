@@ -1,0 +1,14 @@
+[Unit]
+Description=vellum system tray
+PartOf=graphical-session.target
+After=graphical-session.target vellum.service
+Wants=vellum.service
+
+[Service]
+Type=simple
+ExecStart=@VELLUM_TRAY@
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=vellum
+GenericName=Screenshot Tool
+Comment=Capture, annotate, OCR, translate, and create long screenshots
+Comment[zh_CN]=截图、标注、OCR、翻译与长截图
+Exec=@VELLUM_LAUNCHER@ tray
+TryExec=@VELLUM_LAUNCHER@
+Icon=ai.vellum
+Terminal=false
+Categories=Graphics;
+Keywords=Screenshot;Capture;OCR;Translate;Longshot;截图;长截图;
+StartupNotify=false
+X-GNOME-UsesNotifications=true
