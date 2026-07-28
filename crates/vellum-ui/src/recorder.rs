@@ -30,6 +30,7 @@ use gtk4::{
     Orientation,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use vellum_core::compositor;
 use vellum_core::config::LongshotConfig;
 use vellum_core::geom::Rect;
 use vellum_core::{Rgb8, capture};
@@ -271,6 +272,12 @@ pub struct Recorder {
     on_done: DoneHandler,
     rect: Rect,
     poll: Duration,
+    /// Hides the pointer for the duration of sampling.
+    ///
+    /// grim copies the pointer into every frame it appears in, so without this
+    /// the stitched image collects one arrow per scroll step. Held as a guard so
+    /// the pointer comes back on every exit path, including a panic.
+    cursor: RefCell<Option<compositor::CursorGuard>>,
 }
 
 impl Recorder {
@@ -381,6 +388,7 @@ impl Recorder {
                 metrics,
             }),
             worker: RefCell::new(None),
+            cursor: RefCell::new(None),
             on_done,
             rect,
             poll: Duration::from_millis(cfg.poll_ms),
@@ -448,6 +456,13 @@ impl Recorder {
         if !self.shared.sampling() {
             return;
         }
+
+        // Hide the pointer for exactly as long as we sample. Doing it here rather
+        // than in `present` keeps it visible while the overlay is still fading
+        // out, and means a cancelled session never touches the pointer at all.
+        // `None` just means the compositor cannot do it; sampling proceeds.
+        *self.cursor.borrow_mut() = compositor::hide_cursor();
+
         let shared = Arc::clone(&self.shared);
         let rect = self.rect;
         let poll = self.poll;
@@ -550,6 +565,8 @@ impl Recorder {
         self.window.close();
 
         if cancel {
+            // Nothing is kept, so the pointer can come back immediately.
+            self.cursor.borrow_mut().take();
             (self.on_done)(None, Vec::new());
             return;
         }
@@ -578,6 +595,10 @@ impl Recorder {
         if let Some(frame) = latest {
             self.state.borrow_mut().process(&frame);
         }
+
+        // Only now: every captured frame has been consumed, so restoring the
+        // pointer can no longer put it into the output.
+        self.cursor.borrow_mut().take();
 
         let outcome = self.state.borrow_mut().stitcher.result();
         match outcome {

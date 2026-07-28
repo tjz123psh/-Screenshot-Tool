@@ -13,7 +13,7 @@
 //!   fixing it in place beats re-running the capture.
 
 use std::cell::{Cell, RefCell};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -68,9 +68,16 @@ impl Mode {
 thread_local! {
     /// Live windows, so a worker thread can address one without holding an
     /// `Rc`. `glib::idle_add_once` demands `Send`, and GTK widgets are not; the
-    /// worker carries a plain `u64` and the main loop resolves it here. Weak
-    /// references mean a window the user already closed simply disappears.
-    static WINDOWS: RefCell<Vec<(u64, Weak<ResultWindow>)>> = const { RefCell::new(Vec::new()) };
+    /// worker carries a plain `u64` and the main loop resolves it here.
+    ///
+    /// This registry owns the `ResultWindow` outright. It used to hold `Weak`
+    /// references, which looked tidy but meant nothing kept the struct alive:
+    /// the only `Rc` lived in the `activate` closure and died when it returned,
+    /// so every worker update found a dead weak pointer and was dropped. The
+    /// visible symptom was a window stuck on "识别中…" forever while OCR had in
+    /// fact completed. `close-request` removes the entry, which is what lets the
+    /// struct (and the process) go.
+    static WINDOWS: RefCell<Vec<(u64, Rc<ResultWindow>)>> = const { RefCell::new(Vec::new()) };
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -103,7 +110,7 @@ fn post(id: u64, update: Update) {
             slot.borrow()
                 .iter()
                 .find(|(known, _)| *known == id)
-                .and_then(|(_, weak)| weak.upgrade())
+                .map(|(_, window)| Rc::clone(window))
         });
         if let Some(window) = target {
             window.apply(update);
@@ -262,7 +269,7 @@ impl ResultWindow {
             translating: Cell::new(false),
         });
 
-        WINDOWS.with(|slot| slot.borrow_mut().push((result.id, Rc::downgrade(&result))));
+        WINDOWS.with(|slot| slot.borrow_mut().push((result.id, result.clone())));
         result.set_busy(busy);
         result.set_content_ready(usable);
         result.connect(&close);
@@ -300,11 +307,18 @@ impl ResultWindow {
         });
         self.window.add_controller(keys);
 
+        // Weak on purpose: the registry below owns the strong reference, and a
+        // strong one here would be a cycle that never frees.
         let this = Rc::downgrade(self);
+        let id = self.id;
         self.window.connect_close_request(move |_| {
             if let Some(this) = this.upgrade() {
                 this.closed.set(true);
             }
+            // Drop our own ownership so the struct can go. Holding the last
+            // reference here would keep every closed window alive for the
+            // lifetime of the process.
+            WINDOWS.with(|slot| slot.borrow_mut().retain(|(known, _)| *known != id));
             glib::Propagation::Proceed
         });
 

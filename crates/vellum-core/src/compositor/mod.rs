@@ -163,6 +163,53 @@ pub fn set_window_size(window: &Window, width: i32, height: i32) -> bool {
     }
 }
 
+/// Hides the pointer for as long as the returned guard is alive.
+///
+/// Long shots sample the screen with grim while the user scrolls, and grim
+/// copies the pointer into its output on Hyprland regardless of `-c` (measured:
+/// 204 differing pixels around the hotspot, 0 once hidden). Without this the
+/// pointer is baked into the stitched image once per frame it appears in.
+///
+/// Returns `None` when the compositor cannot do it, which is not an error: niri
+/// has no cursor action in its IPC at all, so there the pointer stays visible
+/// and the long shot is otherwise unaffected.
+///
+/// The guard covers ordinary early returns, but it is **not** sufficient on its
+/// own: release builds use `panic = "abort"`, and the control service kills a
+/// long-shot child on shutdown - neither path runs destructors. A pointer left
+/// invisible would break the whole session, not just vellum, so the supervisor
+/// calls [`restore_cursor`] whenever a capture child exits.
+pub fn hide_cursor() -> Option<CursorGuard> {
+    match detect() {
+        Compositor::Hyprland => hyprland::set_cursor_hidden(true).then_some(CursorGuard),
+        // niri exposes no cursor control over IPC, and vellum never edits a
+        // user's compositor config to get one.
+        Compositor::Niri | Compositor::Unknown => None,
+    }
+}
+
+/// Makes the pointer visible again, whatever hid it.
+///
+/// Idempotent and safe to call when nothing was hidden, which is what lets the
+/// supervisor use it as an unconditional safety net after any capture exits.
+pub fn restore_cursor() {
+    if detect() == Compositor::Hyprland {
+        hyprland::set_cursor_hidden(false);
+    }
+}
+
+/// Restores the pointer when dropped.
+#[must_use = "the pointer is restored when this guard is dropped"]
+pub struct CursorGuard;
+
+impl Drop for CursorGuard {
+    fn drop(&mut self) {
+        // Best effort: if the compositor went away there is no pointer left to
+        // restore either.
+        hyprland::set_cursor_hidden(false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +296,28 @@ mod tests {
             Window::Hyprland("0x2".to_string())
         );
         assert_eq!(Window::Niri(7), Window::Niri(7));
+    }
+
+    #[test]
+    fn hiding_the_pointer_is_declined_where_it_is_impossible() {
+        // niri has no cursor action in its IPC, and vellum will not edit a
+        // user's compositor config to invent one. Returning `None` rather than
+        // failing is what lets the long shot proceed with the pointer visible.
+        let _hypr = EnvGuard::clear("HYPRLAND_INSTANCE_SIGNATURE");
+        let _niri = EnvGuard::set("NIRI_SOCKET", "/run/user/1000/niri.sock");
+        assert!(hide_cursor().is_none());
+
+        let _no_niri = EnvGuard::clear("NIRI_SOCKET");
+        assert!(hide_cursor().is_none());
+    }
+
+    #[test]
+    fn restoring_the_pointer_is_safe_when_nothing_hid_it() {
+        // The control service calls this on every long-shot exit, including the
+        // ones that never hid anything, so it must be a no-op rather than a
+        // failed compositor request.
+        let _hypr = EnvGuard::clear("HYPRLAND_INSTANCE_SIGNATURE");
+        let _niri = EnvGuard::clear("NIRI_SOCKET");
+        restore_cursor();
     }
 }

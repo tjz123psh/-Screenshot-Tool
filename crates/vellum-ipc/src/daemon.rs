@@ -190,6 +190,16 @@ impl Service {
     }
 
     fn finish_action(&self, action: Action, pid: u32, code: Option<i32>) {
+        // Safety net for the hidden pointer. A long shot hides it while sampling
+        // and restores it on the way out, but that relies on destructors, and
+        // release builds abort on panic while `stop` kills the child outright -
+        // neither runs `Drop`. This is the one place every child exit funnels
+        // through, whatever killed it, so a stuck invisible pointer cannot
+        // outlive the capture. Idempotent, so a normal exit pays one no-op call.
+        if action == Action::Long {
+            vellum_core::compositor::restore_cursor();
+        }
+
         let message = describe_exit(action, code);
         {
             let mut inner = self.lock();
@@ -280,6 +290,11 @@ impl Service {
             && matches!(active.child.try_wait(), Ok(None))
         {
             let _ = active.child.kill();
+            // A killed child never runs its destructors, so a long shot would
+            // leave the pointer hidden for the rest of the session.
+            if active.action == Action::Long {
+                vellum_core::compositor::restore_cursor();
+            }
         }
     }
 

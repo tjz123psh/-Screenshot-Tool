@@ -41,6 +41,7 @@ use std::time::Duration;
 use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
+use vellum_core::capture::CaptureError;
 use vellum_core::{Config, Rgb8};
 
 use recorder::Recorder;
@@ -78,9 +79,33 @@ fn install_sigusr1_handler() {
     }
 }
 
+/// Forces the cairo GSK renderer for this process.
+///
+/// The overlay is one full-screen `DrawingArea` painted with cairo, so a GL
+/// renderer buys nothing here and charges for EGL/GL context creation on a cold
+/// process. Measured first-draw on this machine: cairo 91 ms versus gl 137 ms.
+/// The hotkey path spawns a fresh process per capture, so that setup is paid on
+/// every single keypress.
+///
+/// This deliberately overrides a session-wide `GSK_RENDERER`. Such a setting is
+/// aimed at long-lived applications, where paying GL init once buys faster
+/// animation for hours; a process that lives for one screenshot has the opposite
+/// tradeoff. Ignoring it here cost 46 ms per keypress on this machine, because
+/// the session exports `GSK_RENDERER=gl`.
+///
+/// `VELLUM_RENDERER` is the escape hatch, so the choice stays overridable
+/// without having to change a global that affects every other GTK app.
+fn prefer_cairo_renderer() {
+    let renderer = std::env::var("VELLUM_RENDERER").unwrap_or_else(|_| "cairo".to_string());
+    // SAFETY: called at the top of main before any thread is spawned and before
+    // GTK reads the variable, so there is no concurrent environment access.
+    unsafe { std::env::set_var("GSK_RENDERER", renderer) };
+}
+
 fn main() -> std::process::ExitCode {
     trace::init();
     trace::mark("process-start");
+    prefer_cairo_renderer();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match dispatch(&args) {
         Ok(code) => code,
@@ -182,17 +207,24 @@ fn load_image(path: &Path, cleanup: bool) -> anyhow::Result<Rgb8> {
     result.map_err(|err| anyhow::anyhow!("failed to load {}: {err}", path.display()))
 }
 
+/// A screen grab running while GTK starts up, collected in `activate`.
+type PendingCapture = std::thread::JoinHandle<Result<Rgb8, CaptureError>>;
+
 /// Captures the screen and hands it to a fresh overlay session.
+///
+/// The grab runs on a thread while GTK initialises, because the two do not need
+/// each other: `grim` is a subprocess round-trip (about 40 ms) and GTK setup is
+/// CPU work in this process (about 50 ms). Running them in sequence made the
+/// hotkey pay the sum; overlapping them makes it pay the larger of the two.
+/// Nothing races: the overlay cannot be drawn before `activate`, which is where
+/// the frame is collected.
 fn run_region(flags: OutputFlags, long_shot: bool) -> anyhow::Result<i32> {
     trace::mark("capture-start");
-    let background = match vellum_core::capture::grab_full() {
-        Ok(image) => image,
-        Err(err) => {
-            eprintln!("[vellum] capture failed: {err}");
-            return Ok(1);
-        }
-    };
-    trace::mark("capture-done");
+    let capture = std::thread::spawn(|| {
+        let frame = vellum_core::capture::grab_full();
+        trace::mark("capture-done");
+        frame
+    });
 
     let app = gtk4::Application::builder()
         .application_id("ai.vellum.overlay")
@@ -200,7 +232,7 @@ fn run_region(flags: OutputFlags, long_shot: bool) -> anyhow::Result<i32> {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    let session = Rc::new(Session::new(background, flags, long_shot));
+    let session = Rc::new(Session::new(capture, flags, long_shot));
     let activate = session.clone();
     app.connect_activate(move |app| activate.start(app));
 
@@ -220,6 +252,11 @@ fn debug_capture(flags: OutputFlags) -> anyhow::Result<i32> {
 /// State shared between the overlay callback, the signal handler and the
 /// recorder. Single-threaded: everything runs on the GTK main thread.
 struct Session {
+    /// The screen grab, still running when the session is built.
+    ///
+    /// Joined in `start`, which is the earliest moment the frame is actually
+    /// needed: GTK cannot draw anything before `activate` fires.
+    pending: RefCell<Option<PendingCapture>>,
     background: RefCell<Option<Rgb8>>,
     screen: Cell<(i32, i32)>,
     flags: OutputFlags,
@@ -232,11 +269,11 @@ struct Session {
 }
 
 impl Session {
-    fn new(background: Rgb8, flags: OutputFlags, long_shot: bool) -> Self {
-        let screen = (background.width as i32, background.height as i32);
+    fn new(capture: PendingCapture, flags: OutputFlags, long_shot: bool) -> Self {
         Self {
-            background: RefCell::new(Some(background)),
-            screen: Cell::new(screen),
+            pending: RefCell::new(Some(capture)),
+            background: RefCell::new(None),
+            screen: Cell::new((0, 0)),
             flags,
             long_shot,
             exit_code: Cell::new(0),
@@ -246,6 +283,26 @@ impl Session {
     }
 
     fn start(self: &Rc<Self>, app: &gtk4::Application) {
+        if let Some(capture) = self.pending.borrow_mut().take() {
+            // A panicked grab thread is reported the same way as a failed grab:
+            // either way there is no frame to annotate.
+            let frame = capture
+                .join()
+                .unwrap_or_else(|_| Err(CaptureError::Failed("capture thread panicked".into())));
+            match frame {
+                Ok(image) => {
+                    self.screen.set((image.width as i32, image.height as i32));
+                    *self.background.borrow_mut() = Some(image);
+                }
+                Err(err) => {
+                    eprintln!("[vellum] capture failed: {err}");
+                    self.exit_code.set(1);
+                    app.quit();
+                    return;
+                }
+            }
+        }
+
         let Some(background) = self.background.borrow().clone() else {
             return;
         };

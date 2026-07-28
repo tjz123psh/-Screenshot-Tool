@@ -153,6 +153,26 @@ pub(super) fn set_window_size(address: &str, width: i32, height: i32) -> bool {
     ))
 }
 
+/// Hides or restores the pointer by toggling `cursor:invisible` at runtime.
+///
+/// Measured on Hyprland 0.56: grim copies the cursor into its output whether or
+/// not `-c` is passed (204 differing pixels around the hotspot with the pointer
+/// visible, 0 with this option on), so this is the only thing that keeps the
+/// pointer out of a long shot.
+///
+/// This goes through `eval`, not `dispatch`: there is no cursor-hiding
+/// dispatcher, and this build rejects `hyprctl keyword` outright ("keyword
+/// can't work with non-legacy parsers"). It is a live setting only - nothing is
+/// written to the user's config - so the compositor forgets it on reload.
+pub(super) fn set_cursor_hidden(hidden: bool) -> bool {
+    let lua = format!(r#"hl.config({{ ["cursor.invisible"] = {hidden} }})"#);
+    let command = format!("eval {lua}");
+    if let Some(reply) = request(&command) {
+        return reply.trim() == "ok";
+    }
+    cli(&["eval", &lua]).is_some_and(|reply| reply.trim() == "ok")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
