@@ -27,7 +27,7 @@ use pango::EllipsizeMode;
 use vellum_core::Rgb8;
 use vellum_core::config::Config;
 
-use crate::{niri, theme};
+use crate::theme;
 
 const APP_ID: &str = "ai.vellum.result";
 const WIDTH: i32 = 560;
@@ -312,7 +312,17 @@ impl ResultWindow {
         // beside the window you captured, not a new column in the scroll.
         self.window.connect_map(|_| {
             glib::timeout_add_local_once(FLOAT_DELAY, || {
-                niri::move_focused_to_floating();
+                // Looked up by pid rather than acting on the focused window:
+                // the user may have moved on during the delay above.
+                let pid = std::process::id();
+                match vellum_core::compositor::window_for_pid(pid) {
+                    Some(window) => {
+                        vellum_core::compositor::float(&window);
+                    }
+                    None => {
+                        vellum_core::compositor::float_focused();
+                    }
+                }
             });
         });
     }

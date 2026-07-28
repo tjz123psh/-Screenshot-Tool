@@ -20,7 +20,7 @@ mod page;
 
 use page::{apply_translucency, page, viewport};
 use vellum_core::image::Rgb8;
-use vellum_stitch::{Stitcher, DEFAULT_MAX_DIFF, DEFAULT_MIN_SHIFT_PX};
+use vellum_stitch::{DEFAULT_MAX_DIFF, DEFAULT_MIN_SHIFT_PX, Stitcher};
 
 const WIDTH: usize = 900;
 const VIEW_H: usize = 700;

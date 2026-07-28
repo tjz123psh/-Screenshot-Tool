@@ -19,7 +19,6 @@
 mod annotate;
 mod highlight;
 mod imaging;
-mod niri;
 mod paint;
 mod pin;
 mod recorder;

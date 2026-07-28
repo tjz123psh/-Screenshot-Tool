@@ -65,7 +65,7 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         lines: usize,
     },
-    /// 管理 Niri 快捷键
+    /// 管理截图快捷键（niri 可自动写入，Hyprland Lua 配置输出片段）
     Shortcuts {
         #[command(subcommand)]
         command: Option<ShortcutsCommand>,
@@ -350,7 +350,13 @@ fn manage_shortcuts(command: Option<ShortcutsCommand>) -> u8 {
 
 fn list_shortcuts() -> u8 {
     let root = shortcuts::config_dir();
-    println!("Niri 快捷键配置：{}", root.display());
+    // Name the compositor we actually detected. Telling a Hyprland user that
+    // their "Niri shortcuts" are missing is a bug report waiting to happen.
+    println!(
+        "{} 快捷键配置：{}",
+        shortcuts::target().label(),
+        root.display()
+    );
 
     let bindings = shortcuts::discover(None);
     if bindings.is_empty() {
@@ -381,6 +387,12 @@ fn report_shortcuts(result: shortcuts::InstallResult) -> u8 {
     }
     if let Some(target) = &result.target {
         println!("目标文件：{}", target.display());
+    }
+    // A Lua Hyprland config cannot be edited safely, so the snippet is the
+    // whole deliverable in that case: print it verbatim, ready to paste.
+    if let Some(snippet) = &result.snippet {
+        println!("\n把下面的内容加入你的配置：\n");
+        println!("{snippet}");
     }
 
     match result.status {

@@ -1943,6 +1943,7 @@ dependencies = [
  "image",
  "libc",
  "serde",
+ "serde_json",
  "toml",
 ]
 

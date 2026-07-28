@@ -17,6 +17,8 @@ use regex::Regex;
 
 use vellum_core::proc::{self, which};
 
+use super::{Binding, DEFAULT_SHORTCUTS, InstallResult, Status, launcher_path};
+
 /// `niri validate` parses the whole config tree; 10s is the predecessor's
 /// budget and is far more than a healthy run needs.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,18 +29,6 @@ const RELOAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Marker comments delimiting the region this tool owns.
 pub const MANAGED_BEGIN: &str = "// >>> vellum managed shortcuts";
 pub const MANAGED_END: &str = "// <<< vellum managed shortcuts";
-
-/// Deliberately conservative defaults: they leave Niri's own
-/// `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone and are easy to
-/// recognise in the hotkey overlay.
-///
-/// The spawned command is `vellumctl`, not `vellum`: this runs on every
-/// keypress and the thin client avoids the argument parser and the GUI stack.
-pub const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
-    ("Mod+Print", "region", "vellum 框选"),
-    ("Mod+Shift+Print", "long", "vellum 长截图"),
-    ("Mod+Ctrl+Print", "pin-last", "vellum 钉图"),
-];
 
 static BIND_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*([^\s{]+)(?:\s+[^{}]+)?\s*\{(.*)\}\s*$").unwrap());
@@ -54,50 +44,6 @@ static INCLUDE_RE: LazyLock<Regex> =
 static KEY_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*([A-Za-z0-9_+\-]+)(?:\s+[^{}]*)?\s*\{").unwrap());
 static BINDS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bbinds\s*\{").unwrap());
-
-/// One discovered binding, with enough provenance to print it back to a user.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Binding {
-    pub key: String,
-    pub action: String,
-    pub path: PathBuf,
-    pub line: usize,
-}
-
-/// Result of a write attempt. `status` mirrors what the CLI prints.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallResult {
-    pub status: Status,
-    pub target: Option<PathBuf>,
-    pub added: Vec<String>,
-    pub conflicts: Vec<String>,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
-    /// Nothing to do; the bindings were already present.
-    Ok,
-    Installed,
-    Removed,
-    /// A default key is taken. Non-fatal: installation continues elsewhere.
-    Conflict,
-    /// No writable, actually-included keybind file was found.
-    Unavailable,
-    Error,
-}
-
-impl InstallResult {
-    fn new(status: Status, target: Option<PathBuf>, detail: impl Into<String>) -> Self {
-        Self {
-            status,
-            target,
-            added: Vec::new(),
-            conflicts: Vec::new(),
-            detail: detail.into(),
-        }
-    }
-}
 
 /// `$XDG_CONFIG_HOME/niri` or `~/.config/niri`.
 pub fn config_dir() -> PathBuf {
@@ -236,10 +182,14 @@ fn binding_keys(text: &str) -> HashSet<String> {
 }
 
 fn render_bindings(items: &[(&str, &str, &str)], indent: &str) -> String {
+    let launcher = launcher_path();
     let mut lines = vec![MANAGED_BEGIN.to_string()];
     for (key, action, title) in items {
+        // `spawn-sh` rather than `spawn`: it runs through a shell, so `$HOME`
+        // expands. Compositors do not spawn with the user's PATH, which is why
+        // the path is absolute rather than a bare `vellumctl`.
         lines.push(format!(
-            "{key} hotkey-overlay-title=\"{title}\" {{ spawn-sh \"$HOME/.local/bin/vellumctl {action}\"; }}"
+            "{key} hotkey-overlay-title=\"{title}\" {{ spawn-sh \"{launcher} {action}\"; }}"
         ));
     }
     lines.push(MANAGED_END.to_string());
@@ -554,18 +504,10 @@ pub fn discover_active(directory: Option<&Path>) -> Vec<Binding> {
     bindings
 }
 
-pub fn action_label(action: &str) -> &str {
-    match action {
-        "region" => "区域截图",
-        "long" => "长截图",
-        "pin-last" => "钉住剪贴板",
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shortcuts::tempdir;
 
     fn workspace(binds: &str) -> tempdir::TempDir {
         let dir = tempdir::TempDir::new();
@@ -696,42 +638,5 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("dms/keybinds.kdl"), PLAIN).unwrap();
         assert_eq!(install(Some(dir.path())).status, Status::Installed);
-    }
-
-    /// Minimal scratch directory helper; avoids a dev-dependency for one need.
-    mod tempdir {
-        use std::path::{Path, PathBuf};
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        pub struct TempDir(PathBuf);
-
-        impl TempDir {
-            #[allow(clippy::new_without_default)]
-            pub fn new() -> Self {
-                let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir().join(format!(
-                    "vellum-shortcuts-{}-{}-{id}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos()
-                ));
-                std::fs::create_dir_all(&path).unwrap();
-                Self(path)
-            }
-
-            pub fn path(&self) -> &Path {
-                &self.0
-            }
-        }
-
-        impl Drop for TempDir {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
     }
 }

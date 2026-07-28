@@ -11,4 +11,6 @@ chrono.workspace = true
 image.workspace = true
 libc.workspace = true
 serde.workspace = true
+# The compositor backends speak JSON to niri and Hyprland.
+serde_json.workspace = true
 toml.workspace = true

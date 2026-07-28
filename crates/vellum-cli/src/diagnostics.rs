@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::shortcuts;
+use vellum_core::compositor::{self, Compositor};
 use vellum_core::proc::{self, which};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,23 +166,52 @@ fn ocr_languages_check() -> Check {
     }
 }
 
+/// Reports which compositor this session is actually running.
+///
+/// Neither niri nor Hyprland is required: capture, clipboard, OCR and the
+/// layer-shell overlay work on any wlroots-style compositor. What a recognised
+/// compositor buys is window control for the long-lived windows (floating the
+/// pin and result windows, and resizing the pin precisely). Reporting the
+/// unrecognised case as a warning rather than an error keeps `doctor` honest
+/// about that difference without pretending a plain session is broken.
+fn compositor_check() -> Check {
+    match compositor::detect() {
+        Compositor::Unknown => check(
+            "compositor",
+            "合成器",
+            Level::Warning,
+            "未识别（截图可用；钉图窗口无法自动浮动或精确改尺寸）",
+        ),
+        found => check(
+            "compositor",
+            "合成器",
+            Level::Ok,
+            format!("{}（支持窗口控制）", found.label()),
+        ),
+    }
+}
+
 fn shortcuts_check() -> Check {
+    // Named after whichever compositor is running: telling a Hyprland user that
+    // their "Niri shortcuts" are missing is a bug report waiting to happen.
+    let name = shortcuts::target().label();
+    let title = "截图快捷键";
     let root = shortcuts::config_dir();
     if !root.exists() {
         return check(
             "shortcuts",
-            "Niri 快捷键",
+            title,
             Level::Warning,
-            "无法读取 niri 配置",
+            format!("无法读取 {name} 配置目录"),
         );
     }
     let found = shortcuts::discover_active(None);
     if found.is_empty() {
         return check(
             "shortcuts",
-            "Niri 快捷键",
+            title,
             Level::Warning,
-            "未在 Niri 配置中发现 vellum 快捷键",
+            format!("未在 {name} 配置中发现 vellum 快捷键"),
         );
     }
     let shown: Vec<String> = found
@@ -193,7 +223,7 @@ fn shortcuts_check() -> Check {
     if found.len() > shown.len() {
         detail.push_str(&format!("等 {} 项", found.len()));
     }
-    check("shortcuts", "Niri 快捷键", Level::Ok, detail)
+    check("shortcuts", title, Level::Ok, detail)
 }
 
 /// Run every check. Nothing here mutates state, so `doctor` is always safe.
@@ -210,12 +240,7 @@ pub fn run() -> Report {
         ),
     });
 
-    checks.push(match env_present("NIRI_SOCKET") {
-        Some(value) => check("niri", "Niri IPC", Level::Ok, value),
-        // Optional: vellum works on any wlroots compositor with grim, only
-        // the shortcut management needs niri.
-        None => check("niri", "Niri IPC", Level::Warning, "未检测到 NIRI_SOCKET"),
-    });
+    checks.push(compositor_check());
 
     checks.push(required_binary("grim", "屏幕捕获", "grim"));
     checks.push(required_binary("wl-copy", "剪贴板", "wl-copy"));
@@ -320,7 +345,7 @@ mod tests {
         for expected in [
             "service",
             "wayland",
-            "niri",
+            "compositor",
             "grim",
             "wl-copy",
             "notify-send",

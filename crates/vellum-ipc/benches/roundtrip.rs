@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use vellum_ipc::{client, daemon, Request};
+use vellum_ipc::{Request, client, daemon};
 
 const WARMUP: usize = 50;
 const SAMPLES: usize = 1000;

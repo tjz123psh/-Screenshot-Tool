@@ -96,26 +96,30 @@ for bin in "${BINARIES[@]}"; do
 done
 ok "二进制已安装"
 
-# --- 3. Niri shortcuts (degradable) ---------------------------------------
-# Shortcuts live in the user's Niri config and must not be a hard dependency of
-# the install: on a conflict, a missing config.kdl or a failed validation we
-# only point at the example and carry on with the service and tray.
+# --- 3. Compositor shortcuts (degradable) ---------------------------------
+# Shortcuts live in the user's compositor config and must never be a hard
+# dependency of the install: on a conflict, a missing config or a failed
+# validation we print what `vellum shortcuts install` had to say, point at the
+# matching example, and carry on with the service and tray.
+#
+# `vellum shortcuts install` decides what is safe on its own (it writes niri KDL
+# and classic hyprland.conf, and only prints a snippet for a Lua Hyprland
+# config), so this step deliberately does not second-guess it by sniffing config
+# files here. Duplicating that policy in shell is how the two drift apart.
 if [[ "${VELLUM_SKIP_SHORTCUTS:-0}" == "1" ]]; then
-    info "已跳过 Niri 快捷键自动配置（VELLUM_SKIP_SHORTCUTS=1）"
-elif [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl" ]]; then
+    info "已跳过快捷键自动配置（VELLUM_SKIP_SHORTCUTS=1）"
+else
     shortcut_output=""
     if shortcut_output=$("$LAUNCHER" shortcuts install 2>&1); then
         printf '%s\n' "$shortcut_output"
-        ok "Niri 快捷键已自动配置或已存在"
+        ok "快捷键已配置或已存在"
     else
         shortcut_status=$?
         printf '%s\n' "$shortcut_output"
-        warn "Niri 快捷键自动配置未完成（状态 $shortcut_status）；不影响 vellum 安装"
-        warn "请参考：$SRC_DIR/contrib/niri-vellum.kdl"
+        warn "快捷键未自动写入（状态 $shortcut_status）；不影响 vellum 安装"
+        warn "niri 示例：$SRC_DIR/contrib/niri-vellum.kdl"
+        warn "Hyprland 示例：$SRC_DIR/contrib/hyprland-vellum.conf（Lua 配置见 hyprland-vellum.lua）"
     fi
-else
-    warn "未找到 Niri config.kdl，跳过快捷键自动配置"
-    warn "安装后可参考：$SRC_DIR/contrib/niri-vellum.kdl"
 fi
 
 # --- 4. Service, tray, desktop entry, icons -------------------------------
@@ -178,4 +182,4 @@ esac
 echo
 ok "安装完成，vellum 图标已加入系统托盘。"
 info "状态检查：vellum status；完整诊断：vellum doctor"
-info "niri 键位与窗口规则示例见：$SRC_DIR/contrib/niri-vellum.kdl"
+info "键位与窗口规则示例见 $SRC_DIR/contrib/：niri-vellum.kdl、hyprland-vellum.conf、hyprland-vellum.lua"

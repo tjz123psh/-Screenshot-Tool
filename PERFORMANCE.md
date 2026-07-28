@@ -201,7 +201,7 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 
 **平台与集成**
 
-5. **niri 窗口规则按 app-id 匹配，不按标题**。Python 的规则是 `match title="pngshot-pin"`，而 vellum 的 pin 窗口标题是本地化的「vellum 钉图」，照搬会永远不匹配。app-id（`ai.vellum.pin`、`ai.vellum.result`）来自 GTK `application_id`，不随界面语言变化。
+5. **窗口规则按 app-id / class 匹配，不按标题**。Python 的规则是 `match title="pngshot-pin"`，而 vellum 的 pin 窗口标题是本地化的「vellum 钉图」，照搬会永远不匹配。app-id（`ai.vellum.pin`、`ai.vellum.result`）来自 GTK `application_id`，不随界面语言变化；Hyprland 的 `class` 就是同一个值。
 6. **托盘是独立二进制 `vellum-tray`**（ksni + zbus），Python 是 GTK3 + AyatanaAppIndicator3。两者都导出传统 `com.canonical.dbusmenu`——这是硬约束，已用 `GetLayout(0,-1,[])` 返回完整 13 项菜单树验证，不是只看到图标就算过。`vellum tray` 子命令保留，execv 到 `vellum-tray`。
 7. **`install.sh` 不 clone 任何东西**，直接构建脚本所在的树。没有远端可漂移、没有第二份源码要同步。
 8. **依赖检查只有一份**：`install.sh` 最后直接跑 `vellum doctor`，不再像 Python 版那样维护第二份会漂移的清单。
@@ -221,18 +221,33 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 **修正的行为**
 
 15. `anno.done` 在标注内容为空时**只返回选区工具栏，不完成截图**。这与 Python `_exit_annotate(apply=True)` 的 `has_content()` 判断一致；Rust 版初稿曾无条件 confirm，是移植缺陷，已修。
-16. `zoom_window` 优先从 `niri::window_size` 读当前尺寸，而不是从自己记账的值推算。用户用合成器键位改过窗口大小后，自记账会漂移。
+16. `zoom_window` 优先从 `compositor::window_size` 读当前尺寸，而不是从自己记账的值推算。用户用合成器键位改过窗口大小后，自记账会漂移。
+
+17. **同时支持 niri 与 Hyprland**（Python 版是 niri-only）。合成器在运行期按环境变量识别，两边都不在时退化为普通 Wayland 客户端。见 `DESIGN.md` §8。
 
 ---
 
-## 6. 环境偏差（需要用户处理）
+## 6. 验收覆盖与环境限制
 
-**当前会话运行的是 Hyprland 0.56.0，不是 niri。** `niri` 二进制存在（`/usr/bin/niri`）、`~/.config/niri/` 配置齐全，但 `NIRI_SOCKET` 不存在，进程列表里是 `Hyprland`。`~/.config/hypr/` 里已有对应的 pngshot 快捷键与 `ai.pngshot.pin` / `ai.pngshot.result` 窗口规则。
+**当前会话运行的是 Hyprland 0.56.0**（`niri` 二进制存在于 `/usr/bin/niri`、`~/.config/niri/` 配置齐全，但 `NIRI_SOCKET` 不存在，进程列表里是 `Hyprland`）。所以两个后端的验收程度不同。
 
-因此本文档的合成器侧数据是在 Hyprland 下采集的，layer-shell 行为（overlay 呈现、namespace、exclusive zone）在 Hyprland 上验证通过，而以下路径**无法在本机自动验收，必须在 niri 会话里由用户确认**：
+**Hyprland：已真机验收。** 用 vellum 自己的 pin 窗口跑通了完整代码路径（不是裸 IPC 探测）：
 
-- niri IPC（`niri.rs` 的 `move_focused_to_floating` / `window_id_for_pid` / `set_window_size`）。在 Hyprland 下这些调用会优雅降级为普通窗口，属受支持的降级模式。
-- `vellum shortcuts install` 写入 `~/.config/niri/dms/keybinds.kdl` 后的实际按键行为，以及 `niri validate` 之后的 reload。
-- niri 预设分栏宽度（1/3、1/2、2/3、全宽）下的窗口布局（§5 要求）。
+| 检查 | 结果 |
+| --- | --- |
+| `compositor::detect()` | `Hyprland` |
+| `window_for_pid(pid)` | `Hyprland("0x5620614d6660")`，按自己的 pid 找到窗口 |
+| 自动浮动（map 后 60 ms） | 窗口以 `float=True` 出现，无需任何 window rule |
+| `window_size` 回读 | `Some((640, 480))` |
+| `set_window_size(760, 520)` | 返回 `true`，实测 `size=[760, 520]` |
+| 用户其他窗口 | 5 个窗口全程 `float=False`，尺寸未变 |
 
-如果日常合成器已经切到 Hyprland，快捷键应该装到 `~/.config/hypr/`（vellum 目前只实现了 niri 的 KDL 写入器），窗口规则要按 `ai.vellum.pin` / `ai.vellum.result` 补一份。这需要你的决定，我没有改动任何合成器配置。
+layer-shell 行为（overlay 呈现、namespace、exclusive zone）也在 Hyprland 上验证通过，本文档的合成器侧延迟数据就是在这里采集的。
+
+**niri：只有单元测试与静态校验。** 本机不是 niri 会话，以下路径需要你在 niri 里确认：
+
+- niri IPC（`compositor/niri.rs` 的浮动 / 按 pid 找窗口 / 读写尺寸）。协议形状与 Python 版一致且未改动，但没有活的 niri 可以对话。
+- `vellum shortcuts install` 写入 `~/.config/niri/dms/keybinds.kdl` 后的实际按键行为，以及 `niri validate` 之后的 reload。生成的 KDL 已用 `niri validate` 校验通过（`contrib/niri-vellum.kdl`）。
+- niri 预设分栏宽度（1/3、1/2、2/3、全宽）下的窗口布局（`ARCHITECTURE.md` §5 要求）。
+
+**Hyprland 快捷键的已知限制**：你的 Hyprland 配置是 Lua 格式，`vellum shortcuts install` 对它**只打印可粘贴片段、不自动写入**（理由见 `DESIGN.md` §8：这个 build 拒绝 `hyprctl keyword`，没有生效前校验的手段）。经典 `hyprland.conf` 格式可以自动写入。两种格式的示例都在 `contrib/`。我没有改动你的任何合成器配置。

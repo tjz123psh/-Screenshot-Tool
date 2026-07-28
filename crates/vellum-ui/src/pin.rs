@@ -8,11 +8,12 @@
 //!   which re-presents its *old* image and then exits — deleting its own
 //!   `--cleanup` temp file on the way out, so the new image is lost forever.
 //! * Scroll zooms the image inside a fixed window; Ctrl+scroll resizes the
-//!   window itself. `set_default_size` is ignored once a window is mapped and
-//!   under niri a floating window's geometry belongs to the compositor, so the
-//!   window resize has to go through niri IPC with GTK as the fallback.
-//! * "Always on top" on niri means "floating". A tiled pin window would join
-//!   the scrolling column row and stop being a reference overlay.
+//!   window itself. `set_default_size` is ignored once a window is mapped, and
+//!   on a tiling compositor a floating window's geometry belongs to the
+//!   compositor, so the resize goes through compositor IPC with GTK as the
+//!   fallback.
+//! * "Always on top" on niri and Hyprland alike means "floating". A tiled pin
+//!   window would join the layout and stop being a reference overlay.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -28,7 +29,9 @@ use gtk4::{
 };
 use vellum_core::Rgb8;
 
-use crate::{imaging, niri, theme};
+use vellum_core::compositor;
+
+use crate::{imaging, theme};
 
 const MIN_SCALE: f64 = 0.1;
 const MAX_SCALE: f64 = 12.0;
@@ -88,9 +91,10 @@ pub struct PinWindow {
     area: DrawingArea,
     view: RefCell<View>,
     menu: PopoverMenu,
-    /// niri window id, learned shortly after mapping. `None` means "no
-    /// compositor control", which is a supported degraded mode.
-    niri_id: Cell<Option<u64>>,
+    /// Compositor handle for this window, learned shortly after mapping.
+    /// `None` means "no compositor control", which is a supported degraded
+    /// mode: the pin still works, it just cannot float or resize itself.
+    handle: RefCell<Option<compositor::Window>>,
 }
 
 /// Runs the pin window for `image` until the user closes it.
@@ -184,7 +188,7 @@ impl PinWindow {
             area,
             view: RefCell::new(view),
             menu,
-            niri_id: Cell::new(None),
+            handle: RefCell::new(None),
         });
 
         pin.connect_draw();
@@ -304,9 +308,23 @@ impl PinWindow {
             // moved to the floating layer or looked up by pid.
             let this = Rc::clone(&this);
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
-                niri::move_focused_to_floating();
-                this.niri_id
-                    .set(niri::window_id_for_pid(std::process::id()));
+                // Look the window up by pid rather than acting on "the focused
+                // window": between mapping and this callback the user may have
+                // focused something else, and floating their window instead
+                // would be a visible, confusing side effect.
+                let handle = compositor::window_for_pid(std::process::id());
+                match &handle {
+                    Some(window) => {
+                        compositor::float(window);
+                    }
+                    // No handle: still worth asking the compositor to float
+                    // whatever it considers current, since this window was just
+                    // presented and is the likely candidate.
+                    None => {
+                        compositor::float_focused();
+                    }
+                }
+                *this.handle.borrow_mut() = handle;
             });
         });
     }
@@ -315,12 +333,13 @@ impl PinWindow {
     /// keeps its framing.
     fn zoom_window(self: &Rc<Self>, factor: f64) {
         // Prefer the compositor's idea of the current size: the user can resize
-        // this window with their own niri bindings, and stepping from stale
+        // this window with their own compositor bindings, and stepping from stale
         // bookkeeping would snap it back to a size it no longer has.
         let (cur_w, cur_h) = self
-            .niri_id
-            .get()
-            .and_then(niri::window_size)
+            .handle
+            .borrow()
+            .as_ref()
+            .and_then(compositor::window_size)
             .unwrap_or_else(|| self.view.borrow().win);
         let new_w = ((cur_w as f64 * factor).round() as i32).max(80);
         let new_h = ((cur_h as f64 * factor).round() as i32).max(60);
@@ -333,12 +352,12 @@ impl PinWindow {
             view.win = (new_w, new_h);
         }
 
-        let resized = match self.niri_id.get() {
-            Some(id) => niri::set_window_size(id, new_w, new_h),
+        let resized = match self.handle.borrow().as_ref() {
+            Some(handle) => compositor::set_window_size(handle, new_w, new_h),
             None => false,
         };
         if !resized {
-            // Fallback for non-niri compositors: harmless when ignored.
+            // Fallback for compositors we do not drive: harmless when ignored.
             self.window.set_default_size(new_w, new_h);
         }
         self.toast(&format!("窗口  {new_w} × {new_h}"), false);
@@ -474,7 +493,7 @@ fn draw(cr: &cairo::Context, view: &View, width: i32, height: i32) {
     let _ = cr.paint();
     let _ = cr.restore();
 
-    // niri rules strip the compositor border for this window, so the pin draws
+    // The shipped window rules strip the compositor border here, so the pin draws
     // its own hairline to separate itself from whatever is behind it.
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
     cr.set_line_width(1.0);

@@ -33,16 +33,18 @@ Python 版仍是用户的日常工具，其 `pngshot.service` 持续占用 `$XDG
 7 个 workspace 成员。切分依据是「能不能在没有图形会话的情况下测试」。
 
 ```
-vellum-core    无依赖的地基：Rgb8、Rect、config、paths、grim 封装、剪贴板、通知、带超时的子进程
+vellum-core    无依赖的地基：Rgb8、Rect、config、paths、grim 封装、剪贴板、通知、带超时的子进程、合成器抽象
 vellum-stitch  长截图算法。纯计算，无 IO 无 GTK，可在 CI 里跑合成回归
 vellum-text    OCR + 翻译。纯计算 + HTTP/子进程，无 GTK（结果窗在 worker 线程调它）
 vellum-ipc     协议 + 客户端 + 守护进程。无 GTK
-vellum-cli     `vellum` / `vellumctl` 两个 bin + doctor + niri 快捷键管理
+vellum-cli     `vellum` / `vellumctl` 两个 bin + doctor + 快捷键管理（niri KDL / Hyprland）
 vellum-ui      唯一链接 GTK 的 crate
 vellum-tray    托盘，只依赖 core + ipc + ksni
 ```
 
-`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 170 个测试里绝大多数不需要 Wayland 会话。
+`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 192 个测试里绝大多数不需要 Wayland 会话。
+
+合成器抽象（`vellum-core/src/compositor/`）放在 core 而不是 GTK 二进制里，因为 `doctor` 也要报告检测到的合成器 —— 一份实现不会漂移，两份会。
 
 ## 3. 技术选型
 
@@ -167,11 +169,59 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 | accept 循环用 `poll()` 而非 25 ms sleep | 修掉每次快捷键固定 25 ms 的延迟 |
 | `route_action` 直接发 action，失败才 `ensure_service` | Python 每次动作前先发一次独立 ping，白付一个往返 |
 | 配置主路径为 `~/.config/vellum/config.toml` | 与仍在服务的 Python 版隔离；旧路径作只读回退 |
-| niri 窗口规则按 app-id 匹配，不按 title | Rust 版窗口标题是本地化文案（「vellum 钉图」），改语言就失效；app-id 稳定 |
+| 窗口规则按 app-id / class 匹配，不按 title | Rust 版窗口标题是本地化文案（「vellum 钉图」），改语言就失效；app-id 稳定 |
+| 同时支持 niri 与 Hyprland，不再是 niri-only | 用户要求「这个版本适配 niri 和 hyprland」；抽象层见 §8 |
 | `install.sh` 不 clone，直接构建脚本所在的树 | 没有远端可漂移，没有第二份源码要同步 |
 | `install.sh` 的依赖复核直接跑 `vellum doctor` | Python 版有两份会漂移的依赖清单；doctor 是唯一事实来源 |
 | `doctor` 检查 GTK4/layer-shell/leptonica 运行库，不检查 Python 模块 | 检查本构建真正加载的东西 |
 | 托盘用 ksni（Rust + zbus）而非 GTK 3 + Ayatana | 托盘进程不再链接任何 GTK |
 | 未移植 `run_result` 与 `Annotator::cycle_color/cycle_width` | Python 里已是死代码（全仓库无调用者） |
 | `anno.done` 无内容时返回选区工具栏而不是直接完成 | 修正：Python `_exit_annotate(apply=True)` 本就是这个语义，早期移植写错了 |
-| 钉图窗口缩放先查 niri 实时尺寸，再回退自记账 | 用户用合成器键位改过窗口大小后，自记账会漂移 |
+| 钉图窗口缩放先查合成器实时尺寸，再回退自记账 | 用户用合成器键位改过窗口大小后，自记账会漂移 |
+
+## 8. 合成器抽象（niri + Hyprland）
+
+`ARCHITECTURE.md` §22 原本写的是 niri-only。用户后来要求「这个版本适配 niri 和 hyprland」，所以加了一层抽象。
+
+### vellum 到底需要合成器做什么
+
+只有四件事，而且**只针对自己的长生命周期窗口**（钉图窗、OCR/翻译结果窗）：
+
+1. 按 pid 找到自己刚映射的窗口
+2. 把它移到浮动层
+3. 读它当前的真实尺寸
+4. 精确设置它的尺寸
+
+选区 overlay、长截图面板、选区高亮都是 layer-shell surface，**不需要任何合成器专属代码**——`wlr-layer-shell` 在两个合成器上行为一致。所以抽象面很窄，实现放在 `vellum-core/src/compositor/`（不是 UI 二进制里），因为 `doctor` 也要报告检测结果，一份实现不会漂移，两份会。
+
+### 两条铁律
+
+**缺失不是错误。** 未识别的合成器让四个入口全部返回 `None`/`false`，vellum 退化成普通 Wayland 客户端：截图、标注、OCR、翻译、托盘全部照常，只是钉图窗不会自动浮动、缩放走 GTK 而非合成器。这是受支持的降级模式，`doctor` 报 Warning 而非 Error。
+
+**按环境变量探测，不主动连接。** `NIRI_SOCKET` 存在 → niri；`HYPRLAND_INSTANCE_SIGNATURE` 存在 → Hyprland。主动连接探测会给快捷键热路径加延迟，而且在「两个二进制都装了但只跑一个」时会误判——本机正是如此（`/usr/bin/niri` 存在但跑的是 Hyprland）。
+
+窗口句柄用 `enum Window { Niri(u64), Hyprland(String) }`：niri 用数字 id，Hyprland 用十六进制 address 字符串，两者不可互换，用类型区分防止误传。
+
+### 为什么按 pid 查窗口，而不是操作「聚焦窗口」
+
+映射与延迟 60 ms 的浮动调用之间，用户完全可能已经切换焦点。浮动别人的窗口是可见且困惑的副作用。只有拿不到 handle 时才退回 `float_focused()`。
+
+### Hyprland 协议的三个坑
+
+都是实测踩出来的，写在这里免得再花一遍时间：
+
+- **响应末尾没有换行**。`j/clients` 返回合法 JSON 数组但不带 `\n`，用 `read_line` 会挂住，必须 `read_to_end`。niri 相反，它以换行分帧。
+- **请求是纯文本命令，不是 JSON**。socket 路径 `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket.sock`。
+- **这个 build 的 `dispatch` 参数按 Lua 解析**。经典文本语法 `dispatch setfloating address:0x...` 必然失败并报 Lua 语法错。正确形式是 `hl.dsp.window.float({ action = "enable", window = "address:0x..." })`。用 `"enable"` 而非 `"toggle"` 保证幂等。精确改尺寸是 `hl.dsp.window.resize({ x = w, y = h, window = ... })`，`relative` 默认 false，一次调用设两维。
+
+API 的权威来源是 `/usr/share/hypr/stubs/hl.meta.lua`：`hyprctl eval` 只回 `ok` 拿不到返回值，无法自省。
+
+### 快捷键：两个合成器能做的事不一样
+
+这是本次最重要的判断。键位都在用户拥有的文本文件里，但 vellum 能安全做的事不同：
+
+- **niri（KDL）**：真的写。插入带标记的托管块 → `niri validate` → 失败恢复备份 → 运行中尝试 reload。任一按键冲突就整组不写。
+- **Hyprland 经典 `hyprland.conf`（hyprlang）**：也能写。同样的备份 → `hyprctl reload` → `hyprctl configerrors` → 失败回滚。
+- **Hyprland Lua 配置**：**永不写**，只打印可粘贴的片段。Lua 配置是代码不是设置，改它等于往用户程序里拼代码；更关键的是这个 build 直接拒绝 `hyprctl keyword`（原文 `keyword can't work with non-legacy parsers. Use eval.`），连生效前校验的手段都没有。没有校验就不该自动改。
+
+discovery（`shortcuts list`）两边都支持且只读，但**必须解析配置文本，不能问合成器**：`hyprctl binds` 把每条 Lua 绑定都报成 `dispatcher: __lua` 加一个不透明数字，活着的合成器说不出哪个键启动了 vellum；而且 `hyprctl -j binds` 在此 build 输出非法 JSON（`"keycode": Comma` 未加引号）。

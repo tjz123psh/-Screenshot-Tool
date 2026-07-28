@@ -5,6 +5,7 @@
 //! milliseconds (ARCHITECTURE.md §6).
 
 pub mod capture;
+pub mod compositor;
 pub mod config;
 pub mod geom;
 pub mod image;
