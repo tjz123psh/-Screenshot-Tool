@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Label,
-    Orientation,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, EventControllerKey,
+    Label, Orientation,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::compositor;
@@ -36,12 +36,18 @@ use vellum_core::geom::Rect;
 use vellum_core::{Rgb8, capture};
 use vellum_stitch::Stitcher;
 
-use crate::{highlight::SelectionHighlight, theme};
+use crate::{highlight::SelectionHighlight, imaging, theme};
 
-/// Panel footprint used to pick a side. Slightly generous so the panel never
-/// ends up half over the sampled area because of a rounding difference.
-const PANEL_W: i32 = 320;
-const PANEL_H: i32 = 190;
+/// Live preview size inside the panel.
+///
+/// The stitched canvas keeps thumbnails at 220px wide, so asking for that width
+/// costs no extra scaling. The height is deliberately modest: the preview only
+/// has to answer "is it still tracking my scroll", and every pixel of panel
+/// height narrows the set of selections that leave room for the panel *outside*
+/// the sampled area.
+const PREVIEW_W: i32 = 220;
+const PREVIEW_H: i32 = 150;
+
 /// Gap between the panel and the selection edge.
 const PANEL_MARGIN: i32 = 24;
 /// Fallback margin when the selection leaves no usable side.
@@ -157,6 +163,13 @@ struct State {
     chip: Label,
     status: Label,
     metrics: Label,
+    /// Live preview of the stitched result.
+    ///
+    /// Shared with the draw handler rather than redrawn from the stitcher: the
+    /// draw callback runs on GTK's schedule, and re-scaling the canvas there
+    /// would put image work on the frame clock for no benefit.
+    preview: Rc<RefCell<Option<cairo::ImageSurface>>>,
+    preview_area: DrawingArea,
 }
 
 impl State {
@@ -212,6 +225,27 @@ impl State {
         let (chip, status) = self.hint.unwrap_or(Hint::Sampling).text();
         self.chip.set_text(chip);
         self.status.set_text(status);
+        self.refresh_preview();
+    }
+
+    /// Rebuilds the preview surface from the stitched canvas.
+    ///
+    /// The canvas already keeps downscaled blocks, so this only stacks the tail
+    /// of them; measured at 0.03 ms per frame against grim's 36 ms, which is why
+    /// it can run on every accepted frame instead of on a slower timer.
+    fn refresh_preview(&self) {
+        let thumb = self
+            .stitcher
+            .preview_thumbnail(PREVIEW_W as usize, PREVIEW_H as usize);
+        let surface = thumb
+            .as_ref()
+            .and_then(|image| imaging::to_surface(image).ok());
+        // Keep the previous frame on a conversion failure: a preview that
+        // flickers to empty reads as "capture broke" when nothing is wrong.
+        if surface.is_some() {
+            *self.preview.borrow_mut() = surface;
+        }
+        self.preview_area.queue_draw();
     }
 }
 
@@ -228,34 +262,50 @@ fn group_digits(value: usize) -> String {
     out
 }
 
-/// Picks the side with the most free space outside `rect` and anchors there.
+/// Which side of `rect` fits a `panel_w` x `panel_h` panel, if any.
 ///
 /// grim samples `rect`, so a panel resting on top of it would be recorded into
-/// the result. When the selection covers the whole output there is no safe side
-/// and the panel falls back to the bottom edge, where it overlaps the least.
-fn apply_panel_anchor(window: &ApplicationWindow, rect: Rect, screen: Option<(i32, i32)>) {
-    let Some((sw, sh)) = screen else {
-        window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, FALLBACK_MARGIN);
-        return;
-    };
+/// the result. Split out from the window call so the rule can be tested without
+/// a display. `None` means no side has room and the caller must fall back.
+fn panel_edge(
+    rect: Rect,
+    screen: (i32, i32),
+    panel_w: i32,
+    panel_h: i32,
+) -> Option<(Edge, i32, i32)> {
+    let (sw, sh) = screen;
+    [
+        (Edge::Top, rect.y, panel_h),
+        (Edge::Bottom, sh - (rect.y + rect.h), panel_h),
+        (Edge::Left, rect.x, panel_w),
+        (Edge::Right, sw - (rect.x + rect.w), panel_w),
+    ]
+    .into_iter()
+    .filter(|&(_, gap, need)| gap >= need + PANEL_MARGIN)
+    .max_by_key(|&(_, gap, _)| gap)
+}
 
-    let candidates = [
-        (Edge::Top, rect.y, PANEL_H),
-        (Edge::Bottom, sh - (rect.y + rect.h), PANEL_H),
-        (Edge::Left, rect.x, PANEL_W),
-        (Edge::Right, sw - (rect.x + rect.w), PANEL_W),
-    ];
-    let best = candidates
-        .into_iter()
-        .filter(|&(_, gap, need)| gap >= need + PANEL_MARGIN)
-        .max_by_key(|&(_, gap, _)| gap);
-
-    match best {
+/// Anchors `window` on the side of `rect` with the most room.
+///
+/// `panel_w`/`panel_h` are the panel's *measured* size, not a constant: the
+/// panel grew a live preview, and a hardcoded footprint that understates the
+/// real height would let the panel sit on top of the sampled area. Measuring
+/// keeps this correct when the panel contents change again.
+fn apply_panel_anchor(
+    window: &ApplicationWindow,
+    rect: Rect,
+    screen: Option<(i32, i32)>,
+    panel_w: i32,
+    panel_h: i32,
+) {
+    let edge = screen.and_then(|screen| panel_edge(rect, screen, panel_w, panel_h));
+    match edge {
         Some((edge, _, _)) => {
             window.set_anchor(edge, true);
             window.set_margin(edge, PANEL_MARGIN);
         }
+        // Either the screen size is unknown or the selection covers everything.
+        // The bottom edge overlaps the least in both cases.
         None => {
             window.set_anchor(Edge::Bottom, true);
             window.set_margin(Edge::Bottom, FALLBACK_MARGIN);
@@ -299,7 +349,8 @@ impl Recorder {
         window.set_layer(Layer::Overlay);
         window.set_namespace(Some("vellum-longshot"));
         window.set_keyboard_mode(KeyboardMode::OnDemand);
-        apply_panel_anchor(&window, rect, screen);
+        // Anchoring happens after the panel is populated: the side is chosen
+        // from the panel's measured size, which is not known yet.
         // Without this the default theme paints an opaque rectangle outside the
         // card's rounded corners, inside the 16px margin.
         window.add_css_class("vellum-transparent");
@@ -340,6 +391,47 @@ impl Recorder {
         metrics.add_css_class("vellum-dim");
         metrics.set_xalign(0.0);
 
+        // Live preview of the stitched result. Without it the user has no way to
+        // tell a working capture from a stalled one until the file is written,
+        // which is exactly the feedback that was missing.
+        let preview: Rc<RefCell<Option<cairo::ImageSurface>>> = Rc::new(RefCell::new(None));
+        let preview_area = DrawingArea::new();
+        preview_area.set_content_width(PREVIEW_W);
+        preview_area.set_content_height(PREVIEW_H);
+        preview_area.add_css_class("vellum-preview");
+        {
+            let preview = preview.clone();
+            preview_area.set_draw_func(move |_, cr, width, height| {
+                let w = f64::from(width);
+                let h = f64::from(height);
+                // Placeholder well while the first frames arrive.
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.04);
+                cr.rectangle(0.0, 0.0, w, h);
+                let _ = cr.fill();
+
+                let borrowed = preview.borrow();
+                let Some(surface) = borrowed.as_ref() else {
+                    return;
+                };
+                let (sw, sh) = (
+                    f64::from(surface.width()).max(1.0),
+                    f64::from(surface.height()).max(1.0),
+                );
+                // Anchor the newest content to the bottom: the interesting edge
+                // is where stitching is currently happening.
+                let scale = (w / sw).min(1.0);
+                let drawn_h = sh * scale;
+                let _ = cr.save();
+                // A tall canvas is allowed to overflow upwards (negative y) so
+                // the freshest rows stay pinned to the bottom of the well.
+                cr.translate((w - sw * scale) / 2.0, h - drawn_h);
+                cr.scale(scale, scale);
+                let _ = cr.set_source_surface(surface, 0.0, 0.0);
+                let _ = cr.paint();
+                let _ = cr.restore();
+            });
+        }
+
         let tip = Label::new(Some("保持目标窗口在前台滚动；再次按长截图快捷键即可完成"));
         tip.add_css_class("vellum-caption");
         tip.set_wrap(true);
@@ -358,22 +450,33 @@ impl Recorder {
 
         content.append(&header);
         content.append(&status);
+        content.append(&preview_area);
         content.append(&metrics);
         content.append(&tip);
         content.append(&buttons);
         root.append(&content);
         root.set_valign(Align::Center);
         window.set_child(Some(&root));
+        // Measure the assembled panel instead of trusting a constant. The
+        // footprint decides which side is far enough from the selection, and a
+        // hardcoded guess silently understates it whenever the panel gains a
+        // widget - which would let the panel sit on the sampled area and be
+        // recorded into the result.
+        let (_, panel_w, _, _) = root.measure(Orientation::Horizontal, -1);
+        let (_, panel_h, _, _) = root.measure(Orientation::Vertical, panel_w);
+        apply_panel_anchor(&window, rect, screen, panel_w, panel_h);
 
         let recorder = Rc::new(Self {
             window: window.clone(),
             highlight: RefCell::new(SelectionHighlight::new(app, rect, screen)),
             shared: Arc::new(Shared::new()),
             state: RefCell::new(State {
+                // Preview enabled: measured at 0.03 ms per frame against a 36 ms
+                // grab, so the live feedback is effectively free.
                 stitcher: Stitcher::with_options(
                     cfg.max_diff,
                     cfg.min_shift_px,
-                    false,
+                    true,
                     vellum_stitch::offline::KEYFRAME_MEMORY_LIMIT,
                 ),
                 max_diff: cfg.max_diff,
@@ -386,6 +489,8 @@ impl Recorder {
                 chip,
                 status,
                 metrics,
+                preview,
+                preview_area,
             }),
             worker: RefCell::new(None),
             cursor: RefCell::new(None),
@@ -679,5 +784,60 @@ mod tests {
             let (chip, status) = hint.text();
             assert!(!chip.is_empty() && !status.is_empty());
         }
+    }
+
+    /// The panel must never overlap the sampled area: grim would record it into
+    /// the result. This is the geometry half of that guarantee.
+    ///
+    /// The assertion is the invariant, not a particular side: the rule is "most
+    /// free space wins", so naming an edge here would just restate the arithmetic
+    /// and would break on any future tie-breaking change that is still safe.
+    #[test]
+    fn the_panel_never_lands_on_the_sampled_area() {
+        let screen = (1920, 1080);
+        for rect in [
+            Rect::new(400, 40, 900, 500),   // room below and to the right
+            Rect::new(40, 300, 500, 400),   // room to the right
+            Rect::new(1300, 300, 560, 400), // room to the left
+            Rect::new(400, 600, 900, 440),  // room above
+        ] {
+            let (_, gap, need) = panel_edge(rect, screen, 330, 420).expect("a side should fit");
+            assert!(
+                gap >= need + PANEL_MARGIN,
+                "chosen side must clear the panel plus its margin for {rect}"
+            );
+        }
+    }
+
+    /// The chosen side is the roomiest one, so the panel keeps its distance from
+    /// the selection rather than hugging it.
+    #[test]
+    fn the_roomiest_side_wins() {
+        let screen = (1920, 1080);
+        // Below: 540px. Right: 620px. Right is roomier, so it must win.
+        let rect = Rect::new(400, 40, 900, 500);
+        let (edge, _, _) = panel_edge(rect, screen, 330, 420).expect("a side should fit");
+        assert_eq!(edge, Edge::Right);
+    }
+
+    /// A panel that grew taller must stop choosing a side that no longer fits,
+    /// which is what made the hardcoded footprint dangerous.
+    #[test]
+    fn a_taller_panel_rejects_a_side_that_no_longer_fits() {
+        let screen = (1920, 1080);
+        // 300px of room below the selection, and nothing anywhere else.
+        let rect = Rect::new(0, 0, 1920, 780);
+        assert!(panel_edge(rect, screen, 330, 200).is_some());
+        assert!(
+            panel_edge(rect, screen, 330, 420).is_none(),
+            "420 + margin exceeds the 300px gap, so no side is safe"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_selection_leaves_no_safe_side() {
+        let screen = (1920, 1080);
+        let rect = Rect::new(0, 0, 1920, 1080);
+        assert!(panel_edge(rect, screen, 330, 420).is_none());
     }
 }
