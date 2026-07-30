@@ -109,14 +109,69 @@ fn already_target_language(text: &str, target_lang: &str) -> bool {
     }
 }
 
+/// Tries the configured model, then each fallback, until one answers.
+///
+/// The free pool serves models on a best-effort basis: a model that answers now
+/// can return "No provider available" later, while a sibling in the same pool
+/// still works. Walking the list turns that from "translation is broken" into a
+/// few extra seconds.
+///
+/// Only an [`TranslateError::Upstream`] refusal advances to the next model. A
+/// missing binary or a transport failure is a local problem that every model
+/// would hit identically, so those abort immediately instead of spending the
+/// timeout once per candidate.
 fn translate_opencode(prompt: &str, cfg: &LlmConfig) -> Result<String, TranslateError> {
+    let mut first_refusal: Option<TranslateError> = None;
+
+    for model_id in model_candidates(cfg) {
+        match translate_with_model(prompt, cfg, model_id) {
+            Ok(text) => return Ok(text),
+            Err(err @ TranslateError::Upstream(_)) => {
+                // Keep the first refusal: it names the model the user actually
+                // configured, which is the useful one to report if every
+                // candidate is refused.
+                first_refusal.get_or_insert(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(first_refusal
+        .unwrap_or_else(|| TranslateError::Failed("no translation model produced a result".into())))
+}
+
+/// The configured model first, then each fallback, with duplicates dropped.
+///
+/// Order matters: the user's choice is always tried first, so a working primary
+/// model never pays for the fallback list existing. Duplicates are dropped
+/// because retrying the same model spends the whole timeout again for an answer
+/// that is already known.
+fn model_candidates(cfg: &LlmConfig) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::with_capacity(1 + cfg.fallback_models.len());
+    for candidate in
+        std::iter::once(cfg.model.as_str()).chain(cfg.fallback_models.iter().map(String::as_str))
+    {
+        let candidate = candidate.trim();
+        if !candidate.is_empty() && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// One model, server transport first and CLI as the second chance.
+fn translate_with_model(
+    prompt: &str,
+    cfg: &LlmConfig,
+    model_id: &str,
+) -> Result<String, TranslateError> {
     if server_available(cfg.serve_port) {
-        match translate_opencode_server(prompt, cfg) {
+        match translate_opencode_server(prompt, cfg, model_id) {
             Ok(text) => return Ok(text),
             // The model or its provider refused. The CLI would ask the same
             // model through the same account, so retrying only doubles the
             // wait: measured 29 s on the server plus 30 s on the CLI for one
-            // 401. Report the real reason instead.
+            // 401. Move on to the next model instead.
             Err(err @ TranslateError::Upstream(_)) => return Err(err),
             // Anything else means the server itself was unhelpful (stale build,
             // protocol drift, transport error). The CLI is a genuine second
@@ -124,14 +179,16 @@ fn translate_opencode(prompt: &str, cfg: &LlmConfig) -> Result<String, Translate
             Err(_) => {}
         }
     }
-    translate_opencode_cli(prompt, cfg)
+    translate_opencode_cli(prompt, cfg, model_id)
 }
 
-fn translate_opencode_cli(prompt: &str, cfg: &LlmConfig) -> Result<String, TranslateError> {
+fn translate_opencode_cli(
+    prompt: &str,
+    cfg: &LlmConfig,
+    model: &str,
+) -> Result<String, TranslateError> {
     let child = Command::new("opencode")
-        .args([
-            "run", "--pure", "--format", "json", "-m", &cfg.model, prompt,
-        ])
+        .args(["run", "--pure", "--format", "json", "-m", model, prompt])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -280,8 +337,12 @@ fn server_available(port: u16) -> bool {
     body.get("healthy").and_then(|v| v.as_bool()) == Some(true)
 }
 
-fn translate_opencode_server(prompt: &str, cfg: &LlmConfig) -> Result<String, TranslateError> {
-    let (provider, model) = split_model(&cfg.model)?;
+fn translate_opencode_server(
+    prompt: &str,
+    cfg: &LlmConfig,
+    model_id: &str,
+) -> Result<String, TranslateError> {
+    let (provider, model) = split_model(model_id)?;
     let base = format!("http://127.0.0.1:{}", cfg.serve_port);
     let timeout = Duration::from_secs(cfg.timeout_s.max(1));
 
@@ -573,5 +634,49 @@ mod tests {
     fn a_missing_health_endpoint_is_not_available() {
         // Port 1 is never a live opencode server.
         assert!(!server_available(1));
+    }
+
+    /// The configured model is always tried first: a fallback list must not
+    /// quietly demote the model the user chose.
+    #[test]
+    fn the_configured_model_is_tried_first() {
+        let cfg = cfg();
+        let order = model_candidates(&cfg);
+        assert_eq!(order.first().copied(), Some(cfg.model.as_str()));
+    }
+
+    /// The shared free pool refuses individual models transiently, so every
+    /// configured alternative has to be reachable in one call.
+    #[test]
+    fn every_fallback_model_is_offered() {
+        let cfg = cfg();
+        let order = model_candidates(&cfg);
+        for fallback in &cfg.fallback_models {
+            assert!(
+                order.contains(&fallback.as_str()),
+                "{fallback} is configured but would never be tried"
+            );
+        }
+    }
+
+    /// A duplicate would spend the timeout twice for the same answer.
+    #[test]
+    fn a_duplicated_model_is_only_tried_once() {
+        let mut cfg = cfg();
+        cfg.model = "opencode/a".into();
+        cfg.fallback_models = vec![
+            "opencode/a".into(),
+            "opencode/b".into(),
+            "opencode/a".into(),
+        ];
+        assert_eq!(model_candidates(&cfg), vec!["opencode/a", "opencode/b"]);
+    }
+
+    /// An empty fallback list must still try the configured model.
+    #[test]
+    fn no_fallbacks_still_tries_the_primary_model() {
+        let mut cfg = cfg();
+        cfg.fallback_models.clear();
+        assert_eq!(model_candidates(&cfg), vec![cfg.model.as_str()]);
     }
 }

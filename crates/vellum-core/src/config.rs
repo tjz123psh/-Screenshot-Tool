@@ -17,6 +17,16 @@ pub struct LlmConfig {
     pub target_lang: String,
     pub timeout_s: u64,
     pub serve_port: u16,
+    /// Models to try, in order, when `model` is refused by its provider.
+    ///
+    /// The shared free pool serves each model on a best-effort basis: a model
+    /// that answers now can return "No provider available" an hour later, and a
+    /// different one in the same pool usually still works. Without this list a
+    /// transient refusal on one model looks like "translation is broken".
+    ///
+    /// Only consulted for [`TranslateError::Upstream`]-style refusals, never for
+    /// transport errors, so a local problem cannot silently walk the whole list.
+    pub fallback_models: Vec<String>,
 }
 
 impl Default for LlmConfig {
@@ -27,6 +37,15 @@ impl Default for LlmConfig {
             target_lang: "简体中文".into(),
             timeout_s: 30,
             serve_port: 47823,
+            // Every free model measured working on this machine, fastest first.
+            // Ordered by measured round trip: 7.2s, 7.5s, 8.1s, 15.2s.
+            fallback_models: vec![
+                "opencode/nemotron-3-ultra-free".into(),
+                "opencode/ling-3.0-flash-free".into(),
+                "opencode/north-mini-code-free".into(),
+                "opencode/mimo-v2.5-free".into(),
+                "opencode/laguna-s-2.1-free".into(),
+            ],
         }
     }
 }
@@ -101,6 +120,7 @@ struct RawLlm {
     target_lang: Option<toml::Value>,
     timeout_s: Option<toml::Value>,
     serve_port: Option<toml::Value>,
+    fallback_models: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -132,6 +152,24 @@ fn non_empty_string(value: &Option<toml::Value>) -> Option<String> {
 fn one_of(value: &Option<toml::Value>, allowed: &[&str]) -> Option<String> {
     let text = non_empty_string(value)?;
     allowed.contains(&text.as_str()).then_some(text)
+}
+
+/// A TOML array of non-empty strings.
+///
+/// An empty list is a meaningful choice ("do not fall back at all"), so it is
+/// returned as `Some(vec![])` rather than being treated as "unset" and silently
+/// replaced by the defaults.
+fn string_list(value: &Option<toml::Value>) -> Option<Vec<String>> {
+    let items = value.as_ref()?.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 fn positive_u64(value: &Option<toml::Value>) -> Option<u64> {
@@ -205,6 +243,9 @@ impl Config {
         }
         if let Some(v) = port(&raw.llm.serve_port) {
             cfg.llm.serve_port = v;
+        }
+        if let Some(v) = string_list(&raw.llm.fallback_models) {
+            cfg.llm.fallback_models = v;
         }
 
         if let Some(v) = one_of(&raw.ocr.engine, &["tesseract", "vision"]) {
