@@ -319,6 +319,20 @@ impl Stitcher {
         if shift.unsigned_abs() < self.min_shift_px {
             // Confident but essentially the same view. Deliberately keep the
             // old reference so small scrolls accumulate.
+            //
+            // The detector still has to see this pair. A viewport-fixed region
+            // (window chrome baked into every frame) matches perfectly at offset
+            // zero, so it drags the score minimum to "did not move" and lands
+            // here on every frame. Feeding the detector only on accepted frames
+            // therefore deadlocks: it needs three observations to activate, and
+            // the very condition it exists to cancel is what stops it from ever
+            // getting them. The output collapses to a single viewport.
+            //
+            // Safe to feed from a rejected pair: `observe` re-checks the frame
+            // shape, a band wider than 45% of the axis is refused, and an
+            // all-unchanged observation (the user simply paused) is cleared
+            // instead of being read as "the whole viewport is chrome".
+            self.observe_fixed_regions(&pixels);
             return diff;
         }
         if !had_valid {
@@ -336,9 +350,7 @@ impl Stitcher {
         self.last_offset = shift;
         self.frames_used += 1;
 
-        if let (Some(detector), Some(newest)) = (self.fixed_regions.as_mut(), self.history.back()) {
-            detector.observe(&newest.pixels, &pixels);
-        }
+        self.observe_fixed_regions(&pixels);
         self.push_history(Tracked {
             cols: Arc::clone(&cols),
             pixels: Arc::clone(&pixels),
@@ -450,6 +462,19 @@ impl Stitcher {
         rows: Option<&[bool]>,
     ) -> (i32, f32) {
         find_shift_for(last, cols, predict, robust, &Mask::rows_only(rows))
+    }
+
+    /// Feed one frame pair to the fixed-region detector.
+    ///
+    /// The pair is always "newest tracked frame" against `pixels`, so the
+    /// detector sees the same transition regardless of whether the frame was
+    /// ultimately accepted. Called from both the accept path and the
+    /// "confident but did not move" path; see the comment at the latter for why
+    /// the rejected case matters.
+    fn observe_fixed_regions(&mut self, pixels: &Arc<Sparse>) {
+        if let (Some(detector), Some(newest)) = (self.fixed_regions.as_mut(), self.history.back()) {
+            detector.observe(&newest.pixels, pixels);
+        }
     }
 
     fn fixed_row_mask(&self) -> Option<Vec<bool>> {

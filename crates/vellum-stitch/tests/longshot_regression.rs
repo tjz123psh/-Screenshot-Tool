@@ -371,3 +371,48 @@ fn sub_threshold_scrolling_accumulates_instead_of_stalling() {
     let expected = viewport(&src, 0, result.image.height);
     assert!(mean_abs_diff(&result.image, &expected) < 1.0);
 }
+
+/// A large viewport-fixed band must not collapse the capture to a single frame.
+///
+/// This is the regression for a real deadlock. A region that never scrolls
+/// (window chrome, or vellum's own long-shot panel when it overlaps the sampled
+/// area) matches *perfectly* at offset zero, which drags the score minimum to
+/// "the view did not move". The frame is then rejected on the `min_shift_px`
+/// branch — note it is rejected for zero shift, not for low confidence, so
+/// raising `max_diff` would not help and must not be attempted.
+///
+/// The fixed-region detector exists to cancel exactly this, but it was only fed
+/// on *accepted* frames, so it could never reach its three-observation warm-up:
+/// the condition it cancels was the condition preventing it from learning. The
+/// result was a file exactly one viewport tall.
+///
+/// The assertion is deliberately "much more than one viewport" rather than the
+/// exact height: with a band this large the warm-up frames are still dropped, so
+/// some content is legitimately lost. Pinning an exact height here would encode
+/// that incidental loss as required behaviour.
+#[test]
+fn a_large_fixed_band_does_not_collapse_the_capture() {
+    let src = page(PAGE_W, 1200);
+    let band = 96; // 40% of the viewport, inside the detector's 45% ceiling.
+    let frames: Vec<Rgb8> = (0..21)
+        .map(|i| {
+            let mut frame = viewport(&src, i * 20, VIEW_H);
+            paint_band(&mut frame, VIEW_H - band, VIEW_H);
+            frame
+        })
+        .collect();
+
+    let mut st = stitcher();
+    feed(&mut st, &frames);
+    let result = st.result().expect("stitch succeeded");
+
+    assert!(
+        st.frames_used > 1,
+        "capture collapsed to the seed frame: the detector never learned the band"
+    );
+    assert!(
+        result.image.height > VIEW_H * 2,
+        "output {} px is barely one viewport; expected the scroll to accumulate",
+        result.image.height
+    );
+}

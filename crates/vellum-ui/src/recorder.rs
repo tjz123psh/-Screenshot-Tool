@@ -49,9 +49,12 @@ const PREVIEW_W: i32 = 220;
 const PREVIEW_H: i32 = 150;
 
 /// Gap between the panel and the selection edge.
+///
+/// There is deliberately no "fallback margin" companion to this: the old code
+/// anchored the panel to the bottom edge when no side had room, which put it
+/// inside the sampled area and therefore into the saved image. Hiding the panel
+/// is the correct last resort.
 const PANEL_MARGIN: i32 = 24;
-/// Fallback margin when the selection leaves no usable side.
-const FALLBACK_MARGIN: i32 = 48;
 
 /// Delay before the first grab so the stage-one overlay is fully gone. Without
 /// it the first frame contains vellum's own dimming layer.
@@ -285,32 +288,47 @@ fn panel_edge(
     .max_by_key(|&(_, gap, _)| gap)
 }
 
-/// Anchors `window` on the side of `rect` with the most room.
+/// Where the sampling panel ends up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Anchored clear of the selection, preview included.
+    WithPreview(Edge),
+    /// Anchored clear of the selection, but only after dropping the preview.
+    WithoutPreview(Edge),
+    /// Nothing fits beside the selection, so the panel is not shown at all.
+    Hidden,
+}
+
+/// Chooses a placement that keeps the panel out of the sampled area.
 ///
-/// `panel_w`/`panel_h` are the panel's *measured* size, not a constant: the
-/// panel grew a live preview, and a hardcoded footprint that understates the
-/// real height would let the panel sit on top of the sampled area. Measuring
-/// keeps this correct when the panel contents change again.
-fn apply_panel_anchor(
-    window: &ApplicationWindow,
+/// grim was measured to copy our own layer-shell surfaces into its output (a
+/// full-screen overlay moved the mean red channel from 108 to 49), so "the panel
+/// overlaps the selection" means "the panel is in the saved image". That makes
+/// overlap unacceptable rather than merely untidy, and it is why there is no
+/// last-resort branch that anchors on top of the selection anyway.
+///
+/// Sizes are measured from the assembled widget tree, never hardcoded: a
+/// constant that understates the real height silently reintroduces the overlap
+/// the moment the panel gains a widget.
+fn choose_placement(
     rect: Rect,
     screen: Option<(i32, i32)>,
-    panel_w: i32,
-    panel_h: i32,
-) {
-    let edge = screen.and_then(|screen| panel_edge(rect, screen, panel_w, panel_h));
-    match edge {
-        Some((edge, _, _)) => {
-            window.set_anchor(edge, true);
-            window.set_margin(edge, PANEL_MARGIN);
-        }
-        // Either the screen size is unknown or the selection covers everything.
-        // The bottom edge overlaps the least in both cases.
-        None => {
-            window.set_anchor(Edge::Bottom, true);
-            window.set_margin(Edge::Bottom, FALLBACK_MARGIN);
-        }
+    full: (i32, i32),
+    compact: (i32, i32),
+) -> Placement {
+    // Without a screen size no side can be *proven* clear of the selection.
+    let Some(screen) = screen else {
+        return Placement::Hidden;
+    };
+    if let Some((edge, _, _)) = panel_edge(rect, screen, full.0, full.1) {
+        return Placement::WithPreview(edge);
     }
+    // The preview is the tallest single widget, so dropping it is what turns a
+    // tall selection from "no panel at all" into "panel with status and buttons".
+    if let Some((edge, _, _)) = panel_edge(rect, screen, compact.0, compact.1) {
+        return Placement::WithoutPreview(edge);
+    }
+    Placement::Hidden
 }
 
 pub struct Recorder {
@@ -322,6 +340,12 @@ pub struct Recorder {
     on_done: DoneHandler,
     rect: Rect,
     poll: Duration,
+    /// Where the panel ended up, decided before the window is mapped.
+    ///
+    /// `Hidden` means no side of the selection could be proven clear of it, so
+    /// the panel is never presented: grim records our layer surfaces, and a
+    /// visible panel there would be baked into the saved image.
+    placement: Placement,
     /// Hides the pointer for the duration of sampling.
     ///
     /// grim copies the pointer into every frame it appears in, so without this
@@ -457,14 +481,33 @@ impl Recorder {
         root.append(&content);
         root.set_valign(Align::Center);
         window.set_child(Some(&root));
-        // Measure the assembled panel instead of trusting a constant. The
-        // footprint decides which side is far enough from the selection, and a
-        // hardcoded guess silently understates it whenever the panel gains a
-        // widget - which would let the panel sit on the sampled area and be
-        // recorded into the result.
-        let (_, panel_w, _, _) = root.measure(Orientation::Horizontal, -1);
-        let (_, panel_h, _, _) = root.measure(Orientation::Vertical, panel_w);
-        apply_panel_anchor(&window, rect, screen, panel_w, panel_h);
+
+        // Measure the assembled panel instead of trusting a constant: a
+        // hardcoded footprint understates the real height the moment the panel
+        // gains a widget, and understating it puts the panel on the sampled area.
+        //
+        // Both variants are measured up front. The preview is the tallest single
+        // widget, so a selection that leaves no room for the full panel often
+        // still has room for the compact one, and showing status plus buttons
+        // beats showing nothing.
+        let measure = |root: &GtkBox| {
+            let (_, w, _, _) = root.measure(Orientation::Horizontal, -1);
+            let (_, h, _, _) = root.measure(Orientation::Vertical, w);
+            (w, h)
+        };
+        let full = measure(&root);
+        content.remove(&preview_area);
+        let compact = measure(&root);
+
+        let placement = choose_placement(rect, screen, full, compact);
+        // Put the preview back only if the chosen placement has room for it.
+        if let Placement::WithPreview(_) = placement {
+            content.insert_child_after(&preview_area, Some(&status));
+        }
+        if let Placement::WithPreview(edge) | Placement::WithoutPreview(edge) = placement {
+            window.set_anchor(edge, true);
+            window.set_margin(edge, PANEL_MARGIN);
+        }
 
         let recorder = Rc::new(Self {
             window: window.clone(),
@@ -497,6 +540,7 @@ impl Recorder {
             on_done,
             rect,
             poll: Duration::from_millis(cfg.poll_ms),
+            placement,
         });
 
         let keys = EventControllerKey::new();
@@ -543,9 +587,16 @@ impl Recorder {
     }
 
     /// Shows the outline and panel, then starts capturing after a short delay.
+    ///
+    /// The panel stays unmapped when no side of the selection can hold it. grim
+    /// records our own layer surfaces, so showing it anyway would put it in the
+    /// saved image; the selection outline still marks the area, and the hotkey
+    /// still finishes the capture.
     pub fn present(self: &Rc<Self>) {
         self.highlight.borrow().present();
-        self.window.present();
+        if self.placement != Placement::Hidden {
+            self.window.present();
+        }
         let recorder = Rc::downgrade(self);
         glib::timeout_add_local_once(
             Duration::from_millis(u64::from(START_DELAY_MS)),
@@ -839,5 +890,66 @@ mod tests {
         let screen = (1920, 1080);
         let rect = Rect::new(0, 0, 1920, 1080);
         assert!(panel_edge(rect, screen, 330, 420).is_none());
+    }
+
+    /// Measured footprints of the two panel variants, used by the placement
+    /// tests so they describe the panel that actually ships.
+    const FULL: (i32, i32) = (330, 413);
+    const COMPACT: (i32, i32) = (330, 253);
+
+    /// Dropping the preview is what rescues a selection that is too tall for the
+    /// full panel. This is the whole reason the compact variant exists.
+    #[test]
+    fn a_tall_selection_keeps_a_panel_by_dropping_the_preview() {
+        let screen = (1920, 1080);
+        // 300px below the selection: too little for 413, enough for 253.
+        let rect = Rect::new(0, 0, 1920, 780);
+        assert_eq!(
+            choose_placement(rect, Some(screen), FULL, COMPACT),
+            Placement::WithoutPreview(Edge::Bottom)
+        );
+    }
+
+    /// The panel is never placed on top of the sampled area, because grim copies
+    /// our layer surfaces into the output. Hiding it is the correct outcome, not
+    /// a missing fallback.
+    ///
+    /// The sizes here are the selections that actually produced contaminated
+    /// captures: centred on a 1920x1080 output they leave under 260px on every
+    /// side, so neither variant fits.
+    #[test]
+    fn a_selection_with_no_room_hides_the_panel_instead_of_overlapping() {
+        let screen = (1920, 1080);
+        for (w, h) in [(1417, 921), (1520, 900), (1573, 700), (1493, 900)] {
+            let rect = Rect::new((1920 - w) / 2, (1080 - h) / 2, w, h);
+            assert_eq!(
+                choose_placement(rect, Some(screen), FULL, COMPACT),
+                Placement::Hidden,
+                "{w}x{h} has no side clear of the selection, so the panel must not be shown"
+            );
+        }
+    }
+
+    /// A roomy selection keeps the preview: the degradation only kicks in when
+    /// geometry forces it.
+    #[test]
+    fn a_small_selection_keeps_the_preview() {
+        let screen = (1920, 1080);
+        let rect = Rect::new(700, 300, 500, 400);
+        assert!(matches!(
+            choose_placement(rect, Some(screen), FULL, COMPACT),
+            Placement::WithPreview(_)
+        ));
+    }
+
+    /// Without a screen size no side can be proven clear, so the panel stays
+    /// hidden rather than gambling on an edge.
+    #[test]
+    fn an_unknown_screen_size_hides_the_panel() {
+        let rect = Rect::new(0, 0, 800, 600);
+        assert_eq!(
+            choose_placement(rect, None, FULL, COMPACT),
+            Placement::Hidden
+        );
     }
 }
