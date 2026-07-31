@@ -2,3 +2,7 @@
 
 # Python 原版源码快照，只作行为参考，不纳入版本控制。
 /pngshot.tar.gz
+
+# Local checkpoint for long-running Codex work; may contain private runtime
+# paths and verification notes, so it must never enter version control.
+/HANDOFF.md
