@@ -2,6 +2,18 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.1.1] - 2026-08-01
+
+### Changed
+
+- Local OCR now adapts to faded text, uneven light/dark backgrounds, colored interference and isoluminant foreground/background colors using lazy CLAHE, polarity and color-projection candidates.
+- Tesseract TSV confidence now drives preprocessing/layout selection, weak sparse-edge noise removal and per-line mixed-language fusion.
+
+### Fixed
+
+- Drain child stdout/stderr while writing stdin so large Tesseract or OpenCode output cannot deadlock and be misreported as a timeout; isolate their process groups so forked descendants cannot keep inherited pipes alive past the deadline.
+- Keep sparse-noise filtering and mixed-language line fusion safe for multi-column text instead of dropping or swapping neighboring columns.
+
 ## [0.1.0] - 2026-07-31
 
 ### Added
@@ -18,4 +30,5 @@ All notable changes to vellum are documented here. The Rust rewrite starts a new
 - Approximately 0.15 seconds for the 101-frame 900×700 long-shot benchmark.
 - Approximately 0.04 milliseconds p50 for local control-socket ping/status round trips.
 
+[0.1.1]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.0
