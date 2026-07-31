@@ -44,6 +44,20 @@ pub(crate) const CLI_TIMEOUT: Duration = Duration::from_secs(3);
 /// from being read forever.
 pub(crate) const MAX_REPLY_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Process environment mutation is global, so compositor tests that override
+/// socket variables must serialize even when Rust's test harness runs modules
+/// in parallel. Without this lock, one test can clear a variable between
+/// another test's `set_var` and assertion, producing a nondeterministic failure.
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Which compositor this session is running, as far as vellum can tell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Compositor {
@@ -248,6 +262,7 @@ mod tests {
 
     #[test]
     fn niri_is_detected_from_its_socket_variable() {
+        let _lock = test_env_lock();
         let _hypr = EnvGuard::clear("HYPRLAND_INSTANCE_SIGNATURE");
         let _niri = EnvGuard::set("NIRI_SOCKET", "/run/user/1000/niri.sock");
         assert_eq!(detect(), Compositor::Niri);
@@ -255,6 +270,7 @@ mod tests {
 
     #[test]
     fn hyprland_is_detected_from_its_signature() {
+        let _lock = test_env_lock();
         let _niri = EnvGuard::clear("NIRI_SOCKET");
         let _hypr = EnvGuard::set("HYPRLAND_INSTANCE_SIGNATURE", "deadbeef_1_2");
         assert_eq!(detect(), Compositor::Hyprland);
@@ -262,6 +278,7 @@ mod tests {
 
     #[test]
     fn a_plain_wayland_session_is_supported_but_uncontrolled() {
+        let _lock = test_env_lock();
         let _niri = EnvGuard::clear("NIRI_SOCKET");
         let _hypr = EnvGuard::clear("HYPRLAND_INSTANCE_SIGNATURE");
         assert_eq!(detect(), Compositor::Unknown);
@@ -273,6 +290,7 @@ mod tests {
 
     #[test]
     fn niri_wins_when_both_variables_are_present() {
+        let _lock = test_env_lock();
         // Both binaries can be installed at once. The socket variable is only
         // exported by the compositor that is actually running, but if a stale
         // one lingers, preferring niri keeps behaviour deterministic instead of
@@ -300,6 +318,7 @@ mod tests {
 
     #[test]
     fn hiding_the_pointer_is_declined_where_it_is_impossible() {
+        let _lock = test_env_lock();
         // niri has no cursor action in its IPC, and vellum will not edit a
         // user's compositor config to invent one. Returning `None` rather than
         // failing is what lets the long shot proceed with the pointer visible.
@@ -313,6 +332,7 @@ mod tests {
 
     #[test]
     fn restoring_the_pointer_is_safe_when_nothing_hid_it() {
+        let _lock = test_env_lock();
         // The control service calls this on every long-shot exit, including the
         // ones that never hid anything, so it must be a no-op rather than a
         // failed compositor request.

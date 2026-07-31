@@ -152,6 +152,7 @@ mod tests {
 
     #[test]
     fn a_missing_socket_is_not_an_error() {
+        let _lock = crate::compositor::test_env_lock();
         // Callers rely on graceful degradation: vellum still works on other
         // compositors, it just cannot float or resize its own windows.
         let saved = std::env::var_os("NIRI_SOCKET");
@@ -164,6 +165,7 @@ mod tests {
 
     #[test]
     fn a_bogus_socket_path_fails_fast() {
+        let _lock = crate::compositor::test_env_lock();
         let saved = std::env::var_os("NIRI_SOCKET");
         unsafe { std::env::set_var("NIRI_SOCKET", "/nonexistent/vellum-niri.sock") };
         assert!(request(&json!("Windows")).is_none());

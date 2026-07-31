@@ -184,6 +184,7 @@ mod tests {
 
     #[test]
     fn a_missing_signature_means_no_socket() {
+        let _lock = crate::compositor::test_env_lock();
         // The whole point of the abstraction: on a non-Hyprland session this
         // must degrade quietly instead of erroring.
         let saved = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
@@ -196,6 +197,7 @@ mod tests {
 
     #[test]
     fn the_socket_path_follows_the_instance_signature() {
+        let _lock = crate::compositor::test_env_lock();
         let saved_sig = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE");
         let saved_run = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe {
