@@ -259,8 +259,6 @@ impl Toolbar {
                 (0.39, 0.52, 0.91, 0.96)
             } else if is_active {
                 (0.34, 0.48, 0.88, 0.88)
-            } else if id == "cancel" && hovered {
-                (0.56, 0.20, 0.26, 0.80)
             } else if hovered {
                 (0.30, 0.38, 0.58, 0.78)
             } else {

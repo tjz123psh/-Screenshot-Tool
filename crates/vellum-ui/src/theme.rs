@@ -12,7 +12,7 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 
 /// Bumped whenever CSS changes so a long-lived display reloads it.
-const CSS_VERSION: u32 = 1;
+const CSS_VERSION: u32 = 2;
 
 thread_local! {
     static INSTALLED: RefCell<HashSet<(usize, u32)>> = RefCell::new(HashSet::new());
@@ -152,8 +152,8 @@ button.vellum-quiet {
 }
 
 button.vellum-quiet:hover {
-  background-color: rgba(255, 137, 149, 0.18);
-  color: #ff8995;
+  background-color: rgba(142, 169, 255, 0.14);
+  color: #dce4ff;
 }
 
 button.vellum-icon-button {
