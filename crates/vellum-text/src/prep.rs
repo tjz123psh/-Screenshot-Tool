@@ -1,22 +1,22 @@
 //! Image preparation for local OCR.
 //!
-//! The Python original leaned on Pillow and OpenCV. Everything here is a
-//! hand-rolled equivalent of the exact operations that were benchmarked for
-//! character accuracy, because the two pipelines below are load-bearing and
-//! swapping in "something similar" measurably degrades recognition:
+//! The proven clean/busy pipelines remain the baseline: clean panels use
+//! autocontrast plus Lanczos, while translucent or textured backgrounds use a
+//! morphological background estimate, division and Otsu. Hard-thresholding is
+//! deliberately kept away from clean anti-aliased text.
 //!
-//! * Clean background (solid panel, terminal without transparency):
-//!   autocontrast then Lanczos upscale. Accuracy ~0.85 -> ~0.97. Deliberately
-//!   *no* binarisation: thresholding damages clean anti-aliased small text.
-//! * Busy background (wallpaper showing through a translucent terminal, where
-//!   plain OCR collapses from ~0.88 to ~0.10): estimate the background with a
-//!   morphological close, divide it out, upscale, then Otsu. ~0.22 -> ~0.88.
-//!   Thresholding *without* the division is worse than doing nothing (~0.02),
-//!   so the divide step is not optional.
+//! Real desktop text is not always separable by luminance, though. Faded glyphs
+//! can occupy less than one percent of a crop, light text can sit on a bright
+//! gradient, and two vivid colors may have exactly the same grayscale value.
+//! A preparation plan therefore adds specialist candidates only when scene
+//! statistics justify them:
 //!
-//! Which pipeline runs is decided by `busyness`, not by a user setting: a solid
-//! panel measures near 0 and glass-over-wallpaper measures 6 or more, so the
-//! threshold sits in the empty gap between the two distributions.
+//! * CLAHE for locally dim/low-contrast strokes;
+//! * the opposite busy-background polarity for pale text on uneven surfaces;
+//! * max-channel or principal-color projection for hue-only contrast.
+//!
+//! Candidates are rendered lazily. Tesseract confidence normally accepts the
+//! original baseline, so clean screenshots retain the old cost and appearance.
 
 use image::imageops::FilterType;
 use image::{GrayImage, ImageBuffer};
@@ -35,6 +35,37 @@ const BUSYNESS_KERNEL: usize = 25;
 
 /// Standard deviation of the closed image above which the busy pipeline runs.
 const BUSY_THRESHOLD: f64 = 3.0;
+
+/// Robust range below which global contrast alone tends to lose faded glyphs.
+const LOW_CONTRAST_RANGE: u8 = 96;
+
+/// Average per-pixel RGB spread that makes a color-preserving projection worth
+/// trying. Neutral screenshots stay on the cheaper luminance path.
+const COLORFUL_CHROMA: f64 = 12.0;
+
+/// CLAHE tiles per axis. Eight matches the OpenCV reference pipeline while the
+/// implementation automatically shrinks the grid for tiny crops.
+const CLAHE_GRID: usize = 8;
+const CLAHE_CLIP_FACTOR: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateKind {
+    Baseline,
+    LocalContrast,
+    OppositePolarity,
+    ColorContrast,
+}
+
+pub(crate) struct Preparation<'a> {
+    source: &'a Rgb8,
+    original: Gray,
+    oriented: Gray,
+    factor: f32,
+    busy: bool,
+    luma_range: u8,
+    chroma: f64,
+    channel_range: u8,
+}
 
 /// Single channel image. Kept separate from `Rgb8` so the morphology below can
 /// work on one byte per pixel.
@@ -406,6 +437,437 @@ fn upscale(gray: &Gray, factor: f32) -> Gray {
     }
 }
 
+/// Histogram stretch with a sub-percent cutoff. Small, faint text can occupy
+/// less than one percent of a large screenshot; the legacy one-percent cutoff
+/// may therefore classify the glyphs themselves as outliers. One per mille
+/// still ignores a stray cursor pixel without erasing a whole text line.
+fn quantile_from_histogram(counts: &[u32; 256], cut: usize, from_high: bool) -> Option<usize> {
+    let mut remaining = cut as u64;
+    let mut visit = |index: usize| {
+        let count = u64::from(counts[index]);
+        if count > remaining {
+            Some(index)
+        } else {
+            remaining = remaining.saturating_sub(count);
+            None
+        }
+    };
+    if from_high {
+        (0..256).rev().find_map(&mut visit)
+    } else {
+        (0..256).find_map(visit)
+    }
+}
+
+fn robust_range(gray: &Gray) -> u8 {
+    if gray.data.is_empty() {
+        return 0;
+    }
+    let counts = histogram(gray);
+    let cut = gray.data.len() / 1000;
+    match (
+        quantile_from_histogram(&counts, cut, false),
+        quantile_from_histogram(&counts, cut, true),
+    ) {
+        (Some(lo), Some(hi)) => hi.saturating_sub(lo) as u8,
+        _ => 0,
+    }
+}
+
+/// Make the dominant border color white. Unlike a whole-image mean this still
+/// handles a pale floating panel on a dark desktop and light text over a bright
+/// gradient: the crop border is a better estimate of its background polarity.
+fn orient_background_light(gray: &mut Gray) {
+    if gray.is_empty() {
+        return;
+    }
+    let band = (gray.width.min(gray.height) / 32).clamp(1, 5);
+    let mut counts = [0u32; 256];
+    let mut total = 0u32;
+    for y in 0..gray.height {
+        for x in 0..gray.width {
+            if x < band || x + band >= gray.width || y < band || y + band >= gray.height {
+                counts[usize::from(gray.row(y)[x])] += 1;
+                total += 1;
+            }
+        }
+    }
+    let mut seen = 0u32;
+    let median = counts
+        .iter()
+        .enumerate()
+        .find_map(|(value, count)| {
+            seen += *count;
+            (seen * 2 >= total).then_some(value as u8)
+        })
+        .unwrap_or(255);
+    if median < 128 {
+        invert(gray);
+    }
+}
+
+fn interpolation_axis(pixel: usize, length: usize, tiles: usize) -> (usize, usize, f64) {
+    debug_assert!(length > 0 && tiles > 0);
+    let position =
+        ((pixel as f64 + 0.5) * tiles as f64 / length as f64 - 0.5).clamp(0.0, (tiles - 1) as f64);
+    let lower = position.floor() as usize;
+    let upper = (lower + 1).min(tiles - 1);
+    let weight = if lower == upper {
+        0.0
+    } else {
+        position - lower as f64
+    };
+    (lower, upper, weight)
+}
+
+/// Contrast-limited adaptive histogram equalisation (CLAHE), implemented on a
+/// small tile grid and bilinearly interpolated to avoid seams. It expands dim
+/// anti-aliased strokes without forcing the hard binary edge that damages clean
+/// text, while clipping each histogram stops colored noise from taking over a
+/// whole tile.
+fn clahe(gray: &Gray) -> Gray {
+    if gray.is_empty() {
+        return gray.clone();
+    }
+    let tiles_x = CLAHE_GRID.min(gray.width).max(1);
+    let tiles_y = CLAHE_GRID.min(gray.height).max(1);
+    let mut luts = vec![[0u8; 256]; tiles_x * tiles_y];
+
+    for ty in 0..tiles_y {
+        let y0 = ty * gray.height / tiles_y;
+        let y1 = (ty + 1) * gray.height / tiles_y;
+        for tx in 0..tiles_x {
+            let x0 = tx * gray.width / tiles_x;
+            let x1 = (tx + 1) * gray.width / tiles_x;
+            let area = ((x1 - x0) * (y1 - y0)).max(1) as u32;
+            let mut counts = [0u32; 256];
+            for y in y0..y1 {
+                for &value in &gray.row(y)[x0..x1] {
+                    counts[usize::from(value)] += 1;
+                }
+            }
+
+            let limit = (CLAHE_CLIP_FACTOR * area / 256).max(1);
+            let mut excess = 0u32;
+            for count in &mut counts {
+                if *count > limit {
+                    excess += *count - limit;
+                    *count = limit;
+                }
+            }
+            let share = excess / 256;
+            let remainder = excess % 256;
+            for count in &mut counts {
+                *count += share;
+            }
+            if remainder > 0 {
+                for index in 0..remainder as usize {
+                    // Spread the remainder rather than biasing the darkest bins.
+                    counts[index * 256 / remainder as usize] += 1;
+                }
+            }
+
+            let lut = &mut luts[ty * tiles_x + tx];
+            let mut cumulative = 0u32;
+            for (value, slot) in lut.iter_mut().enumerate() {
+                cumulative += counts[value];
+                *slot = ((u64::from(cumulative) * 255 + u64::from(area) / 2) / u64::from(area))
+                    .min(255) as u8;
+            }
+        }
+    }
+
+    let mut out = Gray::new(gray.width, gray.height);
+    for y in 0..gray.height {
+        let (y0, y1, wy) = interpolation_axis(y, gray.height, tiles_y);
+        for x in 0..gray.width {
+            let (x0, x1, wx) = interpolation_axis(x, gray.width, tiles_x);
+            let value = usize::from(gray.row(y)[x]);
+            let top = f64::from(luts[y0 * tiles_x + x0][value]) * (1.0 - wx)
+                + f64::from(luts[y0 * tiles_x + x1][value]) * wx;
+            let bottom = f64::from(luts[y1 * tiles_x + x0][value]) * (1.0 - wx)
+                + f64::from(luts[y1 * tiles_x + x1][value]) * wx;
+            out.row_mut(y)[x] = (top * (1.0 - wy) + bottom * wy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+fn max_channel(image: &Rgb8) -> Gray {
+    let mut out = Gray::new(image.width, image.height);
+    for (dst, src) in out.data.iter_mut().zip(image.data.chunks_exact(3)) {
+        *dst = src[0].max(src[1]).max(src[2]);
+    }
+    out
+}
+
+fn mean_chroma(image: &Rgb8) -> f64 {
+    if image.data.is_empty() {
+        return 0.0;
+    }
+    let sum: u64 = image
+        .data
+        .chunks_exact(3)
+        .map(|pixel| u64::from(pixel.iter().max().unwrap() - pixel.iter().min().unwrap()))
+        .sum();
+    sum as f64 / (image.data.len() / 3) as f64
+}
+
+fn strongest_channel_range(image: &Rgb8) -> u8 {
+    (0..3)
+        .map(|channel| {
+            let mut gray = Gray::new(image.width, image.height);
+            for (dst, pixel) in gray.data.iter_mut().zip(image.data.chunks_exact(3)) {
+                *dst = pixel[channel];
+            }
+            robust_range(&gray)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Principal-color projection. Luminance deliberately gives equal weight to
+/// colors with equal brightness, which can erase red-on-blue or green-on-red
+/// text completely. PCA finds the RGB direction with the most separation and
+/// maps it back to one channel; neutral images naturally collapse to luma-like
+/// weights.
+fn principal_color_gray(image: &Rgb8) -> Gray {
+    if image.is_empty() {
+        return to_gray(image);
+    }
+    let pixels = image.data.len() / 3;
+    let stride = (pixels / 200_000).max(1);
+    let mut mean = [0.0f64; 3];
+    let mut count = 0.0f64;
+    for pixel in image.data.chunks_exact(3).step_by(stride) {
+        for channel in 0..3 {
+            mean[channel] += f64::from(pixel[channel]);
+        }
+        count += 1.0;
+    }
+    for value in &mut mean {
+        *value /= count.max(1.0);
+    }
+
+    let mut covariance = [[0.0f64; 3]; 3];
+    for pixel in image.data.chunks_exact(3).step_by(stride) {
+        let centered = [
+            f64::from(pixel[0]) - mean[0],
+            f64::from(pixel[1]) - mean[1],
+            f64::from(pixel[2]) - mean[2],
+        ];
+        for row in 0..3 {
+            for col in 0..3 {
+                covariance[row][col] += centered[row] * centered[col];
+            }
+        }
+    }
+
+    let seed = (0..3)
+        .max_by(|&a, &b| {
+            covariance[a]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .total_cmp(&covariance[b].iter().map(|value| value * value).sum::<f64>())
+        })
+        .unwrap_or(0);
+    let seed_norm = covariance[seed]
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if seed_norm <= f64::EPSILON {
+        return to_gray(image);
+    }
+    let mut vector = [
+        covariance[seed][0] / seed_norm,
+        covariance[seed][1] / seed_norm,
+        covariance[seed][2] / seed_norm,
+    ];
+    for _ in 0..16 {
+        let next = [
+            covariance[0][0] * vector[0]
+                + covariance[0][1] * vector[1]
+                + covariance[0][2] * vector[2],
+            covariance[1][0] * vector[0]
+                + covariance[1][1] * vector[1]
+                + covariance[1][2] * vector[2],
+            covariance[2][0] * vector[0]
+                + covariance[2][1] * vector[1]
+                + covariance[2][2] * vector[2],
+        ];
+        let norm = (next[0] * next[0] + next[1] * next[1] + next[2] * next[2]).sqrt();
+        if norm <= f64::EPSILON {
+            return to_gray(image);
+        }
+        vector = [next[0] / norm, next[1] / norm, next[2] / norm];
+    }
+
+    let mut projected = Vec::with_capacity(pixels);
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for pixel in image.data.chunks_exact(3) {
+        let value = (f64::from(pixel[0]) - mean[0]) * vector[0]
+            + (f64::from(pixel[1]) - mean[1]) * vector[1]
+            + (f64::from(pixel[2]) - mean[2]) * vector[2];
+        min = min.min(value);
+        max = max.max(value);
+        projected.push(value);
+    }
+    if max <= min + f64::EPSILON {
+        return to_gray(image);
+    }
+
+    // Approximate 0.1/99.9 percentiles with a compact histogram so a one-pixel
+    // border does not flatten the useful color separation.
+    let mut counts = [0u32; 1024];
+    for &value in &projected {
+        let bin = (((value - min) * 1023.0 / (max - min)).round() as usize).min(1023);
+        counts[bin] += 1;
+    }
+    let cut = pixels / 1000;
+    let mut remaining = cut as u64;
+    let low_bin = (0..1024)
+        .find(|&index| {
+            let count = u64::from(counts[index]);
+            if count > remaining {
+                true
+            } else {
+                remaining = remaining.saturating_sub(count);
+                false
+            }
+        })
+        .unwrap_or(0);
+    let mut remaining = cut as u64;
+    let high_bin = (0..1024)
+        .rev()
+        .find(|&index| {
+            let count = u64::from(counts[index]);
+            if count > remaining {
+                true
+            } else {
+                remaining = remaining.saturating_sub(count);
+                false
+            }
+        })
+        .unwrap_or(1023);
+    let low = min + (max - min) * low_bin as f64 / 1023.0;
+    let high = min + (max - min) * high_bin as f64 / 1023.0;
+    let scale = 255.0 / (high - low).max(f64::EPSILON);
+    Gray {
+        width: image.width,
+        height: image.height,
+        data: projected
+            .into_iter()
+            .map(|value| ((value - low) * scale).round().clamp(0.0, 255.0) as u8)
+            .collect(),
+    }
+}
+
+fn local_contrast_candidate(mut gray: Gray, factor: f32) -> Rgb8 {
+    // CLAHE needs the original narrow histogram to recognise that a faded
+    // stroke is locally unusual. Globally stretching first can turn the few
+    // glyph pixels into clipped extrema and loses the distinction again.
+    orient_background_light(&mut gray);
+    gray = clahe(&gray);
+    if factor > 1.0 {
+        gray = upscale(&gray, factor);
+    }
+    to_rgb(&gray)
+}
+
+fn busy_candidate(gray: &Gray, factor: f32) -> Rgb8 {
+    let background = close(gray, BACKGROUND_KERNEL);
+    let mut flattened = divide(gray, &background);
+    if factor > 1.0 {
+        flattened = upscale(&flattened, factor);
+    }
+    let cut = otsu(&flattened);
+    threshold(&mut flattened, cut);
+    to_rgb(&flattened)
+}
+
+fn baseline_candidate(mut gray: Gray, factor: f32, busy: bool) -> Rgb8 {
+    if busy {
+        busy_candidate(&gray, factor)
+    } else {
+        autocontrast(&mut gray, 1);
+        if factor > 1.0 {
+            gray = upscale(&gray, factor);
+        }
+        to_rgb(&gray)
+    }
+}
+
+impl<'a> Preparation<'a> {
+    pub(crate) fn new(image: &'a Rgb8, upscale_factor: f32) -> Self {
+        let original = to_gray(image);
+        let luma_range = robust_range(&original);
+        let chroma = mean_chroma(image);
+        let channel_range = strongest_channel_range(image);
+        let mut oriented = original.clone();
+        if mean_luminance(&oriented) < DARK_THEME_LUM {
+            invert(&mut oriented);
+        }
+        let busy = busyness(&oriented) > BUSY_THRESHOLD;
+        Self {
+            source: image,
+            original,
+            oriented,
+            factor: upscale_factor.max(1.0),
+            busy,
+            luma_range,
+            chroma,
+            channel_range,
+        }
+    }
+
+    pub(crate) fn kinds(&self) -> Vec<CandidateKind> {
+        let mut kinds = vec![CandidateKind::Baseline];
+        if self.luma_range < LOW_CONTRAST_RANGE {
+            kinds.push(CandidateKind::LocalContrast);
+        }
+        if self.busy {
+            kinds.push(CandidateKind::OppositePolarity);
+        }
+        if self.chroma >= COLORFUL_CHROMA || self.channel_range > self.luma_range.saturating_add(20)
+        {
+            kinds.push(CandidateKind::ColorContrast);
+        }
+        kinds
+    }
+
+    /// Render on demand. OCR often accepts the baseline immediately, so the
+    /// extra morphology/PCA work must not be paid before confidence says it is
+    /// needed.
+    pub(crate) fn render(&self, kind: CandidateKind) -> Rgb8 {
+        match kind {
+            CandidateKind::Baseline => {
+                baseline_candidate(self.oriented.clone(), self.factor, self.busy)
+            }
+            CandidateKind::LocalContrast => {
+                local_contrast_candidate(self.original.clone(), self.factor)
+            }
+            CandidateKind::OppositePolarity => {
+                let mut opposite = self.oriented.clone();
+                invert(&mut opposite);
+                busy_candidate(&opposite, self.factor)
+            }
+            CandidateKind::ColorContrast => {
+                let isoluminant =
+                    self.luma_range < 40 && self.channel_range > self.luma_range.saturating_add(32);
+                let color = if isoluminant {
+                    principal_color_gray(self.source)
+                } else {
+                    max_channel(self.source)
+                };
+                local_contrast_candidate(color, self.factor)
+            }
+        }
+    }
+}
+
 /// Full preprocessing pass. `upscale_factor` below 1.0 is clamped away because
 /// downscaling text never helps recognition.
 pub fn prepare(image: &Rgb8, upscale_factor: f32) -> Rgb8 {
@@ -545,6 +1007,104 @@ mod tests {
         let gray = to_gray(&solid(20, 10, 90));
         let bigger = upscale(&gray, 3.0);
         assert_eq!((bigger.width, bigger.height), (60, 30));
+    }
+
+    #[test]
+    fn principal_color_keeps_isoluminant_text_visible() {
+        let (width, height) = (80usize, 48usize);
+        // These colors both map to Rec.601 luma 91, so the ordinary grayscale
+        // candidate contains no glyph contrast at all.
+        let background = [35u8, 105, 170];
+        let foreground = [255u8, 25, 0];
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = if (16..64).contains(&x) && (12..36).contains(&y) {
+                    foreground
+                } else {
+                    background
+                };
+                data.extend_from_slice(&pixel);
+            }
+        }
+        let image = Rgb8::from_raw(width, height, data);
+        assert_eq!(robust_range(&to_gray(&image)), 0);
+        assert!(robust_range(&principal_color_gray(&image)) > 200);
+
+        let plan = Preparation::new(&image, 1.0);
+        assert!(plan.kinds().contains(&CandidateKind::ColorContrast));
+    }
+
+    #[test]
+    fn low_contrast_scenes_request_a_local_candidate() {
+        let (width, height) = (96usize, 64usize);
+        let mut image = solid(width, height, 220);
+        for y in 18..46 {
+            for x in 20..76 {
+                let base = (y * width + x) * 3;
+                image.data[base..base + 3].copy_from_slice(&[190, 190, 190]);
+            }
+        }
+        let plan = Preparation::new(&image, 1.0);
+        assert!(plan.kinds().contains(&CandidateKind::LocalContrast));
+        let local = plan.render(CandidateKind::LocalContrast);
+        assert!(robust_range(&to_gray(&local)) > robust_range(&to_gray(&image)));
+    }
+
+    #[test]
+    fn busy_scenes_offer_the_other_text_polarity() {
+        let (width, height) = (96usize, 72usize);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                let value = ((x * 5 + y * 7) % 180 + 35) as u8;
+                data.extend_from_slice(&[value, value.saturating_add(8), value]);
+            }
+        }
+        let image = Rgb8::from_raw(width, height, data);
+        let plan = Preparation::new(&image, 1.0);
+        assert!(plan.kinds().contains(&CandidateKind::OppositePolarity));
+    }
+
+    #[test]
+    fn clahe_handles_tiny_uniform_images_without_seams() {
+        let gray = Gray {
+            width: 2,
+            height: 2,
+            data: vec![120; 4],
+        };
+        let enhanced = clahe(&gray);
+        assert_eq!((enhanced.width, enhanced.height), (2, 2));
+        assert!(enhanced.data.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
+    fn clahe_preserves_mirrored_image_edges() {
+        let axis = [
+            10u8, 20, 40, 60, 80, 100, 120, 140, 140, 120, 100, 80, 60, 40, 20, 10,
+        ];
+        let mut gray = Gray::new(axis.len(), axis.len());
+        for y in 0..gray.height {
+            for x in 0..gray.width {
+                gray.row_mut(y)[x] = ((u16::from(axis[x]) + u16::from(axis[y])) / 2) as u8;
+            }
+        }
+
+        let enhanced = clahe(&gray);
+        for y in 0..enhanced.height {
+            for x in 0..enhanced.width {
+                assert_eq!(
+                    enhanced.row(y)[x],
+                    enhanced.row(y)[enhanced.width - 1 - x],
+                    "horizontal symmetry at ({x}, {y})"
+                );
+                assert_eq!(
+                    enhanced.row(y)[x],
+                    enhanced.row(enhanced.height - 1 - y)[x],
+                    "vertical symmetry at ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]

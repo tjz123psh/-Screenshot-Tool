@@ -9,7 +9,7 @@
 - 区域截图：拖拽框选、移动、缩放选区，保存并复制到剪贴板。
 - 标注：画笔、箭头、矩形、文字、颜色、粗细和撤销。
 - 长截图：用户手动滚动，vellum 连续抓帧并自动拼接；支持固定页眉/页脚、局部动画、半透明背景和离线路径重建。
-- OCR：本地 Tesseract，支持简体中文和英文；可选视觉模型，失败时回退本地 OCR。
+- OCR：本地 Tesseract，支持简体中文和英文；会针对彩色干扰、等亮异色文字、暗淡字色、低对比度和明暗渐变自动选择预处理候选；可选视觉模型失败时回退本地 OCR。
 - 翻译：优先复用本机 `opencode serve`，不可用时回退 `opencode run`，并支持免费模型池轮换。
 - 钉图：无边框浮动窗口，支持移动、缩放、复制和保存。
 - 系统托盘：传统 StatusNotifierItem + dbusmenu，兼容 niri/QuickShell 等托盘宿主。
@@ -153,7 +153,7 @@ cargo bench -p vellum-stitch
 cargo bench -p vellum-ipc
 ```
 
-当前实现包含 7 个 workspace crate、4 个二进制和 216 项测试。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
+当前实现包含 7 个 workspace crate、4 个二进制和 233 项测试。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
 
 ## 架构文档
 

@@ -7,6 +7,7 @@
 //! freezing a screenshot.
 
 use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -14,6 +15,19 @@ use std::time::{Duration, Instant};
 /// Poll interval while waiting. Short enough to stay responsive, long enough to
 /// not spin a core on a process that takes a second.
 const POLL: Duration = Duration::from_millis(20);
+
+/// Build a command in its own process group.
+///
+/// Every child handed to [`wait`] should be created through this helper. If a
+/// tool forks and its descendants inherit stdout/stderr, a timeout can then
+/// terminate the whole group instead of leaving pipe readers blocked forever.
+pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new(program);
+    command.process_group(0);
+    command
+}
 
 /// Resolve `program` against `PATH`.
 ///
@@ -58,28 +72,146 @@ impl Output {
 /// Returns `None` on timeout or on a wait error. Callers that need to tell those
 /// apart should not be using a deadline in the first place.
 ///
-/// The child must have been spawned with piped stdout/stderr for the captured
-/// output to be meaningful; the caller owns stdin so it can stream an image in
-/// before the wait starts.
-pub fn wait(mut child: Child, timeout: Duration) -> Option<std::process::Output> {
+/// The child must have been spawned with piped stdout/stderr for captured
+/// output. This function closes an unused piped stdin; use [`wait_with_input`]
+/// when input must be streamed under the same deadline.
+pub fn wait(child: Child, timeout: Duration) -> Option<std::process::Output> {
+    communicate(child, None, timeout)
+}
+
+/// Feed optional stdin while draining stdout and stderr concurrently.
+///
+/// Pipe capacity is deliberately small. Waiting for a child to exit before
+/// reading its output deadlocks as soon as Tesseract or OpenCode emits more
+/// than that capacity: the child waits for a reader, while the parent waits for
+/// the child. Reader threads start before the deadline loop, and an input
+/// writer runs alongside them so a broken tool that never reads stdin is still
+/// covered by the same timeout.
+pub fn wait_with_input(
+    child: Child,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    communicate(child, Some(input), timeout)
+}
+
+fn communicate(
+    mut child: Child,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let process_group = child.id();
+    let stdout = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
+    let stdin = match (child.stdin.take(), input) {
+        (Some(mut pipe), Some(bytes)) => Some(std::thread::spawn(move || pipe.write_all(&bytes))),
+        // Closing an unused piped stdin is what lets a child waiting for EOF
+        // continue. Stdio::null() arrives here as None.
+        _ => None,
+    };
+
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    // Reap it: a zombie would outlive a short CLI run, and land
-                    // on the control daemon when the daemon is the parent.
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(POLL);
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(POLL.min(remaining));
             }
-            Err(_) => return None,
+            Ok(None) | Err(_) => {
+                terminate(&mut child, process_group);
+                return None;
+            }
         }
+    };
+
+    // A direct child may exit while a forked descendant still owns its pipe
+    // ends. Joining unconditionally would let that descendant bypass the same
+    // deadline that governs the child. A timed-out handle is detached only
+    // after the isolated process group is killed, which makes the blocked I/O
+    // finish without delaying this caller.
+    let collected = (|| {
+        join_writer_before(stdin, deadline)?;
+        let stdout = join_reader_before(stdout, deadline)?;
+        let stderr = join_reader_before(stderr, deadline)?;
+        Some((stdout, stderr))
+    })();
+    let Some((stdout, stderr)) = collected else {
+        kill_process_group(process_group);
+        return None;
+    };
+
+    Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn join_before<T>(handle: std::thread::JoinHandle<T>, deadline: Instant) -> Option<T> {
+    while !handle.is_finished() {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        std::thread::sleep(POLL.min(remaining));
     }
-    child.wait_with_output().ok()
+    handle.join().ok()
+}
+
+fn join_writer_before(
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    deadline: Instant,
+) -> Option<()> {
+    let Some(handle) = handle else {
+        return Some(());
+    };
+    match join_before(handle, deadline)? {
+        Ok(()) => Some(()),
+        // A child may reject the request and close stdin before the writer has
+        // finished. Its exit status and stderr are still the authoritative
+        // answer; treating this ordinary pipe close as a timeout hides them.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Some(()),
+        Err(_) => None,
+    }
+}
+
+fn join_reader_before(
+    handle: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    match handle {
+        Some(handle) => join_before(handle, deadline)?.ok(),
+        None => Some(Vec::new()),
+    }
+}
+
+fn terminate(child: &mut Child, process_group: u32) {
+    kill_process_group(process_group);
+    let _ = child.kill();
+    // Reap it: a zombie would outlive a short CLI run, and land on the control
+    // daemon when the daemon is the parent.
+    let _ = child.wait();
+}
+
+fn kill_process_group(process_group: u32) {
+    let Ok(process_group) = i32::try_from(process_group) else {
+        return;
+    };
+    // SAFETY: a negative PID asks kill(2) to signal one process group. Commands
+    // created by `command()` use their own PID as that group id. If a caller
+    // supplied an ordinary Child instead, no such group exists and kill fails
+    // harmlessly with ESRCH rather than touching vellum's process group.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
 }
 
 /// Run `program` with `args` and no stdin, killing it if it outlives `timeout`.
@@ -87,7 +219,7 @@ pub fn wait(mut child: Child, timeout: Duration) -> Option<std::process::Output>
 /// Returns `None` when the process could not be started, could not be waited
 /// on, or had to be killed: to the caller all three mean "no usable answer".
 pub fn run<S: AsRef<OsStr>>(program: &Path, args: &[S], timeout: Duration) -> Option<Output> {
-    let child = Command::new(program)
+    let child = command(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -138,6 +270,88 @@ mod tests {
             run(&sh, &["-c", "echo bad >&2; exit 1"], Duration::from_secs(2)).expect("sh runs");
         assert!(!output.success);
         assert_eq!(output.message(), "bad");
+    }
+
+    #[test]
+    fn large_stdout_and_stderr_are_drained_before_the_child_exits() {
+        let Some(sh) = which("sh") else {
+            return;
+        };
+        let child = Command::new(sh)
+            .args([
+                "-c",
+                "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("shell spawns");
+
+        let output = wait(child, Duration::from_secs(5)).expect("large output completes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1_048_576);
+        assert_eq!(output.stderr.len(), 1_048_576);
+    }
+
+    #[test]
+    fn inherited_output_pipes_cannot_outlive_the_deadline() {
+        let Some(sh) = which("sh") else {
+            return;
+        };
+        let child = command(sh)
+            .args(["-c", "sleep 2 &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("shell spawns");
+
+        let started = Instant::now();
+        assert!(wait(child, Duration::from_millis(100)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "inherited pipe ignored the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn broken_pipe_preserves_the_child_status_and_diagnostics() {
+        let Some(sh) = which("sh") else {
+            return;
+        };
+        let child = Command::new(sh)
+            .args(["-c", "printf rejected >&2; exit 23"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("shell spawns");
+
+        let output = wait_with_input(child, vec![b'x'; 1_048_576], Duration::from_secs(5))
+            .expect("early input close still returns child output");
+        assert_eq!(output.status.code(), Some(23));
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "rejected");
+    }
+
+    #[test]
+    fn large_stdin_is_written_under_the_same_deadline() {
+        let Some(wc) = which("wc") else {
+            return;
+        };
+        let child = Command::new(wc)
+            .arg("-c")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("wc spawns");
+
+        let output = wait_with_input(child, vec![b'x'; 1_048_576], Duration::from_secs(5))
+            .expect("large input completes");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1048576");
     }
 
     #[test]

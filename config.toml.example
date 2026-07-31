@@ -21,10 +21,11 @@ fallback_models = [
 ]
 
 [ocr]
-# "tesseract" 默认走本地识别；"vision" 先尝试视觉模型，失败回退本地。
+# "tesseract" 默认走本地识别，并自动处理彩色干扰、暗淡字色与低对比度；
+# "vision" 先尝试视觉模型，失败回退同一套增强后的本地 OCR。
 engine = "tesseract"
 langs = "chi_sim+eng"
-preprocess = true
+preprocess = true # 建议保持开启；关闭后只把原图直接交给 Tesseract
 upscale = 3.0
 vision_model = "google/gemini-flash-latest"
 vision_timeout_s = 30

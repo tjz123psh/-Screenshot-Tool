@@ -171,7 +171,24 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 
 识别质量：`dark`（走 invert 分支）与 `banner`（ratio≥2.4 且 h≤96 → psm 7）两边都完全正确；`clean` 的 Latin 行两边都完全正确，CJK 行两边都差一个字（`长截图拼接君成` vs `长截图拼接叶成`，ground truth `长截图 拼接 完成`）；`busy` 的 Latin 行两边都正确，CJK 行两边都严重乱码。
 
-**结论：质量等价，CJK 残缺是 tesseract 与预处理管线的限制，不是移植缺陷。** 手写的形态学 CLOSE / `divide` / Otsu 与 OpenCV 在这批图上给出一致结果。
+**初版移植结论：质量等价，CJK 残缺当时是 Tesseract 与单候选预处理管线的共同限制。** 手写的形态学 CLOSE / `divide` / Otsu 与 OpenCV 在这批图上给出一致结果；下面的多场景增强复测是在这一基线上继续改进，而不是改写原测量。
+
+#### 多场景增强复测（2026-08-01）
+
+在原有 fixture 之外增加 8 张确定性 PIL 合成图，字体仍为 `SourceHanSansCN-Regular.otf`，真值统一为两行 `Vellum OCR 2026` / `暗淡彩色文字识别`。准确率先移除空白与标点，再按字符 Levenshtein 距离计算；“旧”是公开 `v0.1.0` 提交，“新”是本节实现，均为 release 构建并调用同一套 Tesseract 5.5.3 `chi_sim+eng`。
+
+| fixture | 场景 | 旧准确率 | 新准确率 | 旧耗时 | 新耗时 |
+|---|---|---:|---:|---:|---:|
+| clean | 普通浅色面板 | 100.0% | 100.0% | 591 ms | 555 ms |
+| dim-light | 浅色底上的暗淡小字 | 95.2% | **100.0%** | 646 ms | 1797 ms |
+| dim-dark | 暗色底上的暗淡字 | 100.0% | 100.0% | 554 ms | 1660 ms |
+| isoluminant | 前景/背景灰度完全相同、仅色相不同 | 4.8% | **100.0%** | 1031 ms | 3539 ms |
+| color-interference | 彩色纹理与斜线干扰 | 48.8% | **95.2%** | 698 ms | 2452 ms |
+| faded-gradient-dark | 渐变底上的半透明暗字 | 100.0% | 100.0% | 576 ms | 573 ms |
+| faded-gradient-light | 渐变底上的半透明亮字 | 4.8% | **100.0%** | 598 ms | 1664 ms |
+| faded-colored-dark | 暗色底上的低对比彩色字 | 100.0% | 100.0% | 559 ms | 1585 ms |
+
+普通 clean 与旧路径耗时相同；额外成本只在场景分析要求 CLAHE、相反极性或颜色投影时支付。所有 Tesseract 尝试共用 30 秒总 deadline，不会按候选数线性放大最坏等待。彩色强干扰 fixture 仍有 1 个 CJK 字错误，但已从包含大量噪声的 48.8% 提升到无额外噪声的 95.2%。
 
 ### 翻译
 

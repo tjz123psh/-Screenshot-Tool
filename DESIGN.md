@@ -42,7 +42,7 @@ vellum-ui      唯一链接 GTK 的 crate
 vellum-tray    托盘，只依赖 core + ipc + ksni
 ```
 
-`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 192 个测试里绝大多数不需要 Wayland 会话。
+`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 233 个测试里绝大多数不需要 Wayland 会话。
 
 合成器抽象（`vellum-core/src/compositor/`）放在 core 而不是 GTK 二进制里，因为 `doctor` 也要报告检测到的合成器 —— 一份实现不会漂移，两份会。
 
@@ -54,11 +54,11 @@ vellum-tray    托盘，只依赖 core + ipc + ksni
 
 Python 版用 numpy + OpenCV。Rust 侧改为手写：
 
-- **放弃 `opencv` crate**：拖入整个 C++ 运行时与 bindgen/clang 构建依赖，而实际用到的只有形态学 CLOSE、`divide`、Otsu 三个算子。
+- **放弃 `opencv` crate**：拖入整个 C++ 运行时与 bindgen/clang 构建依赖，而实际需要的只是形态学 CLOSE、`divide`、Otsu、CLAHE 和一个 3×3 主成分投影；这些小算子手写后仍然比引入整套 OpenCV 更容易审计。
 - **放弃 `ndarray`**：拼接热路径是「按行取切片做定长比较」，`Vec<u8>` + 手写 stride 已经足够，多一层抽象换不到可读性。
 - 保留 `image` 0.25（仅 `png` feature）做 PNG 编解码与 Lanczos 缩放，`rayon` 做行级并行。
 
-三个 OpenCV 算子在 `vellum-text/src/prep.rs` 里按 OpenCV 语义重实现（椭圆核按 `getStructuringElement(MORPH_ELLIPSE)` 的半宽公式生成，并分解为逐 dy 的滑动窗口 row-max/row-min，避免 25×25 核的 625 ops/px）。等价性由与 Python 版的并排 OCR 结果验证（`PERFORMANCE.md` §5）。
+形态学基线在 `vellum-text/src/prep.rs` 里按 OpenCV 语义重实现（椭圆核按 `getStructuringElement(MORPH_ELLIPSE)` 的半宽公式生成，并分解为逐 dy 的滑动窗口 row-max/row-min，避免 25×25 核的 625 ops/px）。其上增加按需渲染的 CLAHE、相反文字极性和 RGB 主成分/最大通道候选，用于暗淡字色、明暗渐变和等亮异色文字；实测见 `PERFORMANCE.md` §4。
 
 ### 截屏：`grim` 子进程 + PPM
 
@@ -86,7 +86,9 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 ### OCR：`tesseract` 子进程，不用 `leptess`
 
 - **放弃 `leptess`/`tesseract-sys`**：本机 leptonica 的 soname 是 `/usr/lib/libleptonica.so`，而 `tesseract-sys` 期望 `liblept.so.5`；另需 bindgen/clang 构建依赖。
-- **子进程可接受**：OCR 已在 worker 线程，结果窗口先开占位（「识别中…」），进程创建不在用户感知路径上。
+- **子进程可接受**：OCR 已在 worker 线程，结果窗口先开占位（「识别中…」），进程创建不阻塞界面。普通干净截图只跑基线；只有低置信度/低对比/异色场景才按需增加候选。
+- **质量选择不用“字越多越好”**：Tesseract 输出 TSV 置信度，vellum 按行重建文字、剔除稀疏模式找到的弱彩色边缘噪声，并在混合语言顺序之间逐行融合。所有候选共享 30 秒总时限，不能把一次 OCR 放大成多次 30 秒等待。
+- **管道必须并行排空**：PNG stdin、TSV stdout 与 stderr 同时读写；否则任一管道超过内核容量时，子进程和父进程会互相等待并被误报为超时。外部命令单独建立进程组，超时时整组终止，避免 fork 后代继承 pipe 令读取线程永久卡住。
 
 ### HTTP：`ureq` 3.3.0
 

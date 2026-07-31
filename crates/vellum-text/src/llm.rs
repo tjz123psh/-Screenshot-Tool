@@ -6,7 +6,7 @@
 //! older server must never make translation *less* reliable, so any server
 //! failure falls back to the CLI silently.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use vellum_core::config::LlmConfig;
@@ -187,7 +187,7 @@ fn translate_opencode_cli(
     cfg: &LlmConfig,
     model: &str,
 ) -> Result<String, TranslateError> {
-    let child = Command::new("opencode")
+    let child = vellum_core::proc::command("opencode")
         .args(["run", "--pure", "--format", "json", "-m", model, prompt])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
