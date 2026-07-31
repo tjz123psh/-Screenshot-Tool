@@ -1,0 +1,36 @@
+# vellum 配置示例。
+# 复制到 ~/.config/vellum/config.toml 后按需修改；所有字段都可省略。
+
+[llm]
+# opencode：优先复用本机 `opencode serve --pure --port 47823`，失败时走 CLI。
+# openai：直接调用 OpenAI Responses API，需要环境变量 OPENAI_API_KEY。
+provider = "opencode"
+model = "opencode/deepseek-v4-flash-free"
+target_lang = "简体中文"
+timeout_s = 30
+serve_port = 47823
+
+# 仅当上一个模型被上游明确拒绝时依次尝试；网络错误不会遍历整组。
+# 设为空数组可禁用模型轮换。
+fallback_models = [
+  "opencode/nemotron-3-ultra-free",
+  "opencode/ling-3.0-flash-free",
+  "opencode/north-mini-code-free",
+  "opencode/mimo-v2.5-free",
+  "opencode/laguna-s-2.1-free",
+]
+
+[ocr]
+# "tesseract" 默认走本地识别；"vision" 先尝试视觉模型，失败回退本地。
+engine = "tesseract"
+langs = "chi_sim+eng"
+preprocess = true
+upscale = 3.0
+vision_model = "google/gemini-flash-latest"
+vision_timeout_s = 30
+
+[longshot]
+# 这些是经过回归测试和实机验证的生产阈值，通常不建议修改。
+poll_ms = 0
+min_shift_px = 4
+max_diff = 9.0

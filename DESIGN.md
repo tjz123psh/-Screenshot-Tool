@@ -24,7 +24,7 @@
 
 ### 命名空间隔离
 
-Python 版仍是用户的日常工具，其 `pngshot.service` 持续占用 `$XDG_RUNTIME_DIR/pngshot/control.sock`。vellum 全套独立命名：socket/lock 在 `$XDG_RUNTIME_DIR/vellum/`（可用 `VELLUM_RUNTIME_DIR` 覆盖）、unit 名 `vellum.service`/`vellum-tray.service`、配置 `~/.config/vellum/config.toml`。`paths.rs` 有一个断言 socket 路径不含 `/pngshot/` 的测试，防止将来 sed 类改动把两者合并。
+vellum 使用独立且稳定的命名空间：socket/lock 在 `$XDG_RUNTIME_DIR/vellum/`（可用 `VELLUM_RUNTIME_DIR` 覆盖）、unit 名 `vellum.service`/`vellum-tray.service`、配置 `~/.config/vellum/config.toml`。它不复用旧 Python `pngshot` 的运行期路径，避免升级或迁移时发生 socket 与服务冲突；`paths.rs` 有断言防止未来误合并。
 
 `~/.config/pngshot/config.toml` 作为**只读**回退（用户已有配置可直接生效），vellum 永不写入它。
 

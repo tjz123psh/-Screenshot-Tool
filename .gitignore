@@ -6,3 +6,6 @@
 # Local checkpoint for long-running Codex work; may contain private runtime
 # paths and verification notes, so it must never enter version control.
 /HANDOFF.md
+
+# Personal Codex working agreements contain workstation-specific paths.
+/AGENTS.md

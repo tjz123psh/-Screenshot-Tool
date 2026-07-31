@@ -12,7 +12,7 @@ members = [
 
 [workspace.package]
 # Fresh version line: vellum is a rewrite, not a continuation of the Python
-# release series, and it must not be published to the predecessor's remote.
+# release series.
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"

@@ -1,10 +1,10 @@
 //! XDG paths for vellum.
 //!
-//! IMPORTANT: the Python predecessor (pngshot) is still the user's daily tool
-//! and owns `$XDG_RUNTIME_DIR/pngshot/control.sock` plus `pngshot.service`.
-//! Vellum therefore uses its own `vellum` namespace everywhere so both can run
-//! side by side. `VELLUM_RUNTIME_DIR` overrides the socket directory for tests
-//! and for running two instances.
+//! Vellum uses its own `vellum` namespace for runtime state, services and
+//! configuration. It never reuses the retired Python `pngshot` socket, so an
+//! upgrade or leftover process cannot collide with the Rust service.
+//! `VELLUM_RUNTIME_DIR` overrides the socket directory for tests and isolated
+//! parallel instances.
 
 use std::path::PathBuf;
 
@@ -95,8 +95,8 @@ mod tests {
 
     #[test]
     fn runtime_dir_is_namespaced_away_from_the_python_version() {
-        // pngshot.service owns .../pngshot/control.sock and is still running on
-        // this machine; sharing that path would break the user's daily tool.
+        // Keep the retired Python service namespace separate so stale
+        // installations cannot collide with vellum.
         let text = socket_path().to_string_lossy().into_owned();
         assert!(
             text.contains(NAMESPACE),
