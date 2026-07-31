@@ -21,8 +21,8 @@ use crate::canvas::{Canvas, Side};
 use crate::fixed_regions::FixedRegionDetector;
 use crate::offline::{self, KEYFRAME_MEMORY_LIMIT, Keyframe, KeyframeReason, OfflineCtx};
 use crate::scoring::{
-    Mask, col_diff, is_false_motion, pixel_change_fraction, pixel_overlap_diff, robust_col_diff,
-    robust_pixel_overlap_diff,
+    MIN_CHANGED_FRACTION, Mask, col_diff, is_false_motion, pixel_change_fraction,
+    pixel_overlap_diff, robust_col_diff, robust_pixel_overlap_diff,
 };
 use crate::signature::{
     Cols, Sparse, compute_cols, effective_min_overlap, frame_signature, is_duplicate,
@@ -70,6 +70,7 @@ struct Candidate {
     history_index: usize,
     false_motion: bool,
     robust: bool,
+    changed: f32,
 }
 
 pub struct Stitcher {
@@ -239,6 +240,7 @@ impl Stitcher {
                     history_index: index,
                     false_motion: false,
                     robust,
+                    changed: 0.0,
                 });
                 continue;
             }
@@ -267,6 +269,7 @@ impl Stitcher {
                 history_index: index,
                 false_motion,
                 robust,
+                changed,
             });
             if good {
                 break;
@@ -282,13 +285,14 @@ impl Stitcher {
             })
             .min_by(|a, b| a.diff.total_cmp(&b.diff));
 
-        let (diff, shift, position, recovered, had_valid) = match valid_best {
+        let (diff, shift, position, recovered, had_valid, changed) = match valid_best {
             Some(best) => (
                 best.diff,
                 best.shift,
                 best.position,
                 best.robust || best.history_index != 0,
                 true,
+                best.changed,
             ),
             None => {
                 let fallback = matches
@@ -301,6 +305,7 @@ impl Stitcher {
                     fallback.position,
                     false,
                     false,
+                    fallback.changed,
                 )
             }
         };
@@ -332,10 +337,20 @@ impl Stitcher {
             // shape, a band wider than 45% of the axis is refused, and an
             // all-unchanged observation (the user simply paused) is cleared
             // instead of being read as "the whole viewport is chrome".
-            self.observe_fixed_regions(&pixels);
+            if changed >= MIN_CHANGED_FRACTION {
+                self.observe_fixed_regions(&pixels);
+            }
             return diff;
         }
         if !had_valid {
+            // A low row-signature score can still be rejected by the sparse RGB
+            // gate (for example when a large viewport-fixed band favours a wrong
+            // non-zero offset). Only a pair with meaningful changed-pixel
+            // evidence is allowed to warm the detector; a tiny local animation
+            // must not become viewport-fixed chrome.
+            if shift.unsigned_abs() >= self.min_shift_px && changed >= MIN_CHANGED_FRACTION {
+                self.observe_fixed_regions(&pixels);
+            }
             self.last_shift = 0;
             self.last_diff = diff;
             return diff;
@@ -468,9 +483,9 @@ impl Stitcher {
     ///
     /// The pair is always "newest tracked frame" against `pixels`, so the
     /// detector sees the same transition regardless of whether the frame was
-    /// ultimately accepted. Called from both the accept path and the
-    /// "confident but did not move" path; see the comment at the latter for why
-    /// the rejected case matters.
+    /// ultimately accepted. Called from the accept path and from both confident
+    /// rejection paths (tiny shift or sparse-RGB false motion); otherwise a large
+    /// fixed band can prevent the detector from ever completing its warm-up.
     fn observe_fixed_regions(&mut self, pixels: &Arc<Sparse>) {
         if let (Some(detector), Some(newest)) = (self.fixed_regions.as_mut(), self.history.back()) {
             detector.observe(&newest.pixels, pixels);

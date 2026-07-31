@@ -19,6 +19,10 @@ use crate::signature::{
 pub const MAX_PIXEL_DIFF: f32 = 32.0;
 /// Absolute sparse-RGB MAD limit on the robust path (stricter: rows were dropped).
 pub const ROBUST_MAX_PIXEL_DIFF: f32 = 24.0;
+/// Minimum fraction of sparse pixels that must change before a candidate can
+/// count as real motion. Shared by matching and fixed-region warm-up so the two
+/// gates cannot drift apart.
+pub const MIN_CHANGED_FRACTION: f32 = 0.012;
 /// Offline fusion treats larger per-channel deltas as local animation, not as
 /// translucent background to be blended.
 pub const FUSION_MAX_PIXEL_DELTA: i16 = 48;
@@ -312,7 +316,7 @@ pub fn is_false_motion(aligned: f32, stationary: f32, changed: f32, robust: bool
     } else {
         MAX_PIXEL_DIFF
     };
-    changed < 0.012 || stationary <= aligned + 0.2 || aligned > limit
+    changed < MIN_CHANGED_FRACTION || stationary <= aligned + 0.2 || aligned > limit
 }
 
 #[cfg(test)]
@@ -470,7 +474,10 @@ mod tests {
             is_false_motion(1.0, 1.1, 0.5, false),
             "stationary <= aligned+0.2"
         );
-        assert!(is_false_motion(1.0, 50.0, 0.005, false), "changed < 0.012");
+        assert!(
+            is_false_motion(1.0, 50.0, MIN_CHANGED_FRACTION / 2.0, false),
+            "changed below the shared floor"
+        );
         assert!(is_false_motion(33.0, 90.0, 0.5, false), "aligned > 32");
         assert!(!is_false_motion(25.0, 90.0, 0.5, false));
         // The robust path is stricter on absolute pixel agreement.

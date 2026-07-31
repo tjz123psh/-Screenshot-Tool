@@ -372,28 +372,77 @@ fn sub_threshold_scrolling_accumulates_instead_of_stalling() {
     assert!(mean_abs_diff(&result.image, &expected) < 1.0);
 }
 
-/// A large viewport-fixed band must not collapse the capture to a single frame.
-///
-/// This is the regression for a real deadlock. A region that never scrolls
-/// (window chrome, or vellum's own long-shot panel when it overlaps the sampled
-/// area) matches *perfectly* at offset zero, which drags the score minimum to
-/// "the view did not move". The frame is then rejected on the `min_shift_px`
-/// branch — note it is rejected for zero shift, not for low confidence, so
-/// raising `max_diff` would not help and must not be attempted.
-///
-/// The fixed-region detector exists to cancel exactly this, but it was only fed
-/// on *accepted* frames, so it could never reach its three-observation warm-up:
-/// the condition it cancels was the condition preventing it from learning. The
-/// result was a file exactly one viewport tall.
-///
-/// The assertion is deliberately "much more than one viewport" rather than the
-/// exact height: with a band this large the warm-up frames are still dropped, so
-/// some content is legitimately lost. Pinning an exact height here would encode
-/// that incidental loss as required behaviour.
 #[test]
-fn a_large_fixed_band_does_not_collapse_the_capture() {
+fn a_narrow_static_animation_must_not_be_learned_as_fixed_footer() {
     let src = page(PAGE_W, 1200);
-    let band = 96; // 40% of the viewport, inside the detector's 45% ceiling.
+    let mut frames = Vec::new();
+    // The page is paused while a one-pixel, full-width loading rule moves near
+    // the bottom edge.  These frames must exercise the false-motion/tiny-shift
+    // rejection path without teaching the detector that the lower page rows
+    // are viewport-fixed chrome.
+    for tick in 0..6usize {
+        let mut frame = viewport(&src, 60, VIEW_H);
+        let y = 200 + tick;
+        let row = frame.row_mut(y);
+        for px in row.chunks_exact_mut(3) {
+            px.copy_from_slice(&[30, 120, 220]);
+        }
+        frames.push(frame);
+    }
+    // One real scroll follows immediately; result() must therefore exercise
+    // the offline graph, not merely return the online canvas.
+    frames.push(viewport(&src, 80, VIEW_H));
+
+    let mut st = stitcher();
+    let mut diffs = Vec::new();
+    let mut shifts = Vec::new();
+    for frame in &frames {
+        diffs.push(st.add(frame));
+        shifts.push(st.last_shift);
+    }
+    let animation_transitions = 1..frames.len() - 1;
+    assert!(
+        diffs[animation_transitions.clone()]
+            .iter()
+            .all(|diff| *diff <= DEFAULT_MAX_DIFF),
+        "the local animation should be rejected as false motion, not as a low-confidence match: {diffs:?}"
+    );
+    assert!(
+        shifts[animation_transitions]
+            .iter()
+            .all(|shift| shift.unsigned_abs() < DEFAULT_MIN_SHIFT_PX),
+        "the animation transitions did not exercise the tiny/false-motion rejection path: {shifts:?}"
+    );
+    assert_eq!(
+        shifts.last().copied(),
+        Some(20),
+        "the final frame must exercise real scrolling after the rejected animation"
+    );
+    let result = st.result().expect("stitch succeeded");
+    assert!(
+        result.rebuilt,
+        "expected the offline rebuild path to be exercised"
+    );
+    assert_eq!(
+        result.image.height,
+        VIEW_H + 20,
+        "a short scroll after a local animation must retain the full span"
+    );
+    let expected = viewport(&src, 60, VIEW_H + 20);
+    // The first six frames contain the transient rule; compare the rest of the
+    // page, including the final tail, where a false fixed-footer band is most
+    // visible.
+    let diff = interior_diff(&result.image, &expected, 0, 0, (0, 0));
+    assert!(
+        diff < 1.0,
+        "offline rebuild copied a false fixed footer: {diff}"
+    );
+}
+
+/// Assert that learning a large viewport-fixed footer preserves every observed
+/// scroll row, including the detector's three-transition warm-up.
+fn assert_fixed_footer_preserves_full_span(band: usize) {
+    let src = page(PAGE_W, 1200);
     let frames: Vec<Rgb8> = (0..21)
         .map(|i| {
             let mut frame = viewport(&src, i * 20, VIEW_H);
@@ -405,14 +454,88 @@ fn a_large_fixed_band_does_not_collapse_the_capture() {
     let mut st = stitcher();
     feed(&mut st, &frames);
     let result = st.result().expect("stitch succeeded");
+    let expected_height = VIEW_H + 20 * 20;
 
     assert!(
         st.frames_used > 1,
         "capture collapsed to the seed frame: the detector never learned the band"
     );
-    assert!(
-        result.image.height > VIEW_H * 2,
-        "output {} px is barely one viewport; expected the scroll to accumulate",
-        result.image.height
+    assert_eq!(
+        result.image.height, expected_height,
+        "fixed-band warm-up lost part of the observed scroll"
     );
+    let expected = viewport(&src, 0, expected_height);
+    let diff = interior_diff(&result.image, &expected, 0, band, (0, 0));
+    assert!(
+        diff < 6.0,
+        "content above the {band}px fixed footer drifted after warm-up recovery: {diff}"
+    );
+}
+
+#[test]
+fn a_thirty_percent_fixed_band_preserves_the_full_span() {
+    assert_fixed_footer_preserves_full_span(VIEW_H * 30 / 100);
+}
+
+/// A 40% fixed footer used to prefer a wrong non-zero row-signature candidate.
+/// Sparse RGB correctly rejected that candidate as false motion, but the rejected
+/// pair was not fed to the fixed-region detector. Its warm-up therefore happened
+/// too late and the completed image lost exactly the footer's 96px height.
+#[test]
+fn a_large_fixed_band_recovers_the_warmup_span() {
+    assert_fixed_footer_preserves_full_span(VIEW_H * 40 / 100);
+}
+
+/// A 2px sampling cadence is below `min_shift_px=4`. With a 40% fixed footer,
+/// the score therefore stays on the confident tiny-shift branch during detector
+/// warm-up. Requiring a minimum shift before observing that branch is a
+/// contradictory gate and loses the first 62px of the captured page.
+#[test]
+fn a_large_fixed_footer_preserves_sub_threshold_warmup_scrolls() {
+    let src = page(PAGE_W, 1200);
+    let band = VIEW_H * 40 / 100;
+    let step = 2usize;
+    let count = 41usize;
+    let frames: Vec<Rgb8> = (0..count)
+        .map(|i| {
+            let mut frame = viewport(&src, i * step, VIEW_H);
+            paint_band(&mut frame, VIEW_H - band, VIEW_H);
+            frame
+        })
+        .collect();
+
+    let mut st = stitcher();
+    let mut tiny_rejections = 0usize;
+    for frame in &frames {
+        let diff = st.add(frame);
+        if diff <= DEFAULT_MAX_DIFF && st.last_shift.unsigned_abs() < DEFAULT_MIN_SHIFT_PX {
+            tiny_rejections += 1;
+        }
+    }
+    assert!(
+        tiny_rejections >= 3,
+        "fixture did not cover the detector's three-observation tiny-shift warm-up"
+    );
+
+    let result = st.result().expect("stitch succeeded");
+    let expected_height = VIEW_H + step * (count - 1);
+    assert!(
+        result.rebuilt,
+        "the tail keyframe should produce a validated offline rebuild"
+    );
+    assert_eq!(
+        result.image.height, expected_height,
+        "sub-threshold fixed-footer warm-up lost observed page rows"
+    );
+    let expected = viewport(&src, 0, expected_height);
+    let diff = interior_diff(&result.image, &expected, 0, band, (0, 0));
+    assert!(
+        diff < 1.0,
+        "sub-threshold fixed-footer rebuild drifted from page content: {diff}"
+    );
+}
+
+#[test]
+fn a_fixed_band_at_the_detector_ceiling_preserves_the_full_span() {
+    assert_fixed_footer_preserves_full_span(VIEW_H * 45 / 100);
 }

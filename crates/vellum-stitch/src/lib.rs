@@ -36,7 +36,9 @@ pub mod signature;
 pub mod stitcher;
 
 pub use fixed_regions::{FixedBands, FixedRegionDetector};
-pub use scoring::{FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, ROBUST_MAX_PIXEL_DIFF};
+pub use scoring::{
+    FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, MIN_CHANGED_FRACTION, ROBUST_MAX_PIXEL_DIFF,
+};
 pub use stitcher::{StitchResult, Stitcher, stitch_frames};
 
 /// Default acceptance threshold for the row-signature overlap diff. This is a
