@@ -66,18 +66,25 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
         || vec![prep::CandidateKind::Baseline],
         prep::Preparation::kinds,
     );
+    let trace = std::env::var("VELLUM_OCR_TRACE").as_deref() == Ok("1");
+    let trace_started = Instant::now();
+    if trace {
+        eprintln!("[vellum-ocr] candidate-order={kinds:?}");
+    }
     // Layout is a property of the selected crop, not of its 3x OCR pixels. In
     // particular a 70 px banner must still select single-line PSM 7 after
     // preprocessing scales it above the old 96 px threshold.
     let psm = layout_psm(image);
     let checks_local_contrast = kinds.contains(&prep::CandidateKind::LocalContrast);
     let mut best: Option<(f32, TesseractResult)> = None;
+    let mut best_kind = None;
     let mut first_error = None;
 
     for kind in kinds {
         if deadline.checked_duration_since(Instant::now()).is_none() {
             break;
         }
+        let candidate_started = Instant::now();
         let prepared = preparation
             .as_ref()
             .map_or_else(|| image.clone(), |plan| plan.render(kind));
@@ -87,10 +94,39 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
         let payload = prepared
             .to_png()
             .map_err(|e| OcrError::Failed(format!("failed to encode image for OCR: {e}")))?;
+        let preparation_elapsed = candidate_started.elapsed();
         let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
             break;
         };
-        let mut attempt = match run_tesseract(&payload, &cfg.langs, psm, timeout) {
+        let alternate_langs = (kind == prep::CandidateKind::LocalContrast)
+            .then(|| alternate_language_order(&cfg.langs))
+            .flatten();
+        let (primary, primary_elapsed, alternate_language) =
+            if let Some(alternate_langs) = alternate_langs.as_deref() {
+                std::thread::scope(|scope| {
+                    let alternate = scope.spawn(|| {
+                        let started = Instant::now();
+                        let result = run_tesseract(&payload, alternate_langs, psm, timeout);
+                        (result, started.elapsed())
+                    });
+                    let started = Instant::now();
+                    let primary = run_tesseract(&payload, &cfg.langs, psm, timeout);
+                    let primary_elapsed = started.elapsed();
+                    let alternate = Some(match alternate.join() {
+                        Ok(result) => result,
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    });
+                    (primary, primary_elapsed, alternate)
+                })
+            } else {
+                let started = Instant::now();
+                (
+                    run_tesseract(&payload, &cfg.langs, psm, timeout),
+                    started.elapsed(),
+                    None,
+                )
+            };
+        let mut attempt = match primary {
             Ok(attempt) => attempt,
             Err(err @ OcrError::Missing(_)) => return Err(err),
             Err(err) => {
@@ -100,40 +136,70 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
                 continue;
             }
         };
+        if trace {
+            eprintln!(
+                "[vellum-ocr] kind={kind:?} prep_ms={} psm={psm} tess_ms={} conf={:.1} chars={} low={} noise={}",
+                preparation_elapsed.as_millis(),
+                primary_elapsed.as_millis(),
+                attempt.confidence,
+                attempt.meaningful_chars,
+                attempt.low_confidence_chars,
+                attempt.isolated_noise_lines,
+            );
+        }
 
         // Sparse mode is easily distracted by colored rules and wallpaper;
         // block mode is the useful second opinion. Conversely an actual sparse
         // crop can rescue a low-confidence block result.
-        if attempt.confidence < RETRY_CONFIDENCE || attempt.meaningful_chars < 3 {
+        if should_retry_layout(&attempt, psm) {
             let alternate = if psm == 6 { 11 } else { 6 };
-            if let Some(timeout) = deadline.checked_duration_since(Instant::now())
-                && let Ok(other) = run_tesseract(&payload, &cfg.langs, alternate, timeout)
-                && result_score(&other, kind) > result_score(&attempt, kind)
-            {
-                attempt = other;
+            if let Some(timeout) = deadline.checked_duration_since(Instant::now()) {
+                let alternate_started = Instant::now();
+                if let Ok(other) = run_tesseract(&payload, &cfg.langs, alternate, timeout) {
+                    if trace {
+                        eprintln!(
+                            "[vellum-ocr] kind={kind:?} alternate_psm={alternate} tess_ms={} conf={:.1} chars={}",
+                            alternate_started.elapsed().as_millis(),
+                            other.confidence,
+                            other.meaningful_chars,
+                        );
+                    }
+                    if result_score(&other, kind) > result_score(&attempt, kind) {
+                        attempt = other;
+                    }
+                }
             }
         }
 
         // Combined Tesseract models are order-sensitive. On faded mixed-script
         // text the secondary model can recover a glyph that the nominal primary
-        // model is confidently wrong about. Restrict this extra call to the
-        // low-contrast candidate and keep it only when its own confidence wins.
-        if kind == prep::CandidateKind::LocalContrast
-            && let Some(alternate_langs) = alternate_language_order(&cfg.langs)
-            && let Some(timeout) = deadline.checked_duration_since(Instant::now())
-            && let Ok(other) = run_tesseract(&payload, &alternate_langs, psm, timeout)
-        {
+        // model is confidently wrong about. It runs beside the primary local-
+        // contrast attempt, so the quality check costs CPU but not a second
+        // model-initialisation wait on the user-facing path.
+        if let Some((Ok(other), alternate_elapsed)) = alternate_language {
+            if trace {
+                eprintln!(
+                    "[vellum-ocr] kind={kind:?} alternate_lang_order tess_ms={} conf={:.1} chars={}",
+                    alternate_elapsed.as_millis(),
+                    other.confidence,
+                    other.meaningful_chars,
+                );
+            }
             let merged = merge_language_results(&attempt, &other);
             if result_score(&merged, kind) > result_score(&attempt, kind) {
                 attempt = merged;
             }
         }
 
+        let corroborates_best = best
+            .as_ref()
+            .is_some_and(|(_, current_best)| results_agree(current_best, &attempt));
         let score = result_score(&attempt, kind);
         if best
             .as_ref()
             .is_none_or(|(best_score, _)| score > *best_score)
         {
+            best_kind = Some(kind);
             best = Some((score, attempt));
         }
 
@@ -148,11 +214,19 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
                 && result.low_confidence_chars == 0
                 && result.isolated_noise_lines == 0
         });
-        if strong && !(kind == prep::CandidateKind::Baseline && checks_local_contrast) {
+        if (strong || corroborates_best)
+            && !(kind == prep::CandidateKind::Baseline && checks_local_contrast)
+        {
             break;
         }
     }
 
+    if trace {
+        eprintln!(
+            "[vellum-ocr] selected={best_kind:?} total_ms={}",
+            trace_started.elapsed().as_millis()
+        );
+    }
     match best {
         Some((_, result)) if !result.text.trim().is_empty() => Ok(cleanup(&result.text)),
         Some(_) => Err(OcrError::Empty("tesseract returned no text".into())),
@@ -164,6 +238,20 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
             }
         })),
     }
+}
+
+fn should_retry_layout(result: &TesseractResult, psm: u8) -> bool {
+    (result.confidence < RETRY_CONFIDENCE || result.meaningful_chars < 3)
+        // Several isolated sparse-mode lines mean the candidate itself is
+        // dominated by clutter. Block mode tends to merge that clutter into a
+        // large, slow paragraph rather than recover text; another preprocessing
+        // candidate is the useful fallback instead. The reverse direction stays
+        // enabled: sparse mode can still rescue a noisy low-confidence block.
+        && !(psm == 11 && result.isolated_noise_lines > 2)
+}
+
+fn results_agree(a: &TesseractResult, b: &TesseractResult) -> bool {
+    a.meaningful_chars >= 3 && b.meaningful_chars >= 3 && cleanup(&a.text) == cleanup(&b.text)
 }
 
 #[derive(Debug, Clone)]
@@ -716,6 +804,37 @@ mod tests {
         text: &str,
     ) -> String {
         format!("5\t1\t1\t1\t{line}\t1\t{left}\t{top}\t{width}\t{height}\t{confidence}\t{text}\n")
+    }
+
+    fn result(text: &str, confidence: f32, chars: usize, noise: usize) -> TesseractResult {
+        TesseractResult {
+            text: text.to_string(),
+            confidence,
+            meaningful_chars: chars,
+            trusted_chars: chars,
+            low_confidence_chars: 0,
+            isolated_noise_lines: noise,
+            lines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn noisy_sparse_results_move_to_another_candidate_instead_of_block_retry() {
+        assert!(!should_retry_layout(&result("noisy text", 55.0, 10, 4), 11));
+        assert!(should_retry_layout(&result("faded text", 55.0, 10, 1), 11));
+    }
+
+    #[test]
+    fn noisy_block_results_still_try_sparse_layout() {
+        assert!(should_retry_layout(&result("noisy text", 55.0, 10, 4), 6));
+    }
+
+    #[test]
+    fn independent_candidates_can_confirm_the_same_text() {
+        let first = result("暗 淡 文字", 90.0, 4, 0);
+        let second = result("暗淡文字", 82.0, 4, 0);
+        assert!(results_agree(&first, &second));
+        assert!(!results_agree(&first, &result("暗淡文宇", 82.0, 4, 0)));
     }
 
     #[test]

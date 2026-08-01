@@ -824,18 +824,31 @@ impl<'a> Preparation<'a> {
     }
 
     pub(crate) fn kinds(&self) -> Vec<CandidateKind> {
+        let wants_color = self.chroma >= COLORFUL_CHROMA
+            || self.channel_range > self.luma_range.saturating_add(20);
+        let isoluminant = self.is_isoluminant();
         let mut kinds = vec![CandidateKind::Baseline];
+        // When grayscale has almost no range but one color axis clearly does,
+        // another grayscale pass cannot be the useful second opinion. Move the
+        // color projection ahead of CLAHE/opposite-polarity candidates while
+        // retaining baseline as the cheap sanity check.
+        if wants_color && isoluminant {
+            kinds.push(CandidateKind::ColorContrast);
+        }
         if self.luma_range < LOW_CONTRAST_RANGE {
             kinds.push(CandidateKind::LocalContrast);
+        }
+        if wants_color && !isoluminant {
+            kinds.push(CandidateKind::ColorContrast);
         }
         if self.busy {
             kinds.push(CandidateKind::OppositePolarity);
         }
-        if self.chroma >= COLORFUL_CHROMA || self.channel_range > self.luma_range.saturating_add(20)
-        {
-            kinds.push(CandidateKind::ColorContrast);
-        }
         kinds
+    }
+
+    fn is_isoluminant(&self) -> bool {
+        self.luma_range < 40 && self.channel_range > self.luma_range.saturating_add(32)
     }
 
     /// Render on demand. OCR often accepts the baseline immediately, so the
@@ -855,9 +868,7 @@ impl<'a> Preparation<'a> {
                 busy_candidate(&opposite, self.factor)
             }
             CandidateKind::ColorContrast => {
-                let isoluminant =
-                    self.luma_range < 40 && self.channel_range > self.luma_range.saturating_add(32);
-                let color = if isoluminant {
+                let color = if self.is_isoluminant() {
                     principal_color_gray(self.source)
                 } else {
                     max_channel(self.source)
@@ -1032,7 +1043,40 @@ mod tests {
         assert!(robust_range(&principal_color_gray(&image)) > 200);
 
         let plan = Preparation::new(&image, 1.0);
-        assert!(plan.kinds().contains(&CandidateKind::ColorContrast));
+        let kinds = plan.kinds();
+        assert!(kinds.contains(&CandidateKind::ColorContrast));
+        assert_eq!(
+            &kinds[..2],
+            &[CandidateKind::Baseline, CandidateKind::ColorContrast],
+            "hue-only contrast should be tried before grayscale fallbacks"
+        );
+    }
+
+    #[test]
+    fn a_colorful_busy_scene_tries_color_before_opposite_polarity() {
+        let (width, height) = (96usize, 72usize);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for y in 0..height {
+            for x in 0..width {
+                data.extend_from_slice(&[
+                    ((x * 17 + y * 3) % 256) as u8,
+                    ((x * 5 + y * 19) % 256) as u8,
+                    ((x * 11 + y * 7) % 256) as u8,
+                ]);
+            }
+        }
+        let image = Rgb8::from_raw(width, height, data);
+        let plan = Preparation::new(&image, 1.0);
+        let kinds = plan.kinds();
+        let color = kinds
+            .iter()
+            .position(|kind| *kind == CandidateKind::ColorContrast)
+            .expect("color candidate");
+        let opposite = kinds
+            .iter()
+            .position(|kind| *kind == CandidateKind::OppositePolarity)
+            .expect("opposite-polarity candidate");
+        assert!(color < opposite);
     }
 
     #[test]
