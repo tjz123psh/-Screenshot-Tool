@@ -54,7 +54,35 @@ REQUIRED_PACKAGES=(
 
 if [[ "${VELLUM_SKIP_PACKAGES:-0}" != "1" ]]; then
     if command -v pacman >/dev/null; then
-        mapfile -t missing_system < <(pacman -T "${REQUIRED_PACKAGES[@]}" 2>/dev/null || true)
+        # `pacman -T` uses 127 specifically for unsatisfied dependencies.
+        # Any other non-zero status means the query itself failed (database,
+        # permissions, corrupt config) and must not be reported as "all ready".
+        package_query_stderr_file=$(mktemp "${TMPDIR:-/tmp}/vellum-pacman-query.XXXXXX") \
+            || die "无法创建 pacman 依赖查询临时文件"
+        if package_query=$(pacman -T "${REQUIRED_PACKAGES[@]}" 2> "$package_query_stderr_file"); then
+            package_query_status=0
+        else
+            package_query_status=$?
+        fi
+        package_query_stderr=$(< "$package_query_stderr_file")
+        rm -f -- "$package_query_stderr_file"
+
+        case "$package_query_status" in
+            0) missing_system=() ;;
+            127)
+                if [[ -z "$package_query" ]]; then
+                    die "依赖查询失败：pacman -T 未返回缺失包${package_query_stderr:+（$package_query_stderr）}"
+                fi
+                mapfile -t missing_system <<< "$package_query"
+                ;;
+            *)
+                package_query_detail="${package_query_stderr:-$package_query}"
+                die "依赖查询失败（pacman -T 状态 $package_query_status）${package_query_detail:+：$package_query_detail}"
+                ;;
+        esac
+        if [[ -n "$package_query_stderr" ]]; then
+            warn "pacman -T：$package_query_stderr"
+        fi
         if ((${#missing_system[@]})); then
             info "检测到缺失依赖，准备安装：${missing_system[*]}"
             if [[ $EUID -eq 0 ]]; then
@@ -79,7 +107,7 @@ command -v cargo >/dev/null || die "需要 cargo，请先安装：sudo pacman -S
 
 # --- 1. Build -------------------------------------------------------------
 info "构建 release 二进制（首次构建需要几分钟）"
-cargo build --release --manifest-path "$SRC_DIR/Cargo.toml" \
+cargo build --locked --release --manifest-path "$SRC_DIR/Cargo.toml" \
     || die "构建失败"
 for bin in "${BINARIES[@]}"; do
     [[ -x "$SRC_DIR/target/release/$bin" ]] || die "构建产物缺失：$bin"

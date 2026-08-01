@@ -45,6 +45,9 @@ jobs:
       - name: Check installer syntax
         run: bash -n install.sh
 
+      - name: Test installer dependency failures
+        run: bash tests/install-dependency-query.sh
+
       - name: Check whitespace
         run: |
           if git grep -nI -E '[[:blank:]]+$' -- .; then
