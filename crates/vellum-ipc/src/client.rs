@@ -160,6 +160,9 @@ fn spawn_daemon() -> std::io::Result<()> {
     command
         .arg("daemon")
         .env(crate::protocol::BYPASS_ENV, "1")
+        // Trace is request-scoped. A one-off opt-in that happened to start the
+        // fallback daemon must not leak into every later long-shot process.
+        .env_remove(vellum_core::longshot_trace::TRACE_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

@@ -12,7 +12,7 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 
 /// Bumped whenever CSS changes so a long-lived display reloads it.
-const CSS_VERSION: u32 = 2;
+const CSS_VERSION: u32 = 3;
 
 thread_local! {
     static INSTALLED: RefCell<HashSet<(usize, u32)>> = RefCell::new(HashSet::new());
@@ -31,8 +31,50 @@ const CSS: &str = r#"
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
+/* The last-resort edge rail spends its pixels on reachable controls instead of
+   a shadow gutter. Its Wayland allocation is safety-checked before capture. */
+.vellum-card.vellum-micro {
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+.vellum-micro-rail {
+  min-width: 0;
+  min-height: 0;
+}
+
+.vellum-card.vellum-micro button {
+  min-height: 26px;
+  border-radius: 8px;
+  padding: 4px 10px;
+}
+
 .vellum-title {
   font-size: 17px;
+  font-weight: 700;
+}
+
+.vellum-status-copy {
+  color: rgba(242, 244, 248, 0.84);
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.vellum-section-label {
+  color: rgba(232, 236, 245, 0.58);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.vellum-motion-value {
+  color: #b9c8ff;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.vellum-progress-value {
+  color: #f2f4f8;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -80,7 +122,12 @@ const CSS: &str = r#"
 }
 
 .vellum-preview {
-  border-radius: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.vellum-seam-track {
+  border-radius: 4px;
 }
 
 .vellum-text-shell {
@@ -175,7 +222,8 @@ button.vellum-icon-button {
 
 .vellum-highlight-edge {
   background-color: rgba(100, 132, 232, 0.96);
-  box-shadow: 0 0 8px rgba(100, 132, 232, 0.55);
+  /* A shadow can expand a 4px edge surface back across the sampled rect. */
+  box-shadow: none;
 }
 "#;
 

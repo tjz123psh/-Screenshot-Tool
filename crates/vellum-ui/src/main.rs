@@ -23,6 +23,7 @@ mod paint;
 mod pin;
 mod recorder;
 mod result;
+mod screencopy;
 mod selector;
 mod surface;
 mod theme;
@@ -42,6 +43,7 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use vellum_core::capture::CaptureError;
+use vellum_core::longshot_trace::{LongshotTrace, TraceField};
 use vellum_core::{Config, Rgb8};
 
 use recorder::Recorder;
@@ -123,10 +125,16 @@ fn dispatch(args: &[String]) -> anyhow::Result<i32> {
         return Ok(1);
     };
     let flags = OutputFlags::parse(&args[1..]);
+    let daemon_managed = std::env::var(vellum_core::DAEMON_MANAGED_ENV).as_deref() == Ok("1");
 
     match action {
-        "region" => run_region(flags, false),
-        "long" => run_region(flags, true),
+        "region" => run_region(flags, false, false, LongshotTrace::default()),
+        "long" => run_region(
+            flags,
+            true,
+            daemon_managed,
+            LongshotTrace::from_args("ui", &args[1..]),
+        ),
         "debug-capture" => debug_capture(flags),
         "pin-last" => Ok(pin::run_from_clipboard()),
         "pin-file" => {
@@ -218,11 +226,36 @@ type PendingCapture = std::thread::JoinHandle<Result<Rgb8, CaptureError>>;
 /// hotkey pay the sum; overlapping them makes it pay the larger of the two.
 /// Nothing races: the overlay cannot be drawn before `activate`, which is where
 /// the frame is collected.
-fn run_region(flags: OutputFlags, long_shot: bool) -> anyhow::Result<i32> {
+fn run_region(
+    flags: OutputFlags,
+    long_shot: bool,
+    daemon_managed: bool,
+    longshot_trace: LongshotTrace,
+) -> anyhow::Result<i32> {
+    longshot_trace.emit("ui_started", &[("long_shot", TraceField::Bool(long_shot))]);
+    longshot_trace.emit("overlay_background_capture_started", &[]);
     trace::mark("capture-start");
-    let capture = std::thread::spawn(|| {
+    let capture_trace = longshot_trace.clone();
+    let capture = std::thread::spawn(move || {
         let frame = vellum_core::capture::grab_full();
         trace::mark("capture-done");
+        match &frame {
+            Ok(image) => capture_trace.emit(
+                "overlay_background_capture_finished",
+                &[
+                    ("ok", TraceField::Bool(true)),
+                    ("width", TraceField::U64(image.width as u64)),
+                    ("height", TraceField::U64(image.height as u64)),
+                ],
+            ),
+            Err(error) => capture_trace.emit(
+                "overlay_background_capture_finished",
+                &[
+                    ("ok", TraceField::Bool(false)),
+                    ("error_kind", TraceField::Static(capture_error_kind(error))),
+                ],
+            ),
+        }
         frame
     });
 
@@ -232,7 +265,13 @@ fn run_region(flags: OutputFlags, long_shot: bool) -> anyhow::Result<i32> {
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    let session = Rc::new(Session::new(capture, flags, long_shot));
+    let session = Rc::new(Session::new(
+        capture,
+        flags,
+        long_shot,
+        daemon_managed,
+        longshot_trace,
+    ));
     let activate = session.clone();
     app.connect_activate(move |app| activate.start(app));
 
@@ -241,12 +280,68 @@ fn run_region(flags: OutputFlags, long_shot: bool) -> anyhow::Result<i32> {
     Ok(session.exit_code.get())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiStartFailure {
+    BackgroundCapture,
+    OverlayPresent,
+}
+
+fn ui_start_failure_message(failure: UiStartFailure) -> (&'static str, &'static str) {
+    match failure {
+        UiStartFailure::BackgroundCapture => (
+            "Vellum 选区界面启动失败",
+            "无法取得屏幕画面；请运行 vellum doctor 检查截图后端",
+        ),
+        UiStartFailure::OverlayPresent => (
+            "Vellum 选区窗口启动失败",
+            "截图窗口未能创建；请运行 vellum doctor 后重试",
+        ),
+    }
+}
+
+fn notify_ui_start_failure(failure: UiStartFailure) {
+    let (title, body) = ui_start_failure_message(failure);
+    vellum_core::io::notify(title, body, "critical");
+}
+
+fn capture_error_kind(error: &CaptureError) -> &'static str {
+    match error {
+        CaptureError::NotFound => "not_found",
+        CaptureError::Failed(_) => "backend_failed",
+        CaptureError::Decode(_) => "decode_failed",
+        CaptureError::Timeout => "timeout",
+        CaptureError::Cancelled => "cancelled",
+    }
+}
+
 /// Captures the full screen without any UI. Useful for checking that `grim`
 /// and the PPM decoder agree on geometry.
 fn debug_capture(flags: OutputFlags) -> anyhow::Result<i32> {
     let image = vellum_core::capture::grab_full()?;
     println!("captured: {}x{}", image.width, image.height);
     Ok(keep_image(&image, flags, "vellum-debug", false))
+}
+
+fn longshot_done_failed(has_image: bool, warning_count: usize) -> bool {
+    !has_image && warning_count > 0
+}
+
+/// Routes one polled finish signal to the active recorder or remembers it
+/// during the overlay-to-recorder handoff.
+fn dispatch_finish_request<T>(
+    recorder: &RefCell<Option<Rc<T>>>,
+    finish_requested: &Cell<bool>,
+    long_shot: bool,
+    finish: impl FnOnce(&Rc<T>),
+) {
+    // Clone the Rc in a separate statement so the RefCell borrow guard is gone
+    // before `finish` synchronously invokes on_done and clears this same slot.
+    let recorder = recorder.borrow().as_ref().cloned();
+    match recorder {
+        Some(recorder) => finish(&recorder),
+        None if long_shot => finish_requested.set(true),
+        None => {}
+    }
 }
 
 /// State shared between the overlay callback, the signal handler and the
@@ -261,6 +356,8 @@ struct Session {
     screen: Cell<(i32, i32)>,
     flags: OutputFlags,
     long_shot: bool,
+    daemon_managed: bool,
+    trace: LongshotTrace,
     exit_code: Cell<i32>,
     recorder: RefCell<Option<Rc<Recorder>>>,
     /// Set when the finish signal arrives before the recorder exists, i.e.
@@ -269,13 +366,21 @@ struct Session {
 }
 
 impl Session {
-    fn new(capture: PendingCapture, flags: OutputFlags, long_shot: bool) -> Self {
+    fn new(
+        capture: PendingCapture,
+        flags: OutputFlags,
+        long_shot: bool,
+        daemon_managed: bool,
+        trace: LongshotTrace,
+    ) -> Self {
         Self {
             pending: RefCell::new(Some(capture)),
             background: RefCell::new(None),
             screen: Cell::new((0, 0)),
             flags,
             long_shot,
+            daemon_managed,
+            trace,
             exit_code: Cell::new(0),
             recorder: RefCell::new(None),
             finish_requested: Cell::new(false),
@@ -286,16 +391,25 @@ impl Session {
         if let Some(capture) = self.pending.borrow_mut().take() {
             // A panicked grab thread is reported the same way as a failed grab:
             // either way there is no frame to annotate.
-            let frame = capture
-                .join()
-                .unwrap_or_else(|_| Err(CaptureError::Failed("capture thread panicked".into())));
+            let frame = match capture.join() {
+                Ok(frame) => frame,
+                Err(_) => {
+                    self.trace.emit("overlay_capture_thread_panicked", &[]);
+                    Err(CaptureError::Failed("capture thread panicked".into()))
+                }
+            };
             match frame {
                 Ok(image) => {
                     self.screen.set((image.width as i32, image.height as i32));
                     *self.background.borrow_mut() = Some(image);
                 }
                 Err(err) => {
+                    self.trace.emit(
+                        "overlay_start_failed",
+                        &[("error_kind", TraceField::Static(capture_error_kind(&err)))],
+                    );
                     eprintln!("[vellum] capture failed: {err}");
+                    notify_ui_start_failure(UiStartFailure::BackgroundCapture);
                     self.exit_code.set(1);
                     app.quit();
                     return;
@@ -314,8 +428,17 @@ impl Session {
             session.on_result(&app_for_result, outcome);
         });
 
-        if let Err(err) = surface::present(app, &background, self.long_shot, handler) {
+        self.trace.emit("overlay_present_requested", &[]);
+        if let Err(err) = surface::present(
+            app,
+            &background,
+            self.long_shot,
+            self.daemon_managed,
+            handler,
+        ) {
+            self.trace.emit("overlay_present_failed", &[]);
             eprintln!("[vellum] overlay failed: {err}");
+            notify_ui_start_failure(UiStartFailure::OverlayPresent);
             self.exit_code.set(1);
             app.quit();
         }
@@ -333,11 +456,23 @@ impl Session {
         let session = self.clone();
         glib::timeout_add_local(FINISH_POLL, move || {
             if FINISH_PENDING.swap(false, Ordering::SeqCst) {
-                match session.recorder.borrow().as_ref() {
-                    Some(recorder) => recorder.finish(false),
-                    None if session.long_shot => session.finish_requested.set(true),
-                    None => {}
-                }
+                let target = if session.recorder.borrow().is_some() {
+                    "active_recorder"
+                } else if session.long_shot {
+                    "handoff_pending"
+                } else {
+                    "ignored_non_longshot"
+                };
+                session.trace.emit(
+                    "finish_signal_polled",
+                    &[("target", TraceField::Static(target))],
+                );
+                dispatch_finish_request(
+                    &session.recorder,
+                    &session.finish_requested,
+                    session.long_shot,
+                    |recorder| recorder.finish(false),
+                );
             }
             glib::ControlFlow::Continue
         });
@@ -352,10 +487,32 @@ impl Session {
         };
 
         if action == "long" && outcome.rect.valid() {
+            self.trace.emit(
+                "selection_confirmed",
+                &[
+                    ("x", TraceField::I64(i64::from(outcome.rect.x))),
+                    ("y", TraceField::I64(i64::from(outcome.rect.y))),
+                    ("width", TraceField::I64(i64::from(outcome.rect.w))),
+                    ("height", TraceField::I64(i64::from(outcome.rect.h))),
+                ],
+            );
             self.begin_longshot(app, outcome.rect);
             return;
         }
 
+        if self.long_shot {
+            self.trace.emit(
+                "selection_ended_without_recording",
+                &[(
+                    "reason",
+                    TraceField::Static(if action == "cancel" {
+                        "cancelled"
+                    } else {
+                        "invalid"
+                    }),
+                )],
+            );
+        }
         self.exit_code.set(self.handle(outcome.cropped, &action));
         app.quit();
     }
@@ -370,6 +527,10 @@ impl Session {
         for window in app.windows() {
             window.close();
         }
+        self.trace.emit(
+            "selection_overlay_closed",
+            &[("recorder_delay_ms", TraceField::U64(250))],
+        );
 
         let session = self.clone();
         let app = app.clone();
@@ -379,11 +540,28 @@ impl Session {
             let done_app = app.clone();
             let hold = RefCell::new(Some(hold));
             let on_done: recorder::DoneHandler = Rc::new(move |image, warnings| {
+                let failed = longshot_done_failed(image.is_some(), warnings.len());
+                done_session.trace.emit(
+                    "done_callback",
+                    &[
+                        ("has_image", TraceField::Bool(image.is_some())),
+                        ("failed", TraceField::Bool(failed)),
+                        ("warning_count", TraceField::U64(warnings.len() as u64)),
+                    ],
+                );
                 for warning in &warnings {
                     eprintln!("[vellum] {warning}");
                 }
                 let code = match image {
                     Some(image) => done_session.handle(Some(image), "long_done"),
+                    None if failed => {
+                        vellum_core::io::notify(
+                            "Vellum 长截图失败",
+                            "采集或拼接未能完成；可运行 vellum doctor 后重试",
+                            "critical",
+                        );
+                        1
+                    }
                     None => EXIT_CANCELLED,
                 };
                 done_session.exit_code.set(code);
@@ -392,16 +570,23 @@ impl Session {
                 done_app.quit();
             });
 
+            session.trace.emit("recorder_constructing", &[]);
             let recorder = Recorder::new(
                 &app,
                 rect,
                 &cfg.longshot,
                 Some(session.screen.get()),
+                session.daemon_managed,
+                session.trace.clone(),
                 on_done,
             );
             recorder.present();
             let pending = session.finish_requested.replace(false);
             session.recorder.replace(Some(recorder.clone()));
+            session.trace.emit(
+                "recorder_ready",
+                &[("finish_already_pending", TraceField::Bool(pending))],
+            );
             if pending {
                 // The finish signal beat us to it; honour it now.
                 glib::idle_add_local_once(move || recorder.finish(false));
@@ -526,5 +711,56 @@ fn spawn_detached(cropped: Option<Rgb8>, args: &[&str], message: &str) -> i32 {
             let _ = std::fs::remove_file(&path);
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_poll_releases_recorder_borrow_before_synchronous_done_callback() {
+        let recorder = RefCell::new(Some(Rc::new(())));
+        let finish_requested = Cell::new(false);
+
+        dispatch_finish_request(&recorder, &finish_requested, true, |_| {
+            // `Recorder::finish()` invokes on_done synchronously. The real
+            // callback clears this same slot, so retaining the poller's borrow
+            // across the callback reproduces the production panic.
+            recorder.replace(None);
+        });
+
+        assert!(recorder.borrow().is_none());
+        assert!(!finish_requested.get());
+    }
+
+    #[test]
+    fn finish_poll_remembers_signal_until_longshot_recorder_exists() {
+        let recorder: RefCell<Option<Rc<()>>> = RefCell::new(None);
+        let finish_requested = Cell::new(false);
+        let finish_called = Cell::new(false);
+
+        dispatch_finish_request(&recorder, &finish_requested, true, |_| {
+            finish_called.set(true);
+        });
+
+        assert!(finish_requested.get());
+        assert!(!finish_called.get());
+    }
+
+    #[test]
+    fn missing_image_with_warning_is_failure_not_user_cancellation() {
+        assert!(longshot_done_failed(false, 1));
+        assert!(!longshot_done_failed(false, 0));
+        assert!(!longshot_done_failed(true, 1));
+    }
+
+    #[test]
+    fn capture_and_window_start_failures_have_distinct_feedback() {
+        let capture = ui_start_failure_message(UiStartFailure::BackgroundCapture);
+        let window = ui_start_failure_message(UiStartFailure::OverlayPresent);
+        assert_ne!(capture, window);
+        assert!(capture.1.contains("屏幕画面"));
+        assert!(window.1.contains("窗口"));
     }
 }

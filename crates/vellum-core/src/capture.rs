@@ -1,23 +1,32 @@
-//! Screen capture. Shells out to `grim`, exactly like the Python original.
+//! Screen capture through `grim`.
 //!
-//! `grim` is kept as the capture backend on purpose: it is the reference
-//! behaviour under niri, and its ~30-40 ms per grab is dominated by the
-//! compositor copy, not by process startup. The win over the Python version
-//! comes from decoding straight into a packed RGB buffer (no PIL round-trip)
-//! and from `-t ppm`, which skips PNG compression on the capture hot path
-//! entirely.
+//! PPM keeps the hot path free of PNG compression, while anonymous in-memory
+//! files avoid pipe back-pressure: a region-sized raster can be several MiB and
+//! must not deadlock a child that is being watched for timeout/cancellation.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::FromRawFd;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::geom::Rect;
 use crate::image::Rgb8;
+
+/// A compositor copy normally completes in tens of milliseconds. Two seconds
+/// leaves ample room for a loaded compositor but bounds a wedged fallback.
+pub const DEFAULT_GRIM_TIMEOUT: Duration = Duration::from_secs(2);
+const WAIT_SLICE: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub enum CaptureError {
     NotFound,
     Failed(String),
     Decode(String),
+    Timeout,
+    Cancelled,
 }
 
 impl std::fmt::Display for CaptureError {
@@ -26,6 +35,8 @@ impl std::fmt::Display for CaptureError {
             Self::NotFound => write!(f, "grim not found; install grim"),
             Self::Failed(detail) => write!(f, "grim failed: {detail}"),
             Self::Decode(detail) => write!(f, "cannot decode capture: {detail}"),
+            Self::Timeout => write!(f, "grim capture timed out"),
+            Self::Cancelled => write!(f, "grim capture cancelled"),
         }
     }
 }
@@ -33,61 +44,169 @@ impl std::fmt::Display for CaptureError {
 impl std::error::Error for CaptureError {}
 
 pub fn grab_full() -> Result<Rgb8, CaptureError> {
-    grim(&[])
+    grim(&[], DEFAULT_GRIM_TIMEOUT, || false)
 }
 
 pub fn grab_output(name: &str) -> Result<Rgb8, CaptureError> {
-    grim(&["-o".to_string(), name.to_string()])
+    grim(
+        &["-o".to_string(), name.to_string()],
+        DEFAULT_GRIM_TIMEOUT,
+        || false,
+    )
 }
 
 pub fn grab_region(rect: Rect) -> Result<Rgb8, CaptureError> {
+    grab_region_interruptible(rect, DEFAULT_GRIM_TIMEOUT, || false)
+}
+
+/// Region capture with a bounded wait and a cooperative cancellation check.
+/// Long-shot sampling uses this so clicking 完成 can kill an in-flight fallback
+/// instead of leaving its worker blocked forever.
+pub fn grab_region_interruptible(
+    rect: Rect,
+    timeout: Duration,
+    cancelled: impl FnMut() -> bool,
+) -> Result<Rgb8, CaptureError> {
     if !rect.valid() {
         return Err(CaptureError::Failed(format!(
             "invalid region: {}x{}",
             rect.w, rect.h
         )));
     }
-    grim(&[
-        "-g".to_string(),
-        format!("{},{} {}x{}", rect.x, rect.y, rect.w, rect.h),
-    ])
+    grim(
+        &[
+            "-g".to_string(),
+            format!("{},{} {}x{}", rect.x, rect.y, rect.w, rect.h),
+        ],
+        timeout,
+        cancelled,
+    )
 }
 
 /// Capture using PPM output. PPM is uncompressed, so grim skips its PNG encode
-/// and we skip a decode; on the long-shot hot path this removes real per-frame
-/// work (PNG encode of a 900x700 frame is several ms on its own).
-fn grim(extra: &[String]) -> Result<Rgb8, CaptureError> {
-    let mut child = Command::new("grim")
-        .args(["-t", "ppm"])
-        .args(extra)
-        .arg("-")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                CaptureError::NotFound
-            } else {
-                CaptureError::Failed(e.to_string())
-            }
-        })?;
+/// and we skip a dynamic-image round trip.
+fn grim(
+    extra: &[String],
+    timeout: Duration,
+    cancelled: impl FnMut() -> bool,
+) -> Result<Rgb8, CaptureError> {
+    let mut command = Command::new("grim");
+    command.args(["-t", "ppm"]).args(extra).arg("-");
+    let output = run_command_to_memory(command, timeout, cancelled, true)?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CaptureError::Failed(if detail.is_empty() {
+            output.status.to_string()
+        } else {
+            detail
+        }));
+    }
+    decode_ppm(&output.stdout).map_err(CaptureError::Decode)
+}
 
-    let mut stdout = Vec::new();
-    if let Some(pipe) = child.stdout.as_mut() {
-        pipe.read_to_end(&mut stdout)
-            .map_err(|e| CaptureError::Failed(e.to_string()))?;
+struct MemoryOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Runs a command with stdout/stderr backed by memfd files. Unlike a pipe, the
+/// child can always finish writing even while the parent polls its status.
+fn run_command_to_memory(
+    mut command: Command,
+    timeout: Duration,
+    mut cancelled: impl FnMut() -> bool,
+    map_not_found: bool,
+) -> Result<MemoryOutput, CaptureError> {
+    let mut stdout = anonymous_file("vellum-capture-stdout")
+        .map_err(|error| CaptureError::Failed(error.to_string()))?;
+    let mut stderr = anonymous_file("vellum-capture-stderr")
+        .map_err(|error| CaptureError::Failed(error.to_string()))?;
+    command
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .map_err(|error| CaptureError::Failed(error.to_string()))?,
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .map_err(|error| CaptureError::Failed(error.to_string()))?,
+        ))
+        // Put grim in its own process group so timeout/cancellation also kills
+        // any helper it may have started.
+        .process_group(0);
+
+    let mut child = command.spawn().map_err(|error| {
+        if map_not_found && error.kind() == std::io::ErrorKind::NotFound {
+            CaptureError::NotFound
+        } else {
+            CaptureError::Failed(error.to_string())
+        }
+    })?;
+    let started = Instant::now();
+    let status = loop {
+        if cancelled() {
+            terminate(&mut child);
+            return Err(CaptureError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                terminate(&mut child);
+                return Err(CaptureError::Failed(error.to_string()));
+            }
+        }
+        if started.elapsed() >= timeout {
+            terminate(&mut child);
+            return Err(CaptureError::Timeout);
+        }
+        std::thread::sleep(WAIT_SLICE.min(timeout.saturating_sub(started.elapsed())));
+    };
+
+    let stdout = read_from_start(&mut stdout)?;
+    let stderr = read_from_start(&mut stderr)?;
+    Ok(MemoryOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn anonymous_file(name: &str) -> std::io::Result<File> {
+    let name = CString::new(name).expect("static memfd name has no NUL");
+    // SAFETY: `name` is a valid C string; on success ownership of the returned
+    // descriptor is transferred exactly once to `File`.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: `memfd_create` returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
-    let mut stderr = String::new();
-    if let Some(pipe) = child.stderr.as_mut() {
-        let _ = pipe.read_to_string(&mut stderr);
+}
+
+fn read_from_start(file: &mut File) -> Result<Vec<u8>, CaptureError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| CaptureError::Failed(error.to_string()))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)
+        .map_err(|error| CaptureError::Failed(error.to_string()))?;
+    Ok(data)
+}
+
+fn terminate(child: &mut std::process::Child) {
+    let pid = child.id();
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: a negative pid addresses the process group created by
+        // `process_group(0)`. Failure is harmless; `Child::kill` is the fallback.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
     }
-    let status = child
-        .wait()
-        .map_err(|e| CaptureError::Failed(e.to_string()))?;
-    if !status.success() {
-        return Err(CaptureError::Failed(stderr.trim().to_string()));
-    }
-    decode_ppm(&stdout).map_err(CaptureError::Decode)
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Parse binary PPM (P6). Written by hand because the `image` crate's PNM
@@ -186,5 +305,26 @@ mod tests {
     #[test]
     fn rejects_wrong_magic() {
         assert!(decode_ppm(b"P3\n1 1\n255\n0 0 0").is_err());
+    }
+
+    #[test]
+    fn a_wedged_command_is_killed_at_the_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let started = Instant::now();
+        let result = run_command_to_memory(command, Duration::from_millis(40), || false, false);
+        assert!(matches!(result, Err(CaptureError::Timeout)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "timeout did not bound the child wait"
+        );
+    }
+
+    #[test]
+    fn cancellation_kills_an_in_flight_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10"]);
+        let result = run_command_to_memory(command, Duration::from_secs(2), || true, false);
+        assert!(matches!(result, Err(CaptureError::Cancelled)));
     }
 }

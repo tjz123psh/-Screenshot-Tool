@@ -39,6 +39,7 @@ use vellum_core::image::Rgb8;
 use crate::annotate::{Annotator, PALETTE, Tool, WIDTHS};
 use crate::imaging;
 use crate::paint::{self, Bounds};
+use crate::recorder::{SelectionPanelNotice, selection_panel_notice};
 use crate::selector::{Mode, Selector};
 use crate::toolbar::{ANNOTATE_BUTTONS, BUTTONS, Toolbar};
 
@@ -58,6 +59,10 @@ const ACCENT: (f64, f64, f64, f64) = (0.39, 0.52, 0.91, 1.0);
 const HANDLE_DIAMETER: f64 = 9.0;
 const SIZE_HINT_FONT: &str = "Sans 9";
 const CENTER_HINT_FONT: &str = "Sans 13";
+const HANDOFF_HINT_FONT: &str = "Sans 11";
+const MANAGED_LONGSHOT_START_HINT: &str =
+    "拖动框选 · 松手开始 · 控制条若隐藏，仍可再按同一快捷键完成";
+const DIRECT_LONGSHOT_START_HINT: &str = "拖动框选 · 松手开始 · 请使用控制面板的“完成”按钮";
 
 /// What the overlay decided. `rect` is meaningful for every action except
 /// `cancel`; `cropped` is `None` when the caller does not need pixels.
@@ -88,6 +93,7 @@ struct State {
     popup: Option<Popup>,
     hover: Option<String>,
     long_shot: bool,
+    daemon_managed: bool,
     finished: bool,
     last_activity: i64,
     ever_focused: bool,
@@ -112,6 +118,7 @@ pub fn present(
     app: &Application,
     background: &Rgb8,
     long_shot: bool,
+    daemon_managed: bool,
     on_result: ResultHandler,
 ) -> anyhow::Result<ApplicationWindow> {
     let screen_w = background.width as i32;
@@ -128,6 +135,7 @@ pub fn present(
         popup: None,
         hover: None,
         long_shot,
+        daemon_managed,
         finished: false,
         last_activity: glib::monotonic_time(),
         ever_focused: false,
@@ -641,7 +649,7 @@ fn draw(state: &mut State, cr: &Context) {
 
     if !rect.valid() {
         let hint = if state.long_shot {
-            "拖动框选长截图区域，松手即开始  ·  Esc 取消"
+            longshot_start_copy(state.daemon_managed)
         } else {
             "拖动鼠标框选  ·  Esc 取消  ·  右键清除"
         };
@@ -660,6 +668,10 @@ fn draw(state: &mut State, cr: &Context) {
     let _ = cr.stroke();
 
     draw_size_hint(cr, rect);
+    if state.long_shot {
+        let notice = selection_panel_notice(rect, (state.screen_w, state.screen_h));
+        draw_longshot_handoff_hint(cr, notice, state.daemon_managed, sw, sh);
+    }
 
     if state.annotating {
         cr.save().ok();
@@ -688,14 +700,7 @@ fn draw(state: &mut State, cr: &Context) {
         return;
     }
 
-    for (_, hx, hy) in rect.handle_positions() {
-        cr.arc(hx, hy, HANDLE_DIAMETER / 2.0, 0.0, std::f64::consts::TAU);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-        let _ = cr.fill_preserve();
-        cr.set_source_rgba(ACCENT.0, ACCENT.1, ACCENT.2, ACCENT.3);
-        cr.set_line_width(2.0);
-        let _ = cr.stroke();
-    }
+    draw_selection_handles(cr, rect);
 
     // In long-shot mode releasing the drag starts sampling immediately, so a
     // toolbar would only ever be a target the user cannot hit in time.
@@ -705,6 +710,21 @@ fn draw(state: &mut State, cr: &Context) {
             .toolbar
             .layout(cr, rect, state.screen_w, state.screen_h);
         state.toolbar.draw(cr, hover.as_deref(), None);
+    }
+}
+
+fn draw_selection_handles(cr: &Context, rect: Rect) {
+    for (_, hx, hy) in rect.handle_positions() {
+        // Keep every handle independent even if a future decoration leaks a
+        // cairo current point. Without this, `arc` connects that point to the
+        // circle with a diagonal line before the stroke.
+        cr.new_sub_path();
+        cr.arc(hx, hy, HANDLE_DIAMETER / 2.0, 0.0, std::f64::consts::TAU);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        let _ = cr.fill_preserve();
+        cr.set_source_rgba(ACCENT.0, ACCENT.1, ACCENT.2, ACCENT.3);
+        cr.set_line_width(2.0);
+        let _ = cr.stroke();
     }
 }
 
@@ -731,6 +751,77 @@ fn draw_size_hint(cr: &Context, rect: Rect) {
         bx + 7.0,
         by + 4.0,
         (0.90, 0.93, 1.0, 0.95),
+    );
+}
+
+fn longshot_start_copy(daemon_managed: bool) -> &'static str {
+    if daemon_managed {
+        MANAGED_LONGSHOT_START_HINT
+    } else {
+        DIRECT_LONGSHOT_START_HINT
+    }
+}
+
+fn longshot_handoff_copy(
+    notice: SelectionPanelNotice,
+    daemon_managed: bool,
+) -> (&'static str, bool) {
+    match (daemon_managed, notice) {
+        (true, SelectionPanelNotice::ControlExpected) => ("松手开始 · 再按同一快捷键完成", false),
+        (true, SelectionPanelNotice::ControlMayHide) => {
+            ("选区较大，控制条可能隐藏 · 再按同一快捷键完成", true)
+        }
+        (false, SelectionPanelNotice::ControlExpected) => ("松手开始 · 请使用控制面板完成", false),
+        (false, SelectionPanelNotice::ControlMayHide) => {
+            ("选区较大，控制面板可能无法显示 · 请缩小选区", true)
+        }
+    }
+}
+
+/// Pre-sampling handoff rail. It is painted by the selection overlay, which is
+/// fully closed before the first frame, so even the warning state cannot enter
+/// the stitched image.
+fn draw_longshot_handoff_hint(
+    cr: &Context,
+    notice: SelectionPanelNotice,
+    daemon_managed: bool,
+    sw: f64,
+    sh: f64,
+) {
+    let (text, warning) = longshot_handoff_copy(notice, daemon_managed);
+    let (tw, th) = paint::text_size(cr, HANDOFF_HINT_FONT, text);
+    let bw = tw + 26.0;
+    let bh = th + 14.0;
+    let bx = (sw - bw) / 2.0;
+    let by = (sh - bh - 34.0).max(12.0);
+    paint::fill_rounded(
+        cr,
+        Bounds::new(bx, by, bw, bh),
+        10.0,
+        (0.09, 0.105, 0.14, 0.94),
+    );
+    paint::stroke_rounded(
+        cr,
+        Bounds::new(bx, by, bw, bh),
+        10.0,
+        1.0,
+        if warning {
+            (0.94, 0.78, 0.45, 0.80)
+        } else {
+            (0.56, 0.66, 1.0, 0.45)
+        },
+    );
+    paint::draw_text(
+        cr,
+        HANDOFF_HINT_FONT,
+        text,
+        bx + 13.0,
+        by + 7.0,
+        if warning {
+            (1.0, 0.88, 0.62, 0.98)
+        } else {
+            (0.88, 0.91, 1.0, 0.95)
+        },
     );
 }
 
@@ -903,5 +994,74 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
         if index == selected {
             paint::stroke_rounded(cr, *bounds, 8.0, 2.0, (0.48, 0.62, 1.0, 0.85));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_handles_do_not_connect_to_a_leaked_current_point() {
+        let mut surface =
+            ImageSurface::create(cairo::Format::ARgb32, 128, 128).expect("test surface");
+        let stride = surface.stride() as usize;
+        {
+            let cr = Context::new(&surface).expect("cairo context");
+            // Model a preceding painter that accidentally leaves its origin in
+            // cairo's path. The actual handles must still remain isolated.
+            cr.move_to(4.0, 4.0);
+            draw_selection_handles(&cr, Rect::new(88, 88, 16, 16));
+        }
+        surface.flush();
+        let data = surface.data().expect("surface pixels");
+
+        let leaked_pixels = (8usize..72)
+            .flat_map(|y| (8usize..72).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let offset = y * stride + x * 4;
+                let pixel = u32::from_ne_bytes(
+                    data[offset..offset + 4]
+                        .try_into()
+                        .expect("one ARGB32 pixel"),
+                );
+                pixel >> 24 != 0
+            })
+            .count();
+
+        assert_eq!(
+            leaked_pixels, 0,
+            "selection handles painted a diagonal path outside their circles"
+        );
+    }
+
+    #[test]
+    fn longshot_handoff_copy_explains_the_same_shortcut_before_hidden_sampling() {
+        let (visible, visible_warning) =
+            longshot_handoff_copy(SelectionPanelNotice::ControlExpected, true);
+        let (hidden, hidden_warning) =
+            longshot_handoff_copy(SelectionPanelNotice::ControlMayHide, true);
+        let (direct, direct_warning) =
+            longshot_handoff_copy(SelectionPanelNotice::ControlExpected, false);
+        let (direct_hidden, direct_hidden_warning) =
+            longshot_handoff_copy(SelectionPanelNotice::ControlMayHide, false);
+
+        assert!(longshot_start_copy(true).contains("控制条若隐藏"));
+        assert!(longshot_start_copy(true).contains("同一快捷键完成"));
+        assert!(visible.contains("同一快捷键完成"));
+        assert!(!visible_warning);
+        assert!(hidden.contains("控制条可能隐藏"));
+        assert!(hidden.contains("同一快捷键完成"));
+        assert!(hidden_warning);
+
+        assert!(longshot_start_copy(false).contains("控制面板"));
+        assert!(!longshot_start_copy(false).contains("同一快捷键"));
+        assert!(direct.contains("控制面板"));
+        assert!(!direct.contains("同一快捷键"));
+        assert!(!direct_warning);
+        assert!(direct_hidden.contains("可能无法显示"));
+        assert!(direct_hidden.contains("缩小选区"));
+        assert!(!direct_hidden.contains("同一快捷键"));
+        assert!(direct_hidden_warning);
     }
 }

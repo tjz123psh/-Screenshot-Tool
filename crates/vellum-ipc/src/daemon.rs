@@ -7,7 +7,7 @@
 //!   * turn `long` into a toggle by signalling the running child,
 //!   * surface abnormal child exits as desktop notifications.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -19,6 +19,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::log::{Log, create_private_dir};
 use crate::protocol::{
     Action, BYPASS_ENV, MAX_MESSAGE_BYTES, Request, Response, State, encode_line,
+};
+#[cfg(test)]
+use vellum_core::longshot_trace::TRACE_ARG;
+use vellum_core::longshot_trace::{
+    LongshotTrace, TRACE_ENV, TRACE_LINE_PREFIX, TraceField, ensure_session_arg,
 };
 
 /// Signal used to finish an in-flight long shot, matching the Python version.
@@ -36,6 +41,7 @@ const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 struct Active {
     child: Child,
     action: Action,
+    trace: LongshotTrace,
 }
 
 struct Inner {
@@ -156,6 +162,7 @@ impl Service {
             && active.action == Action::Long
         {
             let pid = active.child.id();
+            let trace = active.trace.clone();
             if !signal_child(pid, FINISH_SIGNAL) {
                 return Response {
                     busy: true,
@@ -166,6 +173,11 @@ impl Service {
             set_event(&mut inner, "正在完成长截图".to_string());
             self.log
                 .info(format!("requested long-shot finish child={pid}"));
+            self.log_trace(
+                &trace,
+                "finish_signal_requested",
+                &[("child_pid", TraceField::U64(u64::from(pid)))],
+            );
             return Response {
                 accepted: true,
                 toggled: true,
@@ -183,28 +195,61 @@ impl Service {
             };
         }
 
-        let child = match self.spawn_action(action, args) {
+        // The environment belongs to the long-lived daemon, not to this
+        // request. Only the marker carried in request argv may opt in.
+        let (child_args, trace_session) = match prepare_action_args(action, args, false) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Trace setup is diagnostic-only. Report its failed entropy
+                // query distinctly, then continue the screenshot untraced.
+                self.log.error(format!(
+                    "long-shot trace unavailable; launching without it: {error}"
+                ));
+                (args.to_vec(), None)
+            }
+        };
+        let trace = trace_session
+            .map(|session| LongshotTrace::with_session("daemon", session))
+            .unwrap_or_default();
+        let child = match self.spawn_action(action, &child_args) {
             Ok(child) => child,
             Err(err) => {
                 self.log
                     .error(format!("cannot launch {}: {err}", action.as_str()));
+                self.log_trace(
+                    &trace,
+                    "daemon_spawn_failed",
+                    &[("action", TraceField::Static(action.as_str()))],
+                );
                 return Response::error(err.to_string());
             }
         };
         let pid = child.id();
         self.log
             .info(format!("accepted action={} child={pid}", action.as_str()));
+        self.log_trace(
+            &trace,
+            "daemon_accepted",
+            &[
+                ("action", TraceField::Static(action.as_str())),
+                ("child_pid", TraceField::U64(u64::from(pid))),
+            ],
+        );
         set_event(&mut inner, format!("{}已启动", action.display_name()));
 
         if action.is_exclusive() {
-            inner.active = Some(Active { child, action });
+            inner.active = Some(Active {
+                child,
+                action,
+                trace,
+            });
             drop(inner);
         } else {
             // Non-exclusive actions are not tracked, so reap them here to avoid
             // leaving zombies behind for the lifetime of the daemon.
             drop(inner);
             let service = self.clone();
-            std::thread::spawn(move || service.watch(child, action));
+            std::thread::spawn(move || service.watch(child, action, trace));
         }
 
         Response {
@@ -215,14 +260,21 @@ impl Service {
         }
     }
 
-    fn watch(&self, mut child: Child, action: Action) {
+    fn watch(&self, mut child: Child, action: Action, trace: LongshotTrace) {
         let pid = child.id();
         let code = child.wait().ok().and_then(|status| status.code());
         let _lifecycle = self.lock_lifecycle();
-        self.finish_action(action, pid, code, true);
+        self.finish_action(action, pid, code, true, &trace);
     }
 
-    fn finish_action(&self, action: Action, pid: u32, code: Option<i32>, notify_abnormal: bool) {
+    fn finish_action(
+        &self,
+        action: Action,
+        pid: u32,
+        code: Option<i32>,
+        notify_abnormal: bool,
+        trace: &LongshotTrace,
+    ) {
         // Safety net for the hidden pointer. A long shot hides it while sampling
         // and restores it on the way out, but that relies on destructors, and
         // release builds abort on panic while `stop` kills the child outright -
@@ -244,6 +296,24 @@ impl Service {
             code.map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".into())
         ));
+        self.log_trace(
+            trace,
+            "daemon_child_exited",
+            &[
+                ("action", TraceField::Static(action.as_str())),
+                ("child_pid", TraceField::U64(u64::from(pid))),
+                (
+                    "exit_code",
+                    code.map_or(TraceField::Static("signal"), |code| {
+                        TraceField::I64(i64::from(code))
+                    }),
+                ),
+                (
+                    "normal_exit",
+                    TraceField::Bool(code.is_some_and(|code| NORMAL_EXITS.contains(&code))),
+                ),
+            ],
+        );
         if notify_abnormal && !code.is_some_and(|c| NORMAL_EXITS.contains(&c)) {
             vellum_core::io::notify(
                 "Vellum 启动失败",
@@ -253,18 +323,21 @@ impl Service {
         }
     }
 
+    fn log_trace(
+        &self,
+        trace: &LongshotTrace,
+        event: &'static str,
+        fields: &[(&'static str, TraceField)],
+    ) {
+        if let Some(line) = trace.line(event, fields) {
+            self.log.info(format!("{TRACE_LINE_PREFIX}{line}"));
+        }
+    }
+
     fn spawn_action(&self, action: Action, args: &[String]) -> std::io::Result<Child> {
-        let log_path = self.log.path().to_path_buf();
-        if let Some(parent) = log_path.parent() {
+        if let Some(parent) = self.log.path().parent() {
             let _ = create_private_dir(parent);
         }
-        // Child stdout/stderr land in the service log; a panic backtrace from a
-        // GUI action is otherwise invisible because there is no terminal.
-        let output = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let errors = output.try_clone()?;
 
         let mut command = Command::new(self.exe.as_path());
         #[cfg(test)]
@@ -275,9 +348,15 @@ impl Service {
             // Without this the spawned process would ask the daemon to run the
             // action, looping forever.
             .env(BYPASS_ENV, "1")
+            // This marker, rather than BYPASS_ENV, proves that the daemon owns
+            // the pid and can deliver the second-hotkey finish signal.
+            .env(vellum_core::DAEMON_MANAGED_ENV, "1")
+            // A trace opt-in is carried solely by argv. Otherwise an environment
+            // inherited when this daemon started would make later sessions noisy.
+            .env_remove(TRACE_ENV)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(output))
-            .stderr(Stdio::from(errors));
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(|| {
@@ -289,7 +368,26 @@ impl Service {
                 Ok(())
             });
         }
-        command.spawn()
+        let mut child = command.spawn()?;
+
+        // Never hand children a raw append fd for service.log: those writes skip
+        // Log's 512 KiB rotation check. Dedicated readers preserve panic output
+        // and per-frame trace while routing every line through the bounded logger.
+        if let Some(stdout) = child.stdout.take()
+            && let Err(error) = spawn_output_forwarder(stdout, Arc::clone(&self.log), "CHILD-OUT")
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Some(stderr) = child.stderr.take()
+            && let Err(error) = spawn_output_forwarder(stderr, Arc::clone(&self.log), "CHILD-ERR")
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(child)
     }
 
     /// Poll the tracked child so `status` stays accurate and abnormal exits get
@@ -310,16 +408,17 @@ impl Service {
                     Ok(Some(status)) => {
                         let action = active.action;
                         let pid = active.child.id();
+                        let trace = active.trace.clone();
                         inner.active = None;
-                        Some((action, pid, status.code()))
+                        Some((action, pid, status.code(), trace))
                     }
                     Ok(None) | Err(_) => None,
                 },
                 None => None,
             }
         };
-        if let Some((action, pid, code)) = finished {
-            self.finish_action(action, pid, code, true);
+        if let Some((action, pid, code, trace)) = finished {
+            self.finish_action(action, pid, code, true, &trace);
         }
     }
 
@@ -348,7 +447,7 @@ impl Service {
                 Some(code) => {
                     // The daemon deliberately stopped this action, so still run
                     // cleanup but do not claim that startup failed.
-                    self.finish_action(action, pid, code, false);
+                    self.finish_action(action, pid, code, false, &active.trace);
                 }
                 None => {
                     // Do not block daemon shutdown forever on an uninterruptible
@@ -440,6 +539,58 @@ fn describe_exit(action: Action, code: Option<i32>) -> String {
         Some(other) => format!("{}启动失败（代码 {other}）", action.display_name()),
         None => format!("{}异常结束", action.display_name()),
     }
+}
+
+fn spawn_output_forwarder<R>(reader: R, log: Arc<Log>, level: &'static str) -> std::io::Result<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(format!("vellum-{level}"))
+        .spawn(move || forward_child_output(reader, &log, level))
+        .map(|_| ())
+}
+
+fn forward_child_output<R: std::io::Read>(reader: R, log: &Log, level: &str) {
+    let mut reader = BufReader::new(reader);
+    loop {
+        let mut line = Vec::new();
+        // Bound one allocation even if a broken child emits no newline. A long
+        // logical line is split into independently rotated chunks.
+        let read = match (&mut reader)
+            .take(MAX_MESSAGE_BYTES as u64)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(read) => read,
+            Err(error) => {
+                log.error(format!("cannot read {level}: {error}"));
+                return;
+            }
+        };
+        if read == 0 {
+            return;
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+        log.write(level, &String::from_utf8_lossy(&line));
+    }
+}
+
+fn prepare_action_args(
+    action: Action,
+    args: &[String],
+    _inherited_trace_env: bool,
+) -> std::io::Result<(Vec<String>, Option<String>)> {
+    let mut prepared = args.to_vec();
+    if action != Action::Long {
+        return Ok((prepared, None));
+    }
+    // The daemon is long-lived, so its inherited environment cannot represent
+    // this request's opt-in. vellum/vellumctl already turn an exact `=1` into
+    // TRACE_ARG before crossing the socket boundary.
+    let session = ensure_session_arg(&mut prepared)?;
+    Ok((prepared, session))
 }
 
 fn signal_child(pid: u32, signal: libc::c_int) -> bool {
@@ -714,6 +865,83 @@ mod tests {
         assert_eq!(
             describe_exit(Action::PinLast, Some(2)),
             "钉图启动失败（代码 2）"
+        );
+    }
+
+    #[test]
+    fn inherited_daemon_trace_environment_does_not_opt_in_a_request() {
+        let (args, session) = prepare_action_args(Action::Long, &[], true).unwrap();
+        assert!(
+            args.is_empty(),
+            "daemon environment leaked into request argv"
+        );
+        assert!(
+            session.is_none(),
+            "daemon environment created a trace session"
+        );
+    }
+
+    #[test]
+    fn child_output_is_forwarded_through_the_rotating_logger() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("vellum-daemon-child-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("service.log");
+        let log = Arc::new(Log::new(path.clone()));
+        let payload = "x".repeat(1024);
+        let script = format!(
+            "i=0; while [ \"$i\" -lt 600 ]; do printf '%s\\n' '{}'; i=$((i + 1)); done",
+            payload
+        );
+        let service =
+            Service::new(log, PathBuf::from("/bin/sh")).with_test_prefix_args(&["-c", &script]);
+
+        let mut child = service.spawn_action(Action::Region, &[]).unwrap();
+        assert!(child.wait().unwrap().success());
+
+        let mut backup_name = OsString::from_vec(path.as_os_str().as_encoded_bytes().to_vec());
+        backup_name.push(".1");
+        let backup = PathBuf::from(backup_name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !backup.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(backup.exists(), "child output bypassed log rotation");
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < crate::log::MAX_BYTES,
+            "active log exceeded the configured rotation budget"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn traced_longshot_args_get_a_private_correlation_id() {
+        let request = vec![TRACE_ARG.to_string()];
+        let (args, session) = prepare_action_args(Action::Long, &request, true).unwrap();
+        let session = session.expect("trace session");
+        assert!(vellum_core::longshot_trace::valid_session_id(&session));
+        assert!(args.iter().any(|arg| arg == TRACE_ARG));
+        assert_eq!(
+            vellum_core::longshot_trace::session_from_args(&args),
+            Some(session.as_str())
+        );
+    }
+
+    #[test]
+    fn untraced_or_non_long_actions_do_not_gain_trace_arguments() {
+        let original = vec!["--no-copy".to_string()];
+        assert_eq!(
+            prepare_action_args(Action::Long, &original, false).unwrap(),
+            (original.clone(), None)
+        );
+        assert_eq!(
+            prepare_action_args(Action::Region, &original, true).unwrap(),
+            (original, None)
         );
     }
 }

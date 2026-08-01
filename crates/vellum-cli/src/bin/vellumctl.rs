@@ -38,9 +38,13 @@ fn main() -> ExitCode {
         return fallback(&args);
     }
 
+    let mut request_args = args[1..].to_vec();
+    if action == Action::Long && vellum_core::longshot_trace::env_enabled() {
+        vellum_core::longshot_trace::ensure_trace_arg(&mut request_args);
+    }
     let request = Request::Action {
         action,
-        args: args[1..].to_vec(),
+        args: request_args,
     };
 
     match client::send(&request, TIMEOUT) {
@@ -65,6 +69,11 @@ fn main() -> ExitCode {
 /// on purpose: linking that library would pull clap and regex into the hot path
 /// binary, which is exactly what this binary exists to avoid.
 fn fallback(args: &[String]) -> ExitCode {
+    // SAFETY: vellumctl is single-threaded and has not spawned any worker. The
+    // marker survives execv so the full CLI can notify when its final UI exec
+    // fails in this terminal-less hotkey path.
+    unsafe { std::env::set_var(vellum_core::HOTKEY_FALLBACK_ENV, "1") };
+
     let Some(path) = locate("vellum") else {
         eprintln!("[vellumctl] 未找到 vellum 可执行文件");
         vellum_core::io::notify("vellum", "未找到 vellum 可执行文件", "critical");

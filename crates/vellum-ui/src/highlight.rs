@@ -46,7 +46,12 @@ pub struct SelectionHighlight {
 impl SelectionHighlight {
     /// Builds the edge windows. `screen` of `None` disables the outline, which
     /// keeps the recorder usable when the output size is unknown.
-    pub fn new(app: &Application, rect: Rect, screen: Option<(i32, i32)>) -> Self {
+    pub fn new(
+        app: &Application,
+        rect: Rect,
+        screen: Option<(i32, i32)>,
+        monitor: Option<&gtk4::gdk::Monitor>,
+    ) -> Self {
         let Some(screen) = screen else {
             return Self {
                 windows: Vec::new(),
@@ -68,6 +73,8 @@ impl SelectionHighlight {
                 window.set_layer(Layer::Overlay);
                 window.set_namespace(Some("vellum-longshot-highlight"));
                 window.set_keyboard_mode(KeyboardMode::None);
+                window.set_monitor(monitor);
+                window.set_resizable(false);
                 window.set_anchor(Edge::Top, true);
                 window.set_anchor(Edge::Left, true);
                 window.set_margin(Edge::Top, y);
@@ -80,6 +87,7 @@ impl SelectionHighlight {
                 theme::install_default();
                 window.add_css_class("vellum-highlight-window");
                 let edge = GtkBox::builder().build();
+                edge.set_size_request(w, h);
                 edge.add_css_class("vellum-highlight-edge");
                 window.set_child(Some(&edge));
                 window

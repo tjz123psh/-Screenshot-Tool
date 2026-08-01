@@ -40,6 +40,12 @@ enum Command {
     Long {
         #[command(flatten)]
         output: OutputFlags,
+        /// Internal opt-in forwarded across the daemon boundary.
+        #[arg(long, hide = true)]
+        longshot_trace: bool,
+        /// Internal daemon-generated trace correlation id.
+        #[arg(long, hide = true)]
+        longshot_trace_session: Option<String>,
     },
     /// 把剪贴板里的图片钉到屏幕上
     PinLast,
@@ -158,6 +164,13 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("[vellum] error: {err}");
+            if std::env::var(vellum_core::HOTKEY_FALLBACK_ENV).as_deref() == Ok("1") {
+                vellum_core::io::notify(
+                    "Vellum 界面启动失败",
+                    "无法启动截图界面；请从托盘运行诊断或执行 vellum doctor",
+                    "critical",
+                );
+            }
             ExitCode::from(1)
         }
     }
@@ -166,9 +179,26 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<u8> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Region { output } => capture(Action::Region, &output),
-        Command::Long { output } => capture(Action::Long, &output),
-        Command::PinLast => capture(Action::PinLast, &OutputFlags::default()),
+        Command::Region { output } => capture(Action::Region, &output, &[]),
+        Command::Long {
+            output,
+            longshot_trace,
+            longshot_trace_session,
+        } => {
+            let mut internal = Vec::new();
+            if longshot_trace {
+                internal.push(vellum_core::longshot_trace::TRACE_ARG.to_string());
+            }
+            if let Some(session) = longshot_trace_session {
+                internal.push(format!(
+                    "{}{}",
+                    vellum_core::longshot_trace::TRACE_SESSION_ARG_PREFIX,
+                    session
+                ));
+            }
+            capture(Action::Long, &output, &internal)
+        }
+        Command::PinLast => capture(Action::PinLast, &OutputFlags::default(), &[]),
         Command::Tray => handover(ui::TRAY_BINARY, &[]),
         Command::Status { json } => status(json),
         Command::Doctor { json } => Ok(doctor(json)),
@@ -211,10 +241,15 @@ fn run() -> anyhow::Result<u8> {
 ///
 /// Routing first is what gives `long` its toggle behaviour: the daemon owns the
 /// running capture and signals it, which this process could not do on its own.
-fn capture(action: Action, output: &OutputFlags) -> anyhow::Result<u8> {
-    let forwarded = output.forwarded();
+fn capture(action: Action, output: &OutputFlags, internal: &[String]) -> anyhow::Result<u8> {
+    let mut forwarded = output.forwarded();
+    forwarded.extend_from_slice(internal);
+    if action == Action::Long && vellum_core::longshot_trace::env_enabled() {
+        vellum_core::longshot_trace::ensure_trace_arg(&mut forwarded);
+    }
 
-    if std::env::var(vellum_ipc::protocol::BYPASS_ENV).as_deref() != Ok("1") {
+    let bypassed = std::env::var(vellum_ipc::protocol::BYPASS_ENV).as_deref() == Ok("1");
+    if !bypassed {
         match client::route_action(action, &forwarded) {
             Routed::Accepted => return Ok(0),
             Routed::Rejected(message) => {
@@ -222,13 +257,33 @@ fn capture(action: Action, output: &OutputFlags) -> anyhow::Result<u8> {
                 vellum_core::io::notify("vellum", &message, "normal");
                 return Ok(2);
             }
-            Routed::Unavailable => {}
+            Routed::Unavailable => {
+                let (_, message) = service_fallback_notice(action);
+                eprintln!("[vellum] {message}");
+                // Do not create a desktop notification before capture: both grim
+                // and screencopy can record notification surfaces. A direct long
+                // shot shows the limitation persistently in its safe panel; if no
+                // panel can be shown, the UI fails before sampling instead.
+            }
         }
     }
 
     let mut args = vec![action.as_str().to_string()];
     args.extend(forwarded);
     handover(ui::UI_BINARY, &args)
+}
+
+fn service_fallback_notice(action: Action) -> (&'static str, &'static str) {
+    match action {
+        Action::Long => (
+            "Vellum 服务未启动",
+            "已直接打开长截图；再次按快捷键无法完成，请使用控制面板的“完成”按钮",
+        ),
+        Action::Region | Action::PinLast => (
+            "Vellum 服务未启动",
+            "控制服务启动失败，已直接打开本次截图；建议稍后运行 vellum doctor",
+        ),
+    }
 }
 
 /// `execv` into a GUI binary. Only returns on failure.
@@ -401,6 +456,49 @@ fn report_shortcuts(result: shortcuts::InstallResult) -> u8 {
         // they must not look like success to a script.
         shortcuts::Status::Conflict | shortcuts::Status::Unavailable | shortcuts::Status::Error => {
             1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn longshot_service_fallback_explains_that_toggle_is_unavailable() {
+        let (title, body) = service_fallback_notice(Action::Long);
+        assert_eq!(title, "Vellum 服务未启动");
+        assert!(body.contains("再次按快捷键无法完成"));
+        assert!(body.contains("完成"));
+    }
+
+    #[test]
+    fn ordinary_capture_service_fallback_does_not_claim_total_failure() {
+        let (_, body) = service_fallback_notice(Action::Region);
+        assert!(body.contains("已直接打开"));
+        assert!(!body.contains("再次按快捷键"));
+    }
+
+    #[test]
+    fn hidden_longshot_trace_arguments_survive_full_cli_parsing() {
+        let session = "00112233445566778899aabbccddeeff";
+        let cli = Cli::try_parse_from([
+            "vellum",
+            "long",
+            "--longshot-trace",
+            &format!("--longshot-trace-session={session}"),
+        ])
+        .expect("hidden trace args parse");
+        match cli.command {
+            Command::Long {
+                longshot_trace,
+                longshot_trace_session,
+                ..
+            } => {
+                assert!(longshot_trace);
+                assert_eq!(longshot_trace_session.as_deref(), Some(session));
+            }
+            _ => panic!("parsed the wrong command"),
         }
     }
 }

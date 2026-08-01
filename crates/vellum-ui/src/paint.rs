@@ -79,6 +79,10 @@ pub fn draw_text(cr: &Context, font: &str, text: &str, x: f64, y: f64, rgba: (f6
     cr.set_source_rgba(rgba.0, rgba.1, rgba.2, rgba.3);
     cr.move_to(x, y);
     pangocairo::functions::show_layout(cr, &layout);
+    // `show_layout` paints glyphs without consuming cairo's current path, so
+    // the `move_to` above otherwise survives. A later `arc` then joins its
+    // first point to this text origin with a visible diagonal stroke.
+    cr.new_path();
 }
 
 #[cfg(test)]
@@ -92,5 +96,19 @@ mod tests {
         assert!(b.contains(29.9, 29.9));
         assert!(!b.contains(30.0, 20.0));
         assert!(!b.contains(9.9, 20.0));
+    }
+
+    #[test]
+    fn text_does_not_leave_a_path_for_the_next_shape() {
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, 160, 60).expect("test surface");
+        let cr = Context::new(&surface).expect("cairo context");
+
+        draw_text(&cr, "Sans 9", "640 × 480", 8.0, 8.0, (1.0, 1.0, 1.0, 1.0));
+
+        assert!(
+            !cr.has_current_point().expect("valid cairo context"),
+            "a leaked text origin makes cairo connect the next selection handle with a line"
+        );
     }
 }

@@ -34,6 +34,14 @@ serde_json = "=1.0.151"
 toml = "=1.1.2"
 ureq = { version = "=3.3.0", features = ["json"] }
 
+# Long-shot-only Wayland stack. Kept in vellum-ui so vellum/vellumctl never pay
+# protocol code or dependencies on the shortcut hot path.
+memmap2 = "=0.9.11"
+tempfile = "=3.27.0"
+wayland-client = "=0.31.14"
+wayland-protocols = { version = "=0.32.13", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
+
 # GTK stack. These seven versions must move as a set: gtk4 0.11.4 builds on
 # glib 0.22 / cairo-sys 0.22, and the default resolve of pangocairo picks 0.21,
 # which drags in a second cairo-rs. Two cairo-rs versions means the surface
