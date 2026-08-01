@@ -62,9 +62,17 @@ const FINISH_POLL: Duration = Duration::from_millis(50);
 
 /// Set by the `SIGUSR1` handler, cleared by the polling closure.
 static FINISH_PENDING: AtomicBool = AtomicBool::new(false);
+/// The finish hotkey is armed only after the long-shot selection is confirmed.
+static FINISH_ARMED: AtomicBool = AtomicBool::new(false);
+
+fn record_finish_signal(armed: bool, pending: &AtomicBool) {
+    if armed {
+        pending.store(true, Ordering::SeqCst);
+    }
+}
 
 extern "C" fn on_sigusr1(_signal: libc::c_int) {
-    FINISH_PENDING.store(true, Ordering::SeqCst);
+    record_finish_signal(FINISH_ARMED.load(Ordering::SeqCst), &FINISH_PENDING);
 }
 
 /// Installs the `SIGUSR1` handler exactly once per process.
@@ -105,6 +113,12 @@ fn prefer_cairo_renderer() {
 }
 
 fn main() -> std::process::ExitCode {
+    // The daemon can signal a freshly spawned long-shot process before GTK has
+    // activated. Install the handler before any startup work so an early second
+    // shortcut is ignored instead of taking SIGUSR1's default terminate action.
+    FINISH_ARMED.store(false, Ordering::SeqCst);
+    FINISH_PENDING.store(false, Ordering::SeqCst);
+    install_sigusr1_handler();
     trace::init();
     trace::mark("process-start");
     prefer_cairo_renderer();
@@ -420,7 +434,7 @@ impl Session {
         let Some(background) = self.background.borrow().clone() else {
             return;
         };
-        self.install_finish_signal();
+        self.install_finish_poll();
 
         let session = self.clone();
         let app_for_result = app.clone();
@@ -444,15 +458,12 @@ impl Session {
         }
     }
 
-    /// Installs the long-shot finish signal handler.
+    /// Polls the finish flag on the GTK main loop.
     ///
-    /// Called before the overlay is mapped: the second hotkey press can arrive
-    /// while the overlay is still closing. A press while the user is still
-    /// dragging a selection is deliberately ignored — there is nothing to
-    /// finish yet, and cancelling their drag would be worse than doing nothing.
-    fn install_finish_signal(self: &Rc<Self>) {
-        install_sigusr1_handler();
-
+    /// The async handler itself is installed at process entry, before GTK or the
+    /// background capture can open a termination race. It arms only after region
+    /// confirmation; a press while selecting is deliberately ignored.
+    fn install_finish_poll(self: &Rc<Self>) {
         let session = self.clone();
         glib::timeout_add_local(FINISH_POLL, move || {
             if FINISH_PENDING.swap(false, Ordering::SeqCst) {
@@ -523,6 +534,9 @@ impl Session {
     /// delay exists because grim would otherwise capture our own dimming layer
     /// as the first frame.
     fn begin_longshot(self: &Rc<Self>, app: &gtk4::Application, rect: vellum_core::Rect) {
+        // Only now does the second hotkey mean “finish”. SIGUSR1 delivered while
+        // the user was still choosing a region is intentionally ignored.
+        FINISH_ARMED.store(true, Ordering::SeqCst);
         let hold = app.hold();
         for window in app.windows() {
             window.close();
@@ -746,6 +760,20 @@ mod tests {
 
         assert!(finish_requested.get());
         assert!(!finish_called.get());
+    }
+
+    #[test]
+    fn finish_signal_is_ignored_until_longshot_selection_is_confirmed() {
+        let pending = AtomicBool::new(false);
+
+        record_finish_signal(false, &pending);
+        assert!(
+            !pending.load(Ordering::SeqCst),
+            "a second shortcut press during selection must not arm a future recorder finish"
+        );
+
+        record_finish_signal(true, &pending);
+        assert!(pending.load(Ordering::SeqCst));
     }
 
     #[test]

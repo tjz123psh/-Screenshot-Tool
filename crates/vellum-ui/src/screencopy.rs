@@ -108,6 +108,10 @@ struct CaptureState {
     frame_failed: bool,
     frame_error: Option<String>,
     frame_flags: u32,
+    /// True only when the current frame advertised a supported wl_shm buffer.
+    /// `buffer` itself may belong to a previous frame and is therefore not proof
+    /// that this frame negotiated shm successfully.
+    frame_buffer_ready: bool,
     wait_for_damage: bool,
 }
 
@@ -125,6 +129,7 @@ impl CaptureState {
             frame_failed: false,
             frame_error: None,
             frame_flags: 0,
+            frame_buffer_ready: false,
             wait_for_damage: false,
         }
     }
@@ -334,6 +339,7 @@ impl ScreencopyCapturer {
         self.state.frame_failed = false;
         self.state.frame_error = None;
         self.state.frame_flags = 0;
+        self.state.frame_buffer_ready = false;
         self.state.wait_for_damage = wait_for_damage;
 
         self.event_queue
@@ -560,6 +566,10 @@ fn supported_format(format: u32) -> bool {
     )
 }
 
+fn buffer_done_allows_copy(frame_failed: bool, frame_buffer_ready: bool) -> bool {
+    !frame_failed && frame_buffer_ready
+}
+
 fn decode_shm(
     payload: &[u8],
     width: u32,
@@ -731,15 +741,28 @@ impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for CaptureSt
                 height,
                 stride,
             } => match state.create_or_reuse_buffer(qh, format, width, height, stride) {
-                Ok(()) if frame.version() < 3 => state.submit_copy(frame),
-                Ok(()) => {}
+                Ok(()) => {
+                    state.frame_buffer_ready = true;
+                    if frame.version() < 3 {
+                        state.submit_copy(frame);
+                    }
+                }
                 Err(error) => {
                     state.frame_failed = true;
                     state.frame_done = true;
                     state.frame_error = Some(error);
                 }
             },
-            zwlr_screencopy_frame_v1::Event::BufferDone => state.submit_copy(frame),
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
+                if buffer_done_allows_copy(state.frame_failed, state.frame_buffer_ready) {
+                    state.submit_copy(frame);
+                } else if !state.frame_failed {
+                    state.frame_failed = true;
+                    state.frame_done = true;
+                    state.frame_error =
+                        Some("compositor offered no supported wl_shm buffer".to_string());
+                }
+            }
             zwlr_screencopy_frame_v1::Event::Flags { flags } => {
                 state.frame_flags = match flags {
                     WEnum::Value(flags) => flags.bits(),
@@ -809,5 +832,18 @@ mod tests {
     #[test]
     fn rejects_truncated_shared_memory() {
         assert!(decode_shm(&[0; 8], 2, 2, 8, FORMAT_XRGB8888, 0).is_err());
+    }
+
+    #[test]
+    fn buffer_done_never_submits_after_buffer_negotiation_failed() {
+        assert!(buffer_done_allows_copy(false, true));
+        assert!(
+            !buffer_done_allows_copy(true, true),
+            "BufferDone must not submit a stale or incompatible wl_buffer"
+        );
+        assert!(
+            !buffer_done_allows_copy(false, false),
+            "BufferDone must not reuse the previous frame when this frame offered no shm buffer"
+        );
     }
 }
