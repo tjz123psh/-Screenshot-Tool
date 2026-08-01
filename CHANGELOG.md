@@ -2,6 +2,20 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.1.2] - 2026-08-01
+
+### Fixed
+
+- Serialize daemon completion, launch and shutdown so finished actions always run cursor/event/notification cleanup and no request can start after shutdown begins.
+- Reap killed, detached and notification children instead of accumulating zombies in the daemon or tray.
+- Reject non-executable PATH shadows, overflowing PPM dimensions and failed `pacman -T` dependency queries.
+- Replace writable daemon test executables with stable shell fixtures to remove the parallel `ETXTBSY` race.
+
+### Testing
+
+- Add a deterministic synthetic OCR generator and scorer that uses only generated images and a developer-only local probe.
+- Exercise installer query failures in isolation before cargo or user-file changes can run.
+
 ## [0.1.1] - 2026-08-01
 
 ### Changed
@@ -30,5 +44,6 @@ All notable changes to vellum are documented here. The Rust rewrite starts a new
 - Approximately 0.15 seconds for the 101-frame 900×700 long-shot benchmark.
 - Approximately 0.04 milliseconds p50 for local control-socket ping/status round trips.
 
+[0.1.2]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.2
 [0.1.1]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.0
