@@ -44,7 +44,7 @@ vellum-ui      唯一链接 GTK 的 crate
 vellum-tray    托盘，只依赖 core + ipc + ksni
 ```
 
-`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 238 个 Rust 测试里绝大多数不需要 Wayland 会话。
+`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 300 个 Rust 测试（默认 298 通过，另有 2 个真机 Wayland smoke）里绝大多数不需要 Wayland 会话。
 
 合成器抽象（`vellum-core/src/compositor/`）放在 core 而不是 GTK 二进制里，因为 `doctor` 也要报告检测到的合成器 —— 一份实现不会漂移，两份会。
 
@@ -62,10 +62,12 @@ Python 版用 numpy + OpenCV。Rust 侧改为手写：
 
 形态学基线在 `vellum-text/src/prep.rs` 里按 OpenCV 语义重实现（椭圆核按 `getStructuringElement(MORPH_ELLIPSE)` 的半宽公式生成，并分解为逐 dy 的滑动窗口 row-max/row-min，避免 25×25 核的 625 ops/px）。其上增加按需渲染的 CLAHE、相反文字极性和 RGB 主成分/最大通道候选，用于暗淡字色、明暗渐变和等亮异色文字；实测见 `PERFORMANCE.md` §4。
 
-### 截屏：`grim` 子进程 + PPM
+### 截屏：普通动作走 `grim`，长截图走持久 screencopy
 
-- **改动**：Python 版用 `grim -t png`，vellum 用 `grim -t ppm`。实测全屏 22 ms vs 121 ms，每帧省约 99 ms（`PERFORMANCE.md` §4）。PNG 编码在这里纯属浪费——图刚出来就要解码回像素。PPM 由手写的 P6 解析器读取（跳空白与 `#` 注释，要求 maxval 255）。
-- **暂未改为直连 `wlr-screencopy`**（`ARCHITECTURE.md` §4.1 要求评估）：实测区域抓帧 16 ms，其中进程创建只占很小一部分，而拼接一帧只要 0.89 ms——采样率的瓶颈是合成器交付一帧的时间，不是 grim 的开销。直连 screencopy 需要自己管理 wl_registry/buffer 生命周期与多输出/缩放，换来的余量有限。结论记在这里而不是当作待办：**有数据支持暂不做**，若将来要提高采样率再重新测量。
+- **普通截图保持 `grim -t ppm`**：Python 版用 `grim -t png`，PPM 全屏实测 22 ms vs PNG 121 ms，每次省约 99 ms（`PERFORMANCE.md` §3）。图刚出来就要解码回像素，PNG 编码在这里纯属浪费；P6 由手写解析器读取。
+- **长截图优先直连 `zwlr_screencopy_manager_v1`**：`vellum-ui` 的采集线程独占一条持久 Wayland 连接，用 xdg-output 把全局逻辑选区映射到单个输出，复用 wl_shm buffer，并处理 stride、ARGB/XRGB/ABGR/XBGR 与 Y-invert。首帧后使用 `copy_with_damage`，静止画面不再生成数百张重复帧；1 秒无 damage 时做一次普通 heartbeat copy。普通 copy 的 31 次 900×700 真机采样均值约 2.01 ms，而逐帧 `grim -t ppm` 约 16 ms。
+- **等待可中断且有 deadline**：Wayland fd 与 stop eventfd 一起 `poll()`；取消立即唤醒，完成先给在途尾帧 250 ms、超时再唤醒。协议缺失、跨输出选区或运行时失败时只切换一次到 `grim`，而 grim 也改为 memfd 输出、2 秒 deadline、整进程组终止，不能再永久卡住 worker。连续失败会在面板显示“采集重连中”，恢复后显示“采集已恢复”。
+- 对 [`wl-longshot@5abd758`](https://github.com/SHORiN-KiWATA/wl-longshot/tree/5abd75820d8556ee3b53f0264e748078787693a9) 做过固定 revision 的只读研究：确认它同样使用持久 screencopy、取消 fd、按 output 放置 layer surface、四侧尝试后隐藏 preview，以及“拒绝帧不污染最后 accepted anchor”的行为。vellum 只采用这些通用行为层经验，并直接依据公开的 wlr-screencopy/layer-shell/xdg-output 协议独立设计 API、状态机、常量和 fixture；没有复制或翻译其 Rust/Bash、注释、测试、绘制代码或资产。该仓库附带 GPLv3 文本（§5/§6 对传播衍生作品和 Corresponding Source 有要求），本 MIT 仓库按保守边界不复用表达性实现；静态研究不等于运行期验收。
 
 ### GTK 绑定版本必须整组锁定
 
@@ -90,6 +92,7 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 - **放弃 `leptess`/`tesseract-sys`**：本机 leptonica 的 soname 是 `/usr/lib/libleptonica.so`，而 `tesseract-sys` 期望 `liblept.so.5`；另需 bindgen/clang 构建依赖。
 - **子进程可接受**：OCR 已在 worker 线程，结果窗口先开占位（「识别中…」），进程创建不阻塞界面。普通干净截图只跑基线；只有低置信度/低对比/异色场景才按需增加候选。
 - **质量选择不用“字越多越好”**：Tesseract 输出 TSV 置信度，vellum 按行重建文字、剔除稀疏模式找到的弱彩色边缘噪声，并在混合语言顺序之间逐行融合。所有候选共享 30 秒总时限，不能把一次 OCR 放大成多次 30 秒等待。
+- **困难场景不是固定串行队列**：等亮异色场景把颜色投影提前；彩色繁忙背景先试颜色、再试相反极性；明显由稀疏噪声主导的结果不再付昂贵的 block retry；LocalContrast 的两种语言顺序并行运行后仍逐行融合。`VELLUM_OCR_TRACE=1` 只记录候选/PSM/耗时/置信度，不记录识别文本。
 - **管道必须并行排空**：PNG stdin、TSV stdout 与 stderr 同时读写；否则任一管道超过内核容量时，子进程和父进程会互相等待并被误报为超时。外部命令单独建立进程组，超时时整组终止，避免 fork 后代继承 pipe 令读取线程永久卡住。
 
 ### HTTP：`ureq` 3.3.0
@@ -99,7 +102,7 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 ### 其他
 
 - **不用 `criterion`**：用户等的是「松手到出图」的一次墙钟时间，采样型 harness 只报 per-`add` 吞吐，而尾部延迟住在 offline rebuild 与最后一次 `vstack` 里。两个 bench 都是 `harness = false` 的普通程序。
-- **不加 `tempfile` dev-dependency**：测试里各自用 `std::env::temp_dir()` + 计数器/pid/纳秒时间戳自建临时目录，`Drop` 里清理。
+- **测试不依赖临时目录框架**：测试里仍用 `std::env::temp_dir()` + 计数器/pid/纳秒时间戳自建并清理；`tempfile` 只作为 `vellum-ui` 的生产依赖，为 Wayland wl_shm 创建匿名 backing file。
 - **fixture 不用 `rand`**：合成页面用确定性混淆器生成，保证跨机可复现。
 
 ## 4. 长截图算法要点
@@ -108,31 +111,43 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 
 ### 匹配：行签名 + 稀疏 RGB 校验
 
-每帧取 96 个采样列（`min(width, 96)`，索引均匀分布），每行压成 3 个浮点特征（亮度均值、对比度、边缘能量）。候选偏移按「上次偏移优先，然后向两侧扇出」枚举，先用行签名打分，通过后再用稀疏 RGB 做像素级校验。
+每帧取 96 个采样列（`min(width, 96)`，索引均匀分布），每行压成 3 个浮点特征（亮度均值、对比度、边缘能量）。候选偏移按「上次偏移优先，然后向两侧扇出」枚举，先用行签名打分，通过后再用稀疏 RGB 做像素级校验。18×24 的静止画面签名也只能当预筛：必须同时满足 96 列 RGB 索引逐字节一致才允许提前返回，否则透明终端的固定壁纸可能掩盖采样行之间正在滚动的稀疏文字。
 
 **不能退回模板匹配**：`cv2.matchTemplate` 在抗锯齿文字上给出假低分，这是原实现踩过的坑。
 
 分数超阈值时走一次 robust 路径：`trimmed_mean` 只保留最好的 80% 重叠行，用来吸收局部动画。**这条路径有明确能力边界**：损坏行数超过重叠行的 1/5 就会失效。20 px 步长下实测 H=16 的动画块（16.4% 损坏）仍正确，H=20（18.2%）开始出错。回归测试用 H=16 并把这段推导写在注释里，避免有人把用例改大之后误判为回归。
 
+最近 6 个 viewport 仍是热路径；出现失配或速度突变时，才查询随 canvas 增量维护的完整行签名/稀疏 RGB 索引。恢复查询先用 16 行 × 6 列的小指纹对所有位置做 O(canvas height) 排名，行签名与 RGB 两个独立门各保留最多 512 个候选；只有候选并集才付完整 viewport 的原始 row-signature + sparse-RGB 双门禁，robust 也不再对每个 canvas 行分配并排序。小指纹只负责缩小候选集，`max_diff=9` 与 RGB 32/24 的接受阈值完全不变。命中已捕获位置时只移动 anchor、不追加旧像素，解决惯性滚动突然跳回历史内容后“高度不再动”或重复旧段的问题。近期历史可覆盖的位置不允许全画布路径推翻 sparse motion gate，避免固定页脚尚在 warm-up 时被误认成回访；已有可信历史候选时，全画布重定位还必须在 row 与 RGB 两个独立分数上都严格更好，单纯达到 `strong` 不能覆盖历史中的精确回滚。
+
+周期性列表需要额外防止“第一条低分就是正确答案”的假设：卡片高度重复时，实际回滚 -20 px 可能先遇到结构相似的 +52 px 候选。近期历史只有在普通 sparse-RGB 重叠逐字节一致时才提前结束；否则继续检查最多 6 个 viewport，并以行签名、RGB 分数依次择优。候选的最终运动量始终相对当前 canvas anchor 计算，而不是相对命中的旧参考帧，因此方向变化会在第一帧就记成负向，回访段只重定位、不增长画布。若只滚动一帧便原路返回，命中的 seed 相对自身是零位移；近期历史因此也保留静止签名，仅当签名与 96 列 RGB 都逐字节一致时，才把这个零参考位移解释为相对 live anchor 的精确回访。
+
 ### canvas 增量块拼接
 
-新内容按块 append/prepend 到 canvas，**只在 `result()` 时合并一次**。逐帧 vstack 会让长图越滚越慢（每帧重新分配并拷贝整张图）。
+新内容按块 append/prepend 到 canvas，**只在 `result()` 时合并一次**。逐帧 vstack 会让长图越滚越慢（每帧重新分配并拷贝整张图）。匹配索引也按块增长；只有恢复扫描才把紧凑索引拍成连续数据，绝不拍平 RGB canvas。
 
 ### 关键帧 + 离线重建
 
-在线拼接容错优先；`result()` 时用压缩关键帧（zlib level 1，硬上限 48 MiB / 160 帧）跑一次最短路径 DP 重建，把在线阶段被迫接受的坏链接换掉。淘汰关键帧时按 `(reason 优先级, span)` 排序，优先丢普通 motion 帧，保住 turn/recovered/failure 这些信息量大的。
+在线拼接容错优先；`result()` 时用压缩关键帧（zlib level 1，硬上限 48 MiB / 160 帧）跑一次最短路径 DP 重建，把在线阶段被迫接受的坏链接换掉。淘汰关键帧时按 `(reason 优先级, span)` 排序，优先丢普通 motion 帧，保住 turn/recovered/failure 这些信息量大的。若在线路径发生非连续的完整画布重定位，则保留已验证的在线 canvas，不再强迫只会表达局部时间边的离线图穿过跳转并复制回访区段。
 
 融合时按「视口中心权重高」的三角权重混合重叠行；像素差超过 `FUSION_MAX_PIXEL_DELTA` 时改为整体替换而不是平均，否则闪烁的光标会变成鬼影。
 
 ### 收尾顺序（不可省步）
 
-`finish()` 必须按序：置 `sampling=false` → `notify_all` 唤醒被背压挡住的采集线程 → 关高亮与面板 → `join` 采集线程（≤250 ms，让在途的 grim 落地）→ drain 队列 → 处理 `latest_frame` → `result()`。
+`finish()` 必须按序：置 `sampling=false` 并 `notify_all`（不再请求新帧）→ 关高亮与面板 → 给在途抓帧最多 250 ms 自然落地 → 若仍未返回才写 stop eventfd 中断 → join → drain 队列 → 处理 `latest_frame` → `result()`。取消则无需保尾帧，立即写 eventfd。
 
 省掉 drain 或 `latest_frame` 会静默丢掉最后一屏内容。`latest_frame` 独立于队列保存，就是为了关掉「grim 已抓到最终滚动位置但 GTK 还没处理完」这个竞态。
 
 ### 采集用线程，不用 GLib timer
 
-单次 grim 阻塞 16–22 ms。要达到足够的采样率就得用 ≤50 ms 的 timer，那会卡死 GTK 主循环。worker 线程 back-to-back 抓帧、`Arc<Mutex<VecDeque>>` + `Condvar` 背压（**队满时暂停采集而不是丢帧**，丢一个桥接帧就足以逼用户回滚），主线程用 `glib::idle_add` 消费。
+抓屏与像素转换都不进入 GTK 主循环。worker 线程按 compositor damage 请求 screencopy（或运行有界 grim fallback），`Arc<Mutex<VecDeque>>` + `Condvar` 背压（**队满时暂停采集而不是丢帧**，丢一个桥接帧就足以逼用户回滚），主线程只通过 `glib::idle_add` 顺序消费。
+
+### 隐私安全的长截图 trace
+
+`VELLUM_LONGSHOT_TRACE=1` 是按 session opt-in 的 JSON-lines 遥测。瘦客户端只为 `long` 请求附加内部 marker；daemon 用 Linux `getrandom(2)` 生成 128-bit 随机关联 id，把同一 id 传给 full CLI/UI，并记录 accepted、finish signal 与 child exit。服务不可用的 direct-exec 路径由 UI 自己生成 id。daemon 路径的 UI stdout/stderr 通过 pipe 由 daemon 逐行送进既有 512 KiB × 2 的用户私有 rotating logger，不能把裸 append fd 交给子进程绕过轮转；服务不可用的 direct UI 路径写 stderr，不新增像素 dump 或无限增长的目录。trace opt-in 只认当前请求 argv marker：fallback daemon 启动和 action spawn 都显式移除继承的 `VELLUM_LONGSHOT_TRACE`，一次 opt-in 不会污染后续 session。
+
+隐私约束由类型而不只是注释保证：`TraceField` 只接受整数、有限浮点、布尔和 `&'static str` 枚举，没有 `String`/`&str` 运行期文本入口。因此事件可以记录 rect/screen/measured/actual geometry、backend enum、capture/duplicate/enqueue/dequeue/max-depth、每帧 decision/shift/added/diff/canvas height、finish queue/latest/worker 和最终 online/offline height，却不能把截图像素、窗口标题、OCR 文本或动态 backend 错误串写进去。`F64` 的 NaN/Infinity 编成 JSON `null`，失败的 `getrandom` 明确报告 trace unavailable，不伪装成随机 id。
+
+捕获成功帧带单调 sequence。ordered queue 与独立 `latest` 使用同一 sequence，完成时只处理尚未由队列消费的 newest frame；这既保留在途尾帧，也避免把已经处理过的 `latest` 再送一次 stitcher。最终 summary 分开报告 capture、queue、stitch decision 与 offline rebuild 数字，用于判断“短图”发生在合成器 damage、队列、在线 matcher 还是 finish/offline 阶段。
 
 ### 不做自动滚动
 
@@ -140,9 +155,56 @@ Wayland 下普通应用无法安全合成滚轮事件。这是事实陈述，不
 
 ## 5. UI 侧的硬约束
 
+### 长截图面板收口设计（实时 viewport + 累计 canvas）
+
+**场景与唯一主任务。** 面板服务正在 niri/Hyprland 中手动滚动网页、终端或列表的用户；主任务不是浏览一张缩略长图，而是立即确认“目标 viewport 正在被采集/向哪边移动”和“唯一内容是否继续累积”，然后可靠完成。完成是唯一 suggested action，取消保持 quiet；面板仍用 `KeyboardMode::OnDemand`，不抢目标窗口焦点。
+
+**视觉 tokens。** 单一深色 surface `rgba(23,26,33,.97)`；正文 `#f2f4f8`、次要文字 `#aab1c0`；蓝色 `#8ea9ff` 只表示拼接增长/主动作；绿色 `#7ed9ad` 只表示采集健康；琥珀 `#f0c674` 表示校准/减速；红色 `#ff8995` 只用于真正失败。标题走 GNOME heading，状态/说明走 body/caption，数字保持 tabular-feeling 但不引入自带字体。签名元素是一条紧凑的“拼接缝轨”：最近若干 decision 中，新增行是蓝段、已捕获回访是紫灰段、静止是暗点、拒绝/恢复是琥珀段；它表达历史变化而不是伪造未知终点的百分比。
+
+**两种反馈语义必须分离。** “实时画面”是节流到约 12 fps 的最新 viewport 小缩略图和 `↑/↓ N px`/“回访已捕获区域”文案；distinct frame（包括 rejected/revisit）在 80 ms 窗口内合并到 newest 并安排尾部刷新，不能直接丢弃最后一帧；“累计拼接”只显示 unique canvas height、约等于多少 viewport、处理/对齐数和拼接缝轨，仅在 matcher decision 改变时更新。不能再让一张 accumulated thumbnail 同时冒充这两个信号。
+
+按 1920 logical output 的常见 niri 选区/列宽规划，而不是把同一布局硬缩：
+
+```text
+约 1/3 或 1/2 选区、侧边空隙 >= full panel
+┌ 长截图                         [采集中] ┐
+│ 保持平稳滚动，画面会自动拼接             │
+│ 实时画面                         ↓ 20 px │
+│ ┌──────── 小型 viewport（约 240×86） ───┐ │
+│ └───────────────────────────────────────┘ │
+│ 累计拼接                    3,420 px · 4.9 屏 │
+│ ━━━╍━╍━━  （最近 decision 拼接缝轨）       │
+│ 48 帧处理 · 26 帧对齐 · 3 次回访           │
+│ 再次按长截图快捷键完成                      │
+│ [取消]                         [完成]      │
+└───────────────────────────────────────────┘
+
+约 2/3 选区、侧边空隙只能容纳 compact panel
+┌ 长截图                   [采集中] ┐
+│ 正在采集                    ↓ 20 px │
+│ 累计 3,420 px · 4.9 屏              │
+│ ━━━╍━╍━━  48 处理 · 26 对齐          │
+│ [取消]                 [完成]       │
+└────────────────────────────────────┘
+
+只剩窄边缘安全空隙
+上/下横条：┌ 取消  ● [采集中] 12.4k [完成] ┐
+左/右竖条：┌ 取消 ┐
+             │  ●   │
+             │采集中│
+             │12.4k │
+             │ 完成 │
+             └──────┘
+
+接近全输出、四边连微型条也放不下
+（选择阶段先提示控制条可能隐藏；不映射 panel；daemon 管理时只写 trace 并由第二次快捷键完成，direct 模式在采样前失败；highlight 也只在能证明外置时显示）
+```
+
+当前主题在 1920×1080、scale 1 的 release/debug 相邻实测 footprint 为 full **332×401–404**、compact **280×242–245**、micro 横条 **298×62**、micro 竖条 **94×176–177**；最终仍以 GTK 最大 natural size 与 map 后 allocation 为准，不为命中目标尺寸裁掉 primary action。视觉自检明确拒绝：重复 metric cards、巨型数字/标题、霓虹渐变、未知总量的假 progress bar、把日志塞进面板、以及在图片上叠文字。高对比 micro 与 USER-priority 26px（约 200% 正文）纯色 fixture 都通过零污染和视觉检查；大字若使实际 allocation 超出某个选区的安全 gap，安全降级/隐藏仍优先于强行显示。相邻文字提供自定义 DrawingArea 的等价语义，按钮保留明确 label 与键盘访问。
+
 这些是原实现用户反馈换来的，改掉等于回归。
 
-- **UI 绝不进入产出图**：选区边框是四个独立的 layer-shell 窗口且只画在选区外；长截图面板锚在选区未覆盖的一侧（挑最宽的空隙，都不够时退到底部）；overlay 关闭后等 250/300 ms 才开始抓帧。
+- **UI 绝不进入产出图**：选区边框是四个独立的 layer-shell 窗口且只画在选区外；边框不使用会扩张 footprint 的 CSS shadow。长截图面板依次尝试带预览尺寸、compact 尺寸，再按安全边缘选择上/下横向或左/右纵向 micro rail；连 micro 都无法证明安全时才主动隐藏，绝不退回选区上方。选择 overlay 在采样前按生命周期分流：daemon-managed 明确“再次按同一快捷键完成”，direct 明确“请使用控制面板完成”；micro 设计 envelope 也放不下时，managed 提示控制条可能隐藏，direct 则提示缩小选区、本次可能无法安全开始。overlay 随后完全关闭，提示本身不会进入帧。panel 与边框显式选择唯一 output，并用 `exclusive_zone=-1` 让 margin 与 grim 的全输出坐标同源，不被 bar/dock 推向选区；多输出、scale/geometry 不一致或选区越界时 fail closed 隐藏 recorder UI。动态文案的最大 natural size 在 map 前全部测量并固定 request，visible panel 在 map 后仍用 GTK 实际 allocation 再验一次；未映射或实际尺寸不安全会在采集前关闭并额外等待 300 ms。overlay 关闭后仍保留 250/300 ms settle。
 - **长生命周期窗口必须 `NON_UNIQUE`**：GTK 默认单实例下，第二次截图只向第一个进程转发 `activate`，后者重新显示**旧内容**然后退出并删掉自己的 `--cleanup` 临时文件，新截图永久丢失。overlay、pin、result 三个都设了。
 - **孤儿 overlay 逃生阀**：overlay 持有全屏 EXCLUSIVE 键盘抓取，一旦映射到用户看不见的地方，Escape 永远不来，进程僵在 `Application::run`。看门狗认**真实输入时间戳**（45 s 静默取消，5 s 轮询），不认 GTK 焦点事件——layer-shell 下焦点 enter/leave 不可靠，早期纯焦点方案会把「只用鼠标标注」误判为用户离开。焦点丢失只启动 10 s 宽限计时，期间任何输入都撤销它。
 - **标注模式豁免看门狗**：边看屏幕边想批注是合理的静止。
@@ -159,7 +221,9 @@ JSON over Unix socket，换行分帧，单条上限 64 KiB。命令 `ping`/`stat
 
 **`long` 是开关式**：已有长截图在跑时不返回 busy，而是向活动进程发 `SIGUSR1` 让它完成，返回 `{accepted:true, toggled:true}`。这样用户不必把指针移回浮动面板——面板本来就得留在采样区外。`region`/`long` 互斥，`pin-last` 不互斥（它只是重钉剪贴板内容）。
 
-安全边界：`flock` 独占 `service.lock`；runtime dir 0700；socket 0600（socket 能启动进程，不许他人访问）；子进程 stdout/stderr 追加进 `service.log`（GUI 动作没有终端，否则 panic backtrace 不可见）；子进程设 `VELLUM_BYPASS_SERVICE=1`（否则它会把请求再打回守护进程形成无限循环）并 `setsid()`（动作窗口要活过守护进程重启）。
+失败反馈按边界区分：daemon 无法启动但 direct UI 可用时不在抓图前弹可能入镜的通知，而由可见 panel 标题持续显示“仅面板完成”，主状态仍保留采集重试/恢复与 matcher 反馈；direct 模式若 panel 必须隐藏、map 失败或实际 allocation 不安全，会在采样前失败；niri live fixture 还断言该路径没有 worker、`sampling=false`。daemon 管理的 `Placement::Hidden` 是正常安全降级，只写固定枚举 trace，第二次快捷键仍可完成。full-screen background capture/overlay present、capture thread spawn 和 stitch result failure 各有独立 trace event 与用户文案，并且 critical 通知只在采样停止、surface 关闭后发出。`None + warnings` 是失败 exit 1，只有 `None + no warnings` 才是用户取消 exit 130。
+
+安全边界：`flock` 独占 `service.lock`；runtime dir 0700；socket 0600（socket 能启动进程，不许他人访问）；子进程 stdout/stderr 用两个 pipe 并行排空，再经 `Log::write` 进入 `service.log`（GUI 动作没有终端，否则 panic backtrace 不可见，同时不能绕过 512 KiB 轮转）；子进程设 `VELLUM_BYPASS_SERVICE=1`（否则它会把请求再打回守护进程形成无限循环）、`VELLUM_DAEMON_MANAGED=1`（UI 才能证明第二次快捷键有接收者），并 `setsid()`。
 
 accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个真实缺陷**：25 ms 的 sleep 让每次快捷键都固定多付 25 ms（`PERFORMANCE.md` §3）。`REAP_INTERVAL` 现在只是「多晚注意到子进程已结束」的上限，不是请求延迟。
 

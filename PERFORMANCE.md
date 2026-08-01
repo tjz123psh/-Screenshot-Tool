@@ -2,12 +2,12 @@
 
 ARCHITECTURE.md §6 要求性能结论必须来自实测，不能凭「Rust 应该更快」。本文档记录测量方法、可复现命令和本机实测数据，并列出与 Python 版的行为差异（§8.4）。
 
-所有数据都在同一台机器、同一次会话内采集：
+历史主表与本轮补测都在同一台机器上采集；涉及合成器的条目在各节明确会话，不能互相替代：
 
 - AMD Ryzen 7 7735H（16 线程），Arch Linux
 - rustc 1.97.0，release profile（`opt-level=3`、`lto="fat"`、`codegen-units=1`）
 - Python 3.14.6 + numpy 2.5.1 + Pillow 12.3.0（对照基线）
-- 合成器：**Hyprland 0.56.0**（见文末「环境偏差」）
+- 历史 overlay/窗口主表：Hyprland 0.56.0；2026-08-01 的 screencopy 与最终 smoke：niri
 
 Debug 构建的数字不要用来比较：形态学与拼接热路径在 debug 下比 release 慢一个量级，实测 OCR debug 比 Python 慢约 2 倍、release 反而更快。
 
@@ -31,14 +31,90 @@ cargo bench -p vellum-stitch
 
 | 场景 | 实现 | 总计 | add | 每帧 | finish |
 |---|---|---|---|---|---|
-| 不透明 | vellum | **142.1 ms** | 90.2 ms | 0.89 ms | 51.9 ms |
+| 不透明 | vellum | **151.5 ms** | 105.3 ms | 1.04 ms | 46.2 ms |
 | 不透明 | Python | 1419.9 ms | 831.2 ms | 8.23 ms | 588.7 ms |
-| 半透明 | vellum | **140.4 ms** | 93.4 ms | 0.92 ms | 47.1 ms |
+| 半透明 | vellum | **135.1 ms** | 93.6 ms | 0.93 ms | 41.5 ms |
 | 半透明 | Python | 1317.9 ms | 749.9 ms | 7.42 ms | 568.0 ms |
 
 两边都是 101 帧全部使用、输出 900x2700、keyframe 2.2 MiB、走了 offline rebuild，即同等工作量下 **约 10 倍**。ARCHITECTURE.md §4.2 记载的 Python 基线 1.4~2.3 秒与此处复现的 1.42/1.32 秒一致。
 
 keyframe 内存 2.2 MiB 远低于 48 MiB 硬上限，`_trim_keyframes` 在该规格下不会触发。
+
+### 超长画布失配恢复
+
+完整画布重定位不能对每个候选位置再比较一个完整 viewport，否则一次 miss 是 O(canvas height × viewport height)，而且 robust 路径会在每个位置创建并分区行分数。用 release 临时压力探针预先构造 **50,000 行 canvas、700 行 viewport**，再送入一帧确定不匹配的画面；构造阶段不计入 miss：
+
+| 实现 | 单次完整 miss |
+|---|---:|
+| 逐位置完整普通 + robust 扫描 | 167 ms |
+| 双门粗排 + 有界精确候选 + viewport RGB window | **38–42 ms** |
+
+当前实现对全画布只做 16 行 × 6 稀疏列的 O(canvas height) 粗排，行签名与 RGB 分别保留最多 512 个候选，再用原始完整 scorer 和不变的 9.0 / 32 / 24 门限决定是否重定位。粗排不参与接受判定；精确、局部损坏 robust、快速前进三个相邻回归均通过。压力文件属于一次性 probe，测完已删除，仓库只保留确定性功能回归。
+
+### 周期列表回滚
+
+新增的 `repeating_list_rollback` 回归使用 72 px 周期卡片、240 px viewport 与 20 px 步长，执行“向下 600 px → 回滚到 100 px → 再向下超过旧边界”。旧热路径在第一帧回滚时把 -20 px 选成结构同相位的 +52 px，在线画布由应有的 1040 px 膨胀到 2840 px；禁用离线重建与默认重建两条路径都确定性失败。修复后回访阶段每帧 `last_added == 0`，第一帧方向即为 -20 px，在线输出和离线重建输出都与唯一页面跨度逐字节一致；相邻的三帧边界 `0 → 20 → 0` 也验证了历史只有 seed 与 newest 时仍能精确回访；`600 → 500` 的速度突变用例则锁定“完整画布候选不得用较差分数覆盖历史中的 0/0 精确命中”。该修复只在首个候选的 sparse-RGB 重叠并非完全一致时继续查看至多 6 帧历史，普通静态滚动仍在第一帧短路，接受阈值没有变化。
+
+### “短图”分层遥测方法
+
+`VELLUM_LONGSHOT_TRACE=1 vellum long` 会把一次 session 的 daemon/UI 生命周期和逐帧数字写成带随机 id 的 JSON-lines。它不写像素或运行期文本，因而可以在真实网页上长期复现而不把页面内容带入日志。关键判读：
+
+- `capture_successful` 与 `capture_exact_duplicates`：合成器实际交付了多少 distinct viewport；
+- `queue_enqueued/dequeued/max_depth`：是否背压、是否有尾帧只落到 `latest`；
+- 每个 `stitch_frame` 的 `decision/shift/added/diff/canvas_height/recovered`：是拒绝、已捕获回访、完整画布 re-anchor，还是确实增加唯一行；
+- `finish_started`、`capture_worker_joined`、`finish_latest_frame`：完成时 queue/latest/in-flight 是否收干净；
+- `session_summary` 的 online/output height 与 `offline_rebuilt`：在线 canvas 正确但离线重建变短，还是输入/在线阶段已经缺桥。
+
+trace 未开启时 emitter 本身不分配或序列化；capture sequence/汇总计数仍使用已有 queue mutex，以便尾帧去重语义不依赖诊断开关。其对 101 帧 stitch benchmark 与 niri capture cadence 的影响必须在 Phase F 重跑后再记录，当前不把“clippy/tests 通过”冒充性能结论。
+
+### recorder UI 隔离的 niri 像素证明
+
+ignored live test `recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels` 在当前单输出 niri（1920×1080 logical、scale 1）短暂映射一个已知 RGB `[31,93,167]` 的 full-output Overlay layer，随后只在内存中创建真实 `Recorder`、可见 Overlay panel 与四条 highlight，并抓取中央 600×500 rect；不读取原桌面内容、不写任何 PNG/frame。命令：
+
+```sh
+# full panel（600×500）
+VELLUM_LONGSHOT_TRACE=1 cargo test --locked --release -p vellum-ui \
+  recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels \
+  -- --ignored --exact --nocapture --test-threads=1
+
+# compact panel（1280×500）
+VELLUM_LONGSHOT_TRACE=1 VELLUM_TEST_LONGSHOT_COMPACT=1 \
+  cargo test --locked --release -p vellum-ui \
+  recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels \
+  -- --ignored --exact --nocapture --test-threads=1
+
+# micro 竖条（1600×900，只剩左右窄边缘）
+VELLUM_TEST_LONGSHOT_MICRO=1 \
+  cargo test --locked --release -p vellum-ui \
+  recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels \
+  -- --ignored --exact --nocapture --test-threads=1
+
+# micro 横条（1920×900，只剩上下窄边缘）
+VELLUM_TEST_LONGSHOT_MICRO_HORIZONTAL=1 \
+  cargo test --locked --release -p vellum-ui \
+  recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels \
+  -- --ignored --exact --nocapture --test-threads=1
+
+# daemon-managed hidden panel（1800×1000，连 micro 也无安全位置）
+VELLUM_LONGSHOT_TRACE=1 VELLUM_TEST_LONGSHOT_HIDDEN=1 \
+  cargo test --locked --release -p vellum-ui \
+  recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels \
+  -- --ignored --exact --nocapture --test-threads=1
+
+# direct hidden（无 daemon finish endpoint，必须在采样前失败）
+VELLUM_TEST_LONGSHOT_DIRECT_HIDDEN=1 \
+  cargo test --locked --release -p vellum-ui \
+  recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+fixture 使用 Overlay 而不是 Top：用户 shell 可能常驻透明 OSD/notification Overlay surface，Top fixture 无法隔离它们；fixture 先 map、Recorder surface 后 map 于同一层，所以既覆盖既有无关 surface，又不会掩盖之后创建的 vellum surface。
+
+2026-08-01 最新 release 构建顺序实测六种真实分支：600×500 选区得到 `with_preview`，1280×500 得到 `without_preview`；1600×900 得到右侧 micro 竖条，1920×900 得到下方 micro 横条；1800×1000 才进入 daemon-managed `hidden/no_safe_space`，同尺寸 direct hidden 同步返回 `None + 1 warning`，并断言 `sampling=false`、capture worker 不存在。一次带 trace 的 release 测量得到 full **332×401**、compact **280×242**、micro 横条 **298×62**、micro 竖条 **94×176**；debug/字体分配的相邻运行曾为 full 332×404、compact 280×245、竖条 94×177，因此安全逻辑从不把单个硬编码尺寸当真值，而是逐次测量最大 natural size、固定 request，并在 map 后再验 actual allocation。前五个采样分支均为 `output_geometry_proven=true`，最终图尺寸与选区一致；按每通道容差 1 统计，偏离 fixture 的像素都为 **0**。full/compact/micro 强制 panel 可见且 micro 还断言选择阶段 envelope 不小于当前 measured footprint；managed/direct hidden 强制 panel 不可见，direct 分支证明没有留下无法完成的后台采集。六个分支每次结束后结构化查询的 vellum layer 数量都为 0，fixture/panel/highlight 均已收口。
+
+可访问性定向 smoke 也沿用同一纯色/零像素 fixture：`GTK_THEME=Adwaita:hc` 下 micro 竖条 exit 0；`VELLUM_TEST_LONGSHOT_LARGE_TEXT=1` 在 USER CSS priority 注入 26px 字体（约为正文 13px 的 200% 压力条件），400×300 选区仍保留全部状态与主操作，测得 full 464×555、compact 406×301、micro 横条 484×74、竖条 166×251，map 后安全校验、零污染和 layer 清理均通过。确定性 fixture 截图的原尺寸视觉检查确认大字状态文案换行但不遮挡实时画面、累计高度或取消/完成按钮；这不替代真实桌面的 Orca 手工验收。
+
+该证据覆盖当前 niri 单输出/scale 1。多输出或 capture/GDK scale/geometry 不一致时生产代码 fail closed：daemon 管理的 capture 不映射无法证明安全的 recorder UI，只写 trace；direct capture 则在采样前失败。桌面通知不会在采样前或采样中作为 fallback，因为它同样可能入镜。不能把单屏证据外推成未经验证的多屏安全结论。Hyprland 的相同纯色 live test 仍需切换会话后执行，不能用 niri 结果代替。
 
 ### 输出逐位等价
 
@@ -74,8 +150,8 @@ cargo bench -p vellum-ipc
 
 | 命令 | mean | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|
-| ping | **0.046 ms** | 0.043 ms | 0.066 ms | 0.082 ms | 0.263 ms |
-| status | **0.045 ms** | 0.042 ms | 0.065 ms | 0.088 ms | 0.206 ms |
+| ping | **0.046 ms** | 0.042 ms | 0.065 ms | 0.088 ms | 0.327 ms |
+| status | **0.049 ms** | 0.042 ms | 0.072 ms | 0.108 ms | 1.015 ms |
 
 落在 §6 要求的亚毫秒区间。
 
@@ -92,7 +168,7 @@ status   mean  25.156 ms  p50  25.131 ms  p95  25.246 ms  p99  25.677 ms  max  2
 
 修复：`WouldBlock` 分支改为 `poll()` 阻塞等待（`wait_readable`），超时值 `REAP_INTERVAL = 25ms` 只决定「多晚注意到抓图子进程已结束」，有连接到来时 `poll()` 立刻醒。**25.149 → 0.046 ms，约 546 倍**。
 
-回归验证：`cargo test -p vellum-ipc` 22 项全过，含 long 开关语义、互斥拒绝、子进程收尸、日志轮转、shutdown 路径。
+回归验证：`cargo test -p vellum-ipc` 28 项全过，含 long 开关语义、互斥拒绝、子进程收尸、日志轮转、shutdown 路径。
 
 如果只依赖「Rust 比 Python 快」的直觉，这个缺陷会一路带到用户手上，且症状（快捷键有一点点迟滞）几乎不会被归因到 socket 层。
 
@@ -153,7 +229,9 @@ vellum 约 **2.9 倍** 快（155 ms vs 460 ms 中位）。
 
 vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧省约 99 ms**，且省掉一次 PNG 编码再解码的往返。这是长截图 `add` 之外最大的单项收益，也是采样率能提上来的前提。
 
-关于直接走 `wlr-screencopy`：`grim -t ppm` 的 22 ms 里已经包含进程创建、协议往返和一次全屏拷贝。自己实现 screencopy 能省掉进程创建（约 1~2 ms）和 PPM 序列化，但要接管 dmabuf/shm 缓冲、多输出几何、格式转换和合成器差异。**当前不做**：长截图的瓶颈已经不在抓帧（0.89 ms/帧的拼接 vs 16 ms 的区域抓帧，抓帧是上限但 20 px/帧的滚动速度下 16 ms 已足够），端到端延迟的大头在 GTK 初始化而非抓屏。如果将来要提高长截图采样率上限，这是第一个该动的地方。
+长截图现已独立实现持久 `wlr-screencopy` 后端：一条 Wayland 连接、xdg-output 逻辑几何、复用 wl_shm buffer，事件等待同时 poll Wayland fd 与 stop eventfd。2026-08-01 在当前 niri 会话用 release 构建强制连续执行 31 次普通 copy、每次 900×700（像素只在内存中校验后丢弃），总计 62.44 ms，均值 **2.01 ms/帧**；同区域逐帧 `grim -t ppm` 为 16 ms，原始 copy 约快 8 倍。实际采样在首帧后用 `copy_with_damage`，只在内容变化时交付帧，并每 1 秒普通 copy 一次作为静止画面 heartbeat，避免 2 ms 原语反过来制造数百张重复帧。协议不可用、跨输出或运行时错误时回退 grim；fallback 通过 memfd 接收 PPM、每次最多等待 2 秒并整组杀死超时子进程，因此稳定性不依赖 screencopy 一定可用。
+
+这里优化的重点不是只省 14 ms，而是消除“每帧新建一个无 timeout 子进程”的无界状态：持久连接可被完成信号立即唤醒，连续失败有 UI 状态，输出变化最多触发一次降级。当前 niri 已用 3 帧 2×2 与 31 帧 900×700 两种真机路径验证 buffer 复用；Hyprland 仍需在切换到该会话后做同一真机 smoke，不能用 niri 的通过替代。
 
 ---
 
@@ -190,6 +268,23 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 
 普通 clean 与旧路径耗时相同；额外成本只在场景分析要求 CLAHE、相反极性或颜色投影时支付。所有 Tesseract 尝试共用 30 秒总 deadline，不会按候选数线性放大最坏等待。历史并排表中的彩色强干扰 fixture 仍有 1 个 CJK 字错误，但已从包含大量噪声的 48.8% 提升到无额外噪声的 95.2%；仓库内新的可重复门禁使用独立合成样本，当前复跑为 10/10、100%。
 
+#### 困难场景延迟收敛（当前修复）
+
+在同一台机器、同一 probe 和同一 10 个固定 fixture 上，调整只涉及候选调度：等亮异色时把颜色投影提前，彩色繁忙背景先颜色后反极性，PSM 11 稀疏噪声过多时不再启动会放大噪声的 block retry（PSM 6 → 11 的救援仍保留），LocalContrast 的两种语言顺序并行后仍执行原来的逐行融合。识别门禁保持 **10/10、全部 100%**；耗时对比如下（单次墙钟，保留进程抖动）：
+
+| fixture | 调整前 | 当前 |
+|---|---:|---:|
+| clean | 593 ms | 635 ms |
+| dim-light | 1752 ms | 1310 ms |
+| dim-dark | 1579 ms | 1265 ms |
+| isoluminant | 4139 ms | **1119 ms** |
+| color-interference | 4905 ms | **2496 ms** |
+| faded-gradient-light | 1802 ms | 1904 ms |
+| faded-colored-dark | 1650 ms | 1187 ms |
+| banner-dim-color | 1485 ms | 1065 ms |
+
+因此用户观察到的旧版慢路径确实是“困难场景用更多 Tesseract 候选换识别率”，但不是必须串行付完所有候选。现在保留同样的质量复核，最慢合成场景从约 4.9 秒降到约 2.5 秒。`VELLUM_OCR_TRACE=1` 可记录候选种类、PSM、预处理/Tesseract 耗时、置信度与最终选择，不记录 OCR 文本。
+
 #### 可重复的本地回归门禁
 
 历史表保留的是 v0.1.0 与增强提交的原始并排测量；为避免 fixture 只存在于临时目录，仓库另提供 `tools/ocr-regression.py`。它用固定随机种子生成 8 个双行场景和 2 个短横幅，在临时目录构建并调用 `vellum-text` 的 developer-only `ocr_probe` example，按同一 Levenshtein 规则返回人类表格或 `--json`，任何场景低于阈值即退出 1。脚本不读取截图目录或剪贴板。
@@ -200,7 +295,7 @@ python3 tools/ocr-regression.py
 python3 tools/ocr-regression.py --json
 ```
 
-该检查依赖本机字体与 Tesseract 数据，不冒充纯 Rust CI；缺依赖或 fixture/probe I/O 失败会明确退出 2（unavailable），与完成评分但不达标的退出 1 分开。Rust 侧的候选选择、CLAHE/PCA、TSV 解析和多栏融合仍由无外部依赖的单元测试覆盖。2026-08-01 在 Tesseract 5.5.3 + Source Han Sans CN 上从干净临时目录复跑，10/10 场景均为 100%，耗时从 clean 591 ms 到强彩色干扰 4963 ms。
+该检查依赖本机字体与 Tesseract 数据，不冒充纯 Rust CI；缺依赖或 fixture/probe I/O 失败会明确退出 2（unavailable），与完成评分但不达标的退出 1 分开。Rust 侧的候选选择、CLAHE/PCA、TSV 解析和多栏融合仍由无外部依赖的单元测试覆盖。2026-08-01 在 Tesseract 5.5.3 + Source Han Sans CN 上从干净临时目录复跑，10/10 场景均为 100%；最终调度下 warm run 的 clean 约 635 ms，最慢的强彩色干扰约 2496 ms。
 
 ### 翻译
 
@@ -223,7 +318,7 @@ python3 tools/ocr-regression.py --json
 
 **性能相关**
 
-1. **抓屏用 `grim -t ppm` + 手写 P6 解码**（Python 用 `-t png`）。每帧省约 99 ms，见 §3。
+1. **普通抓屏用 `grim -t ppm` + 手写 P6 解码，长截图优先持久 `wlr-screencopy`**（Python 每帧 `grim -t png`）。screencopy 失败时才回到有界 grim，见 §3。
 2. **`route_action` 直接发 action**，失败才 `ensure_service` 重试一次。Python 每次动作前先发一次独立 `ping`，白付一次往返。
 3. **daemon accept 循环用 `poll()`**。Python 的 `socketserver` 是阻塞 accept，本来没有这个问题；是 Rust 版早期的 nonblocking+sleep 写法引入的，已修复（§2）。
 4. **`vellum`/`vellumctl` 不链接 GTK**，用 execv 交接给 `vellum-ui`。Python 的 `fastctl.py` 同样避免 import GTK，但回退时需要注入 `LD_PRELOAD=/usr/lib/libgtk4-layer-shell.so`；Rust 版在构建期链接 gtk4-layer-shell，不需要 preload。
@@ -258,9 +353,9 @@ python3 tools/ocr-regression.py --json
 
 ## 6. 验收覆盖与环境限制
 
-**当前会话运行的是 Hyprland 0.56.0**（`niri` 二进制存在于 `/usr/bin/niri`、`~/.config/niri/` 配置齐全，但 `NIRI_SOCKET` 不存在，进程列表里是 `Hyprland`）。所以两个后端的验收程度不同。
+核心合成器集成已分别在 Hyprland 0.56.0 与 niri 真机验收。以下区分既有窗口/快捷键路径与本轮新增的长截图采集路径，不能用一个合成器的结果替代另一个。
 
-**Hyprland：已真机验收。** 用 vellum 自己的 pin 窗口跑通了完整代码路径（不是裸 IPC 探测）：
+**Hyprland 既有路径：已真机验收。** 用 vellum 自己的 pin 窗口跑通了完整代码路径（不是裸 IPC 探测）：
 
 | 检查 | 结果 |
 | --- | --- |
@@ -273,10 +368,8 @@ python3 tools/ocr-regression.py --json
 
 layer-shell 行为（overlay 呈现、namespace、exclusive zone）也在 Hyprland 上验证通过，本文档的合成器侧延迟数据就是在这里采集的。
 
-**niri：只有单元测试与静态校验。** 本机不是 niri 会话，以下路径需要你在 niri 里确认：
+**niri 既有路径：已真机验收。** 合成器探测、按 pid 找自己的窗口、pin 浮动与精确改尺寸、layer-shell overlay，以及迁移后的快捷键均曾在 niri 会话跑通。
 
-- niri IPC（`compositor/niri.rs` 的浮动 / 按 pid 找窗口 / 读写尺寸）。协议形状与 Python 版一致且未改动，但没有活的 niri 可以对话。
-- `vellum shortcuts install` 写入 `~/.config/niri/dms/keybinds.kdl` 后的实际按键行为，以及 `niri validate` 之后的 reload。生成的 KDL 已用 `niri validate` 校验通过（`contrib/niri-vellum.kdl`）。
-- niri 预设分栏宽度（1/3、1/2、2/3、全宽）下的窗口布局（`ARCHITECTURE.md` §5 要求）。
+**本轮长截图采集改动的环境边界：** 2026-08-01 的最终验证会话是 niri（`NIRI_SOCKET` 已设置、`HYPRLAND_INSTANCE_SIGNATURE` 未设置）。忽略测试在内存中连续采集 3 帧，覆盖持久 `wlr-screencopy` 连接、damage copy 与 wl_shm buffer 复用；像素没有写盘。当前会话无法对新增后端做 Hyprland 真机 smoke，因此该项是“不可用”，不是通过。安装新构建后的完整 GUI 手动滚动手感也仍属于环境依赖验收。
 
-**Hyprland 快捷键的已知限制**：你的 Hyprland 配置是 Lua 格式，`vellum shortcuts install` 对它**只打印可粘贴片段、不自动写入**（理由见 `DESIGN.md` §8：这个 build 拒绝 `hyprctl keyword`，没有生效前校验的手段）。经典 `hyprland.conf` 格式可以自动写入。两种格式的示例都在 `contrib/`。我没有改动你的任何合成器配置。
+**Hyprland 快捷键的已知限制**：Lua 配置下，`vellum shortcuts install` 只打印可粘贴片段、不自动写入（理由见 `DESIGN.md` §8：该 build 拒绝 `hyprctl keyword`，没有生效前校验手段）；经典 `hyprland.conf` 格式可以自动写入。两种格式的示例都在 `contrib/`，实际用户配置是否应用需由安装流程另行验证。

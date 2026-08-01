@@ -8,7 +8,7 @@
 
 - 区域截图：拖拽框选、移动、缩放选区，保存并复制到剪贴板。
 - 标注：画笔、箭头、矩形、文字、颜色、粗细和撤销。
-- 长截图：用户手动滚动，vellum 连续抓帧并自动拼接；支持固定页眉/页脚、局部动画、半透明背景和离线路径重建。
+- 长截图：用户手动滚动，vellum 用持久 Wayland screencopy 连续抓帧并自动拼接；支持完整画布重定位、固定页眉/页脚、局部动画、半透明背景和安全回退。
 - OCR：本地 Tesseract，支持简体中文和英文；会针对彩色干扰、等亮异色文字、暗淡字色、低对比度和明暗渐变自动选择预处理候选；可选视觉模型失败时回退本地 OCR。
 - 翻译：优先复用本机 `opencode serve`，不可用时回退 `opencode run`，并支持免费模型池轮换。
 - 钉图：无边框浮动窗口，支持移动、缩放、复制和保存。
@@ -108,11 +108,25 @@ vellum logs               # 查看服务日志
 Wayland 普通应用无法安全合成全局滚轮事件，所以 vellum 不做自动滚动：
 
 1. 执行 `vellum long` 或按 `Mod+Shift+Print`；
-2. 框选目标区域；
+2. 框选目标区域；选择 overlay 会提前说明控制条会按选区外空间缩小，必要时隐藏；
 3. 手动垂直滚动目标窗口；
 4. 再次执行同一动作完成，或在控制面板聚焦时按 Enter；Esc 取消。
 
-采样期间请保持选区和窗口尺寸不变。vellum 会处理短暂停顿、往返滚动、固定页眉/页脚、局部动画和半透明窗口；控制面板与选区高亮不会进入结果图。
+控制面板按选区外空间依次降级为完整面板、无预览 compact 面板、横向/纵向微型控制条；微型条仍保留采集状态、累计高度、取消和完成。只有连微型条都无法安全放置时才完全隐藏；正常由控制服务管理时再次按同一长截图快捷键仍可完成，direct 降级则会在采样前要求缩小选区。采样期间请保持选区和窗口尺寸不变。vellum 会处理短暂停顿、往返滚动、周期重复的列表页、突然跳回已捕获内容、固定页眉/页脚、局部动画和半透明窗口；控制面板与选区高亮不会进入结果图。长截图优先复用一条可中断的 `wlr-screencopy` 连接；协议不可用、选区跨输出或运行时失败时自动切到有 2 秒 deadline 的 `grim`，不会无限显示“采集中”却没有新帧。
+
+透明终端的文字可以拼接，但桌面壁纸属于视口固定背景，并不存在可恢复的“下一屏壁纸”；输出中可能按每次滚动步长出现背景重复条带。需要干净长图时请临时关闭终端透明度，并尽量把滚动条/minimap 排除在选区外。这与文字滚动被误判为静止是两件事：后者由 96 列 RGB 二次确认防止，前者是合成后的 Wayland RGB 截图无法反推出窗口 alpha 的信息边界。
+
+### 长截图隐私安全 trace
+
+遇到“滚动很多但结果偏短”、回访后不增长或面板没有出现时，可以只为下一次长截图开启结构化 trace：
+
+```sh
+VELLUM_LONGSHOT_TRACE=1 vellum long
+```
+
+该开关会跨控制服务传给本次 `vellum-ui`，并为 session 生成随机关联 id。正常 daemon 路径写入用户私有、已有大小轮转的 `~/.local/state/vellum/service.log`；服务不可用而直接运行 UI 时写到该调用的 stderr；内容只包括生命周期状态和数值：选区/屏幕/面板几何、后端类型、捕获成功与精确重复计数、入队/出队及最大深度、每帧 `shift`/`added`/`diff`/canvas height/decision、finish 尾帧状态以及在线/离线输出高度。字段 API 不接受运行期文本，因此不会记录截图像素、窗口标题、OCR/翻译文本或后端动态错误内容。未设置为精确值 `1` 时完全关闭。
+
+桌面通知本身也是可能被 `grim`/screencopy 拍进选区的 surface，因此采样开始前和采样期间不弹通知：选择 overlay 会按实际完成路径给出提示：daemon-managed 模式说明可再次按同一快捷键，direct 模式只指向控制面板；连微型控制条都可能放不下时，前者提示控制条可能隐藏，后者提示缩小选区。由 daemon 管理且最终没有安全位置时，状态只写入隐私安全 trace，第二次快捷键仍可完成；未连接 daemon 的 direct 模式会在可见面板标题持续显示“仅面板完成”，若面板隐藏、映射失败或实际尺寸不安全则在采样前失败，不会留下无法结束的后台采集。采集线程启动失败和拼接失败会先停止采样、关闭全部 recorder surface，再发 critical 通知。
 
 ## 配置和文件位置
 
@@ -140,6 +154,9 @@ $XDG_RUNTIME_DIR/vellum/control.sock    用户私有控制 socket
 | `VELLUM_RUNTIME_DIR` | 覆盖 runtime/socket 目录，主要用于测试隔离 |
 | `VELLUM_RENDERER` | 覆盖 overlay 默认使用的 Cairo GSK renderer |
 | `VELLUM_TRACE=1` | 输出 `vellum-ui` 启动阶段打点 |
+| `VELLUM_OCR_TRACE=1` | 输出 OCR 候选、PSM、耗时和置信度（不输出识别文本） |
+| `VELLUM_LONGSHOT_TRACE=1` | 输出长截图生命周期、队列和拼接数值 trace；不记录像素或运行期文本 |
+| `VELLUM_LONGSHOT_BACKEND=grim` | 禁用长截图 screencopy，强制使用有界 grim 回退 |
 | `VELLUM_ICON_PATH` | 覆盖托盘图标目录 |
 
 ## 构建与验证
@@ -157,7 +174,7 @@ bash tests/install-dependency-query.sh
 python3 tools/ocr-regression.py
 ```
 
-当前实现包含 7 个 workspace crate、4 个安装二进制和 238 项 Rust 测试。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
+当前实现包含 7 个 workspace crate、4 个安装二进制和 300 项 Rust 测试（默认 298 项，另有 2 项需 Wayland 真机显式运行）。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
 
 ## 架构文档
 
