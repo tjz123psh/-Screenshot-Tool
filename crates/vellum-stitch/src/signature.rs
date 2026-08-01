@@ -143,6 +143,24 @@ pub fn compute_cols(pixels: &Sparse) -> Cols {
     }
 }
 
+/// Row signatures restricted to the non-fixed sparse columns. Falls back to
+/// the precomputed signatures when the mask is absent or leaves too little
+/// signal. Live history, full-canvas recovery and offline matching must share
+/// this rule.
+pub fn matching_cols(fallback: &Cols, pixels: &Sparse, excluded_columns: Option<&[bool]>) -> Cols {
+    let Some(mask) = excluded_columns else {
+        return fallback.clone();
+    };
+    if mask.len() != pixels.columns {
+        return fallback.clone();
+    }
+    let keep: Vec<bool> = mask.iter().map(|value| !*value).collect();
+    if keep.iter().filter(|value| **value).count() < 4 {
+        return fallback.clone();
+    }
+    compute_cols(&pixels.select_columns(&keep))
+}
+
 /// Tiny 18x24 luma grid used only to detect a completely unmoved view.
 pub fn frame_signature(frame: &Rgb8) -> Vec<u8> {
     const COLS: usize = 18;
@@ -196,6 +214,18 @@ pub fn is_duplicate(previous: &[u8], current: &[u8]) -> bool {
     }
     let mean = f64::from(sum) / previous.len() as f64;
     mean <= 1.1 && max <= 4
+}
+
+/// A frame is truly static only when both the cheap luma prefilter and the
+/// denser sparse-RGB index agree. A viewport-fixed wallpaper can dominate the
+/// 18x24 grid while sparse terminal text scrolls between its sample rows.
+pub fn is_static_view(
+    previous_signature: &[u8],
+    current_signature: &[u8],
+    previous_pixels: &Sparse,
+    current_pixels: &Sparse,
+) -> bool {
+    is_duplicate(previous_signature, current_signature) && previous_pixels == current_pixels
 }
 
 /// Rows ignored at the top of an overlap so scroll inertia does not poison it.
@@ -338,6 +368,21 @@ mod tests {
         let flat_cols = compute_cols(&sample_pixels(&flat));
         let striped_cols = compute_cols(&sample_pixels(&striped));
         assert!(striped_cols.row(0)[2] > flat_cols.row(0)[2] + 50.0);
+    }
+
+    #[test]
+    fn static_view_requires_sparse_pixels_to_agree() {
+        let signature = vec![100; 18 * 24];
+        let pixels = Sparse {
+            height: 1,
+            columns: 1,
+            data: vec![10, 20, 30],
+        };
+        let mut moved = pixels.clone();
+        moved.data[0] = 11;
+
+        assert!(is_static_view(&signature, &signature, &pixels, &pixels));
+        assert!(!is_static_view(&signature, &signature, &pixels, &moved));
     }
 
     #[test]

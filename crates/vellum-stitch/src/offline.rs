@@ -19,7 +19,7 @@ use crate::fixed_regions::FixedBands;
 use crate::scoring::{
     self, FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, Mask, ROBUST_MAX_PIXEL_DIFF, is_false_motion,
 };
-use crate::signature::{Cols, Sparse, compute_cols, is_duplicate};
+use crate::signature::{Cols, Sparse, is_static_view, matching_cols};
 
 /// Lossless keyframes retained for reconstruction. Excludes one pending raw
 /// accepted frame, matching the Python accounting.
@@ -124,22 +124,6 @@ impl OfflineCtx<'_> {
         }
     }
 
-    /// Row signatures restricted to non-fixed sparse columns, matching
-    /// `Stitcher._matching_cols`.
-    fn matching_cols(&self, fallback: &Cols, pixels: &Sparse) -> Cols {
-        let Some(mask) = self.column_mask else {
-            return fallback.clone();
-        };
-        if mask.len() != pixels.columns {
-            return fallback.clone();
-        }
-        let keep: Vec<bool> = mask.iter().map(|v| !*v).collect();
-        if keep.iter().filter(|v| **v).count() < 4 {
-            return fallback.clone();
-        }
-        compute_cols(&pixels.select_columns(&keep))
-    }
-
     fn find_shift(
         &self,
         previous: &Cols,
@@ -153,8 +137,8 @@ impl OfflineCtx<'_> {
     /// One directed edge of the reconstruction graph, or `None` when the pair
     /// cannot be trusted at any offset.
     fn edge(&self, previous: &Keyframe, current: &Keyframe) -> Option<GraphEdge> {
-        let previous_cols = self.matching_cols(&previous.cols, &previous.pixels);
-        let current_cols = self.matching_cols(&current.cols, &current.pixels);
+        let previous_cols = matching_cols(&previous.cols, &previous.pixels, self.column_mask);
+        let current_cols = matching_cols(&current.cols, &current.pixels, self.column_mask);
 
         // Prefer the shift implied by the online positions; fall back to 0.
         let mut predictions: Vec<i32> = Vec::with_capacity(2);
@@ -187,7 +171,12 @@ impl OfflineCtx<'_> {
             let candidate = if shift.unsigned_abs() < self.min_shift_px {
                 // A still view is a legitimate zero-shift edge, but only when
                 // the two frames really are the same view.
-                if !is_duplicate(&previous.signature, &current.signature) {
+                if !is_static_view(
+                    &previous.signature,
+                    &current.signature,
+                    &previous.pixels,
+                    &current.pixels,
+                ) {
                     continue;
                 }
                 GraphEdge {

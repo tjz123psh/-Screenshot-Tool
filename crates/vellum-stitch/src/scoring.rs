@@ -12,7 +12,8 @@
 //! or blinking caret cannot lower the bar for the whole frame.
 
 use crate::signature::{
-    Cols, Sparse, content_bottom_ignore, content_top_ignore, overlap_window, trimmed_mean,
+    Cols, Sparse, content_bottom_ignore, content_top_ignore, effective_min_overlap, overlap_window,
+    trimmed_mean,
 };
 
 /// Absolute sparse-RGB MAD limit on the normal path.
@@ -48,6 +49,70 @@ impl<'a> Mask<'a> {
         self.rows
             .map(|rows| rows.iter().filter(|v| **v).count())
             .unwrap_or(0)
+    }
+}
+
+/// Borrowed row access keeps the ordinary frame matcher and the accumulated
+/// canvas matcher on exactly the same scoring implementation. A canvas window
+/// is only a view; finding a known position must never flatten the RGB canvas.
+trait ColRows {
+    fn height(&self) -> usize;
+    fn row(&self, y: usize) -> &[f32];
+}
+
+impl ColRows for Cols {
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    fn row(&self, y: usize) -> &[f32] {
+        self.row(y)
+    }
+}
+
+struct ColWindow<'a> {
+    source: &'a Cols,
+    start: usize,
+    height: usize,
+}
+
+impl ColWindow<'_> {
+    fn new(source: &Cols, start: usize, height: usize) -> Option<ColWindow<'_>> {
+        (start.checked_add(height)? <= source.height).then_some(ColWindow {
+            source,
+            start,
+            height,
+        })
+    }
+}
+
+impl ColRows for ColWindow<'_> {
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    fn row(&self, y: usize) -> &[f32] {
+        self.source.row(self.start + y)
+    }
+}
+
+trait SparseRows {
+    fn height(&self) -> usize;
+    fn columns(&self) -> usize;
+    fn row(&self, y: usize) -> &[u8];
+}
+
+impl SparseRows for Sparse {
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn row(&self, y: usize) -> &[u8] {
+        self.row(y)
     }
 }
 
@@ -91,7 +156,17 @@ fn active_columns(count: usize, columns: Option<&[bool]>) -> Option<Vec<usize>> 
 /// Row-signature overlap score. LOWER is better; `INFINITY` when the confident
 /// overlap is too small to trust.
 pub fn col_diff(a: &Cols, b: &Cols, offset: i32, min_overlap: usize, mask: &Mask<'_>) -> f32 {
-    let Some(window) = overlap_window(a.height, b.height, offset) else {
+    col_diff_rows(a, b, offset, min_overlap, mask)
+}
+
+fn col_diff_rows(
+    a: &impl ColRows,
+    b: &impl ColRows,
+    offset: i32,
+    min_overlap: usize,
+    mask: &Mask<'_>,
+) -> f32 {
+    let Some(window) = overlap_window(a.height(), b.height(), offset) else {
         return f32::INFINITY;
     };
     if window.length < min_overlap {
@@ -102,15 +177,9 @@ pub fn col_diff(a: &Cols, b: &Cols, offset: i32, min_overlap: usize, mask: &Mask
     if end <= top {
         return f32::INFINITY;
     }
-    let pairs = active_rows(
-        a.height,
-        b.height,
-        window.a_start,
-        window.b_start,
-        top,
-        end,
-        mask.rows,
-    );
+    let usable_mask = mask
+        .rows
+        .filter(|rows| rows.len() == a.height() && a.height() == b.height());
     let required = if mask.rows.is_some() {
         min_overlap
             .saturating_sub(mask.excluded_row_count())
@@ -118,15 +187,22 @@ pub fn col_diff(a: &Cols, b: &Cols, offset: i32, min_overlap: usize, mask: &Mask
     } else {
         min_overlap
     };
-    if pairs.len() < required {
+    let mut total = 0f32;
+    let mut pair_count = 0usize;
+    for offset in top..end {
+        let ai = window.a_start + offset;
+        let bi = window.b_start + offset;
+        if usable_mask.is_some_and(|rows| rows[ai] || rows[bi]) {
+            continue;
+        }
+        let (ra, rb) = (a.row(ai), b.row(bi));
+        total += (ra[0] - rb[0]).abs() + (ra[1] - rb[1]).abs() + (ra[2] - rb[2]).abs();
+        pair_count += 1;
+    }
+    if pair_count < required {
         return f32::INFINITY;
     }
-    let mut total = 0f32;
-    for (ai, bi) in &pairs {
-        let (ra, rb) = (a.row(*ai), b.row(*bi));
-        total += (ra[0] - rb[0]).abs() + (ra[1] - rb[1]).abs() + (ra[2] - rb[2]).abs();
-    }
-    total / (pairs.len() * 3) as f32
+    total / (pair_count * 3) as f32
 }
 
 /// Row-signature score that tolerates a bounded locally-changing region.
@@ -138,7 +214,17 @@ pub fn robust_col_diff(
     min_overlap: usize,
     mask: &Mask<'_>,
 ) -> f32 {
-    let Some(window) = overlap_window(a.height, b.height, offset) else {
+    robust_col_diff_rows(a, b, offset, min_overlap, mask)
+}
+
+fn robust_col_diff_rows(
+    a: &impl ColRows,
+    b: &impl ColRows,
+    offset: i32,
+    min_overlap: usize,
+    mask: &Mask<'_>,
+) -> f32 {
+    let Some(window) = overlap_window(a.height(), b.height(), offset) else {
         return f32::INFINITY;
     };
     if window.length < min_overlap {
@@ -150,8 +236,8 @@ pub fn robust_col_diff(
         return f32::INFINITY;
     }
     let pairs = active_rows(
-        a.height,
-        b.height,
+        a.height(),
+        b.height(),
         window.a_start,
         window.b_start,
         top,
@@ -178,6 +264,26 @@ pub fn robust_col_diff(
     trimmed_mean(&mut scores)
 }
 
+/// Score a frame-sized window inside the accumulated canvas without copying
+/// that window. This deliberately shares the ordinary scorer above.
+pub(crate) fn positioned_col_diff(
+    canvas: &Cols,
+    frame: &Cols,
+    position: usize,
+    robust: bool,
+    mask: &Mask<'_>,
+) -> f32 {
+    let Some(window) = ColWindow::new(canvas, position, frame.height) else {
+        return f32::INFINITY;
+    };
+    let min_overlap = effective_min_overlap(frame.height);
+    if robust {
+        robust_col_diff_rows(&window, frame, 0, min_overlap, mask)
+    } else {
+        col_diff_rows(&window, frame, 0, min_overlap, mask)
+    }
+}
+
 /// Absolute sparse-RGB MAD over the same ignored bands used for matching.
 pub fn pixel_overlap_diff(a: &Sparse, b: &Sparse, offset: i32, mask: &Mask<'_>) -> f32 {
     match sparse_row_scores(a, b, offset, mask) {
@@ -197,8 +303,13 @@ pub fn robust_pixel_overlap_diff(a: &Sparse, b: &Sparse, offset: i32, mask: &Mas
 }
 
 /// Per-row mean absolute difference of the sparse overlap.
-fn sparse_row_scores(a: &Sparse, b: &Sparse, offset: i32, mask: &Mask<'_>) -> Option<Vec<f32>> {
-    let window = overlap_window(a.height, b.height, offset)?;
+fn sparse_row_scores(
+    a: &impl SparseRows,
+    b: &impl SparseRows,
+    offset: i32,
+    mask: &Mask<'_>,
+) -> Option<Vec<f32>> {
+    let window = overlap_window(a.height(), b.height(), offset)?;
     let top = content_top_ignore(window.length);
     let end = window
         .length
@@ -207,15 +318,15 @@ fn sparse_row_scores(a: &Sparse, b: &Sparse, offset: i32, mask: &Mask<'_>) -> Op
         return None;
     }
     let pairs = active_rows(
-        a.height,
-        b.height,
+        a.height(),
+        b.height(),
         window.a_start,
         window.b_start,
         top,
         end,
         mask.rows,
     );
-    let count = a.columns.min(b.columns);
+    let count = a.columns().min(b.columns());
     let kept = active_columns(count, mask.columns);
     let columns: &[usize] = match &kept {
         Some(list) => list,

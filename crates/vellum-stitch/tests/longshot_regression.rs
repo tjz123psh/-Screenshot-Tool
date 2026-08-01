@@ -353,6 +353,60 @@ fn a_static_screen_produces_a_single_viewport() {
     assert_eq!(mean_abs_diff(&result.image, &frame), 0.0);
 }
 
+/// A translucent terminal can have a viewport-fixed background while only a
+/// few foreground rows scroll. The 18x24 idle signature samples every tenth row
+/// in this fixture and therefore sees only the background; sparse RGB still sees
+/// the moving text and must get the final say before declaring the view static.
+#[test]
+fn sparse_scrolling_foreground_is_not_hidden_by_a_fixed_background() {
+    fn terminal_frame(top: usize) -> Rgb8 {
+        let mut frame = Rgb8::new(PAGE_W, VIEW_H);
+        for y in 0..VIEW_H {
+            let global_y = top + y;
+            let row = frame.row_mut(y);
+            // A fixed, dark translucent-looking background. These rows are what
+            // the 24-point idle signature lands on.
+            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+                let texture = ((x / 13 + y / 9 * 3) % 7) as u8;
+                pixel.copy_from_slice(&[30 + texture, 36 + texture, 40 + texture]);
+            }
+            if global_y % 10 != 4 && global_y % 10 != 5 {
+                continue;
+            }
+
+            // Text-like runs vary by document line but occupy the same two-row
+            // baseline. They move by 20px between frames and are visible to the
+            // 96-column matcher even though the idle grid misses them.
+            let line = global_y / 10;
+            let mut x = 8 + line * 17 % 23;
+            for run in 0..5 {
+                let width = 12 + (line * 13 + run * 7) % 31;
+                let end = (x + width).min(PAGE_W.saturating_sub(8));
+                for column in x..end {
+                    let base = column * 3;
+                    row[base..base + 3].copy_from_slice(&[205, 216, 210]);
+                }
+                x = end + 9 + (line + run * 3) % 13;
+                if x >= PAGE_W.saturating_sub(8) {
+                    break;
+                }
+            }
+        }
+        frame
+    }
+
+    let frames: Vec<Rgb8> = (0..11).map(|index| terminal_frame(index * 20)).collect();
+    let mut st = stitcher();
+    feed(&mut st, &frames);
+    let result = st.result().expect("stitch succeeded");
+
+    assert_eq!(
+        result.image.height,
+        VIEW_H + 10 * 20,
+        "moving sparse text was mistaken for an unchanged fixed background"
+    );
+}
+
 #[test]
 fn sub_threshold_scrolling_accumulates_instead_of_stalling() {
     let src = page(PAGE_W, 1200);
@@ -538,4 +592,92 @@ fn a_large_fixed_footer_preserves_sub_threshold_warmup_scrolls() {
 #[test]
 fn a_fixed_band_at_the_detector_ceiling_preserves_the_full_span() {
     assert_fixed_footer_preserves_full_span(VIEW_H * 45 / 100);
+}
+
+/// A kinetic-scroll jump can move farther than the six-frame live history while
+/// landing on content that is already present in the accumulated canvas. The
+/// live matcher must re-anchor there instead of freezing for the rest of the
+/// session.
+#[test]
+fn a_fast_jump_to_known_canvas_content_does_not_stall_live_matching() {
+    let src = page(PAGE_W, 2200);
+    let mut st = stitcher();
+    let initial = scroll_down(&src, 0, 20, 31); // 0 -> 600
+    feed(&mut st, &initial);
+    let height_before_jump = st.current_height();
+
+    let jump = viewport(&src, 80, VIEW_H);
+    let diff = st.add(&jump);
+    assert!(
+        diff <= DEFAULT_MAX_DIFF,
+        "known canvas content was rejected after a fast jump: {diff}"
+    );
+    assert_eq!(
+        st.current_height(),
+        height_before_jump,
+        "re-anchoring inside known content must not duplicate rows"
+    );
+
+    // Continue forward from the recovered position and eventually extend beyond
+    // the previous bottom edge. A stalled matcher never reaches the new tail.
+    for top in (100..=1000).step_by(20) {
+        st.add(&viewport(&src, top, VIEW_H));
+    }
+    let result = st.result().expect("stitch succeeded");
+    assert_eq!(result.image.height, 1000 + VIEW_H);
+    let expected = viewport(&src, 0, result.image.height);
+    assert!(mean_abs_diff(&result.image, &expected) < 1.5);
+}
+
+/// Full-canvas recovery must keep its bounded robust path: a small repaint or
+/// animation can accompany the kinetic jump, but must not hide a known position
+/// from the coarse candidate index.
+#[test]
+fn a_damaged_fast_jump_can_reanchor_to_known_canvas_content() {
+    let src = page(PAGE_W, 2200);
+    let mut st = stitcher();
+    feed(&mut st, &scroll_down(&src, 0, 20, 31)); // known span: 0..840
+    let height_before_jump = st.current_height();
+
+    let mut jump = viewport(&src, 80, VIEW_H);
+    paint_occlusion(&mut jump, 90, 122, 255);
+    let diff = st.add(&jump);
+    assert!(
+        diff <= DEFAULT_MAX_DIFF,
+        "robust full-canvas recovery rejected a locally damaged jump: {diff}"
+    );
+    assert!(st.last_recovered, "the jump did not exercise recovery");
+    assert_eq!(st.last_added, 0);
+    assert_eq!(st.current_height(), height_before_jump);
+
+    for top in (100..=1000).step_by(20) {
+        st.add(&viewport(&src, top, VIEW_H));
+    }
+    let result = st.result().expect("stitch succeeded");
+    assert_eq!(result.image.height, 1000 + VIEW_H);
+    let expected = viewport(&src, 0, result.image.height);
+    assert!(mean_abs_diff(&result.image, &expected) < 1.5);
+}
+
+/// Full-canvas recovery must not turn a legitimate fast forward scroll into a
+/// false revisit. A viewport that extends beyond the known bottom edge still
+/// contributes its new rows.
+#[test]
+fn a_fast_jump_to_new_content_still_extends_the_canvas() {
+    let src = page(PAGE_W, 2200);
+    let mut st = stitcher();
+    feed(&mut st, &scroll_down(&src, 0, 20, 31)); // known span: 0..840
+
+    let diff = st.add(&viewport(&src, 720, VIEW_H));
+    assert!(
+        diff <= DEFAULT_MAX_DIFF,
+        "large overlapping forward jump was rejected: {diff}"
+    );
+    assert_eq!(st.last_added, 120);
+    assert_eq!(st.current_height(), 960);
+
+    let result = st.result().expect("stitch succeeded");
+    assert_eq!(result.image.height, 960);
+    let expected = viewport(&src, 0, 960);
+    assert!(mean_abs_diff(&result.image, &expected) < 1.5);
 }
