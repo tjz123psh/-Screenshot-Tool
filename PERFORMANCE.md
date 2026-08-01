@@ -188,7 +188,19 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 | faded-gradient-light | 渐变底上的半透明亮字 | 4.8% | **100.0%** | 598 ms | 1664 ms |
 | faded-colored-dark | 暗色底上的低对比彩色字 | 100.0% | 100.0% | 559 ms | 1585 ms |
 
-普通 clean 与旧路径耗时相同；额外成本只在场景分析要求 CLAHE、相反极性或颜色投影时支付。所有 Tesseract 尝试共用 30 秒总 deadline，不会按候选数线性放大最坏等待。彩色强干扰 fixture 仍有 1 个 CJK 字错误，但已从包含大量噪声的 48.8% 提升到无额外噪声的 95.2%。
+普通 clean 与旧路径耗时相同；额外成本只在场景分析要求 CLAHE、相反极性或颜色投影时支付。所有 Tesseract 尝试共用 30 秒总 deadline，不会按候选数线性放大最坏等待。历史并排表中的彩色强干扰 fixture 仍有 1 个 CJK 字错误，但已从包含大量噪声的 48.8% 提升到无额外噪声的 95.2%；仓库内新的可重复门禁使用独立合成样本，当前复跑为 10/10、100%。
+
+#### 可重复的本地回归门禁
+
+历史表保留的是 v0.1.0 与增强提交的原始并排测量；为避免 fixture 只存在于临时目录，仓库另提供 `tools/ocr-regression.py`。它用固定随机种子生成 8 个双行场景和 2 个短横幅，在临时目录构建并调用 `vellum-text` 的 developer-only `ocr_probe` example，按同一 Levenshtein 规则返回人类表格或 `--json`，任何场景低于阈值即退出 1。脚本不读取截图目录或剪贴板。
+
+```sh
+# 依赖：python-pillow、Source Han Sans/Noto CJK、tesseract chi_sim+eng
+python3 tools/ocr-regression.py
+python3 tools/ocr-regression.py --json
+```
+
+该检查依赖本机字体与 Tesseract 数据，不冒充纯 Rust CI；缺依赖或 fixture/probe I/O 失败会明确退出 2（unavailable），与完成评分但不达标的退出 1 分开。Rust 侧的候选选择、CLAHE/PCA、TSV 解析和多栏融合仍由无外部依赖的单元测试覆盖。2026-08-01 在 Tesseract 5.5.3 + Source Han Sans CN 上从干净临时目录复跑，10/10 场景均为 100%，耗时从 clean 591 ms 到强彩色干扰 4963 ms。
 
 ### 翻译
 

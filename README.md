@@ -151,9 +151,13 @@ cargo test
 cargo audit --no-yanked
 cargo bench -p vellum-stitch
 cargo bench -p vellum-ipc
+bash tests/install-dependency-query.sh
+
+# 可选的本地 OCR 集成回归；需要 Pillow、Tesseract 中英语言包和 CJK 字体
+python3 tools/ocr-regression.py
 ```
 
-当前实现包含 7 个 workspace crate、4 个二进制和 233 项测试。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
+当前实现包含 7 个 workspace crate、4 个安装二进制和 238 项 Rust 测试。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
 
 ## 架构文档
 
