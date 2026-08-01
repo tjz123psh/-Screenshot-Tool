@@ -109,13 +109,10 @@ fn locate(program: &str) -> Option<PathBuf> {
         && let Some(dir) = exe.parent()
     {
         let candidate = dir.join(program);
-        if candidate.is_file() {
+        if vellum_core::proc::is_executable(&candidate) {
             return Some(candidate);
         }
     }
 
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+    vellum_core::proc::which(program)
 }

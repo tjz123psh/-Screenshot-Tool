@@ -22,6 +22,8 @@
 
 **守护进程住在 `vellum` 里**（`vellum daemon`），不是第五个二进制：`client::spawn_daemon()` 直接 re-exec `current_exe()`，只有一条路径要保持同步。
 
+**动作生命周期单点串行化**：完成、启动与 shutdown 共用一把 lifecycle mutex。子进程退出时必须依次更新事件、恢复长截图光标、记录日志并按需通知；不能由 `snapshot()` 只清除 busy 标志。shutdown 先关闭接单，再恢复长截图光标、杀死当前动作并做有界回收；极慢退出会移交后台 reaper，避免关停无限等待。通知、托盘直启和无 systemd 回退启动的进程同样交给后台 reaper，长驻父进程不丢弃 `Child`。
+
 ### 命名空间隔离
 
 vellum 使用独立且稳定的命名空间：socket/lock 在 `$XDG_RUNTIME_DIR/vellum/`（可用 `VELLUM_RUNTIME_DIR` 覆盖）、unit 名 `vellum.service`/`vellum-tray.service`、配置 `~/.config/vellum/config.toml`。它不复用旧 Python `pngshot` 的运行期路径，避免升级或迁移时发生 socket 与服务冲突；`paths.rs` 有断言防止未来误合并。
@@ -42,7 +44,7 @@ vellum-ui      唯一链接 GTK 的 crate
 vellum-tray    托盘，只依赖 core + ipc + ksni
 ```
 
-`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 233 个测试里绝大多数不需要 Wayland 会话。
+`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 238 个 Rust 测试里绝大多数不需要 Wayland 会话。
 
 合成器抽象（`vellum-core/src/compositor/`）放在 core 而不是 GTK 二进制里，因为 `doctor` 也要报告检测到的合成器 —— 一份实现不会漂移，两份会。
 

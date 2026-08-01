@@ -312,8 +312,9 @@ fn spawn_direct(action: Action, args: &[String]) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
-    if spawned.is_err() {
-        vellum_core::io::notify("vellum", "截图动作无法启动", "critical");
+    match spawned {
+        Ok(child) => vellum_core::proc::reap_in_background(child),
+        Err(_) => vellum_core::io::notify("vellum", "截图动作无法启动", "critical"),
     }
 }
 
@@ -337,7 +338,7 @@ fn locate(name: &str) -> Option<PathBuf> {
         && let Some(dir) = exe.parent()
     {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if vellum_core::proc::is_executable(&candidate) {
             return Some(candidate);
         }
     }

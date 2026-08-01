@@ -135,9 +135,15 @@ pub fn decode_ppm(data: &[u8]) -> Result<Rgb8, String> {
     if maxval != 255 {
         return Err(format!("unsupported PPM maxval {maxval}"));
     }
-    let expected = width * height * 3;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| "PPM dimensions overflow the raster size".to_string())?;
+    let end = cursor
+        .checked_add(expected)
+        .ok_or_else(|| "PPM raster offset overflow".to_string())?;
     let raster = data
-        .get(cursor..cursor + expected)
+        .get(cursor..end)
         .ok_or_else(|| "PPM raster shorter than header claims".to_string())?;
     Ok(Rgb8::from_raw(width, height, raster.to_vec()))
 }
@@ -162,6 +168,12 @@ mod tests {
         data.extend_from_slice(&[9; 12]);
         let img = decode_ppm(&data).unwrap();
         assert_eq!((img.width, img.height), (2, 2));
+    }
+
+    #[test]
+    fn rejects_dimensions_that_overflow_the_raster_size() {
+        let data = format!("P6\n{} 2\n255\n", usize::MAX);
+        assert!(decode_ppm(data.as_bytes()).is_err());
     }
 
     #[test]

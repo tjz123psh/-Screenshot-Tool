@@ -130,7 +130,7 @@ pub fn save_bytes(dir: &Path, prefix: &str, png: &[u8]) -> std::io::Result<PathB
 
 /// Desktop notification. Best-effort: a missing notify-send is not an error.
 pub fn notify(title: &str, body: &str, urgency: &str) {
-    let _ = Command::new("notify-send")
+    if let Ok(child) = Command::new("notify-send")
         .arg("--app-name=Vellum")
         .arg(format!("--urgency={urgency}"))
         .arg(title)
@@ -138,5 +138,8 @@ pub fn notify(title: &str, body: &str, urgency: &str) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        crate::proc::reap_in_background(child);
+    }
 }

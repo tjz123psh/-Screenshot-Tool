@@ -54,6 +54,12 @@ pub struct Service {
     /// Path of the binary used to run actions; overridable in tests.
     exe: Arc<PathBuf>,
     running: Arc<AtomicBool>,
+    /// Serializes child completion, launch and shutdown. The state mutex alone
+    /// cannot be dropped around cursor/notification side effects without
+    /// letting a newer action overtake cleanup for the previous one.
+    lifecycle: Arc<Mutex<()>>,
+    #[cfg(test)]
+    test_prefix_args: Arc<Vec<String>>,
 }
 
 impl Service {
@@ -68,7 +74,16 @@ impl Service {
             log,
             exe: Arc::new(exe),
             running: Arc::new(AtomicBool::new(true)),
+            lifecycle: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            test_prefix_args: Arc::new(Vec::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_prefix_args(mut self, args: &[&str]) -> Self {
+        self.test_prefix_args = Arc::new(args.iter().map(|arg| (*arg).to_string()).collect());
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -78,20 +93,33 @@ impl Service {
         }
     }
 
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.lifecycle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     pub fn snapshot(&self) -> Response {
-        let mut inner = self.lock();
-        reap_finished(&mut inner);
+        let _lifecycle = self.lock_lifecycle();
+        self.reap_finished_locked();
+        let inner = self.lock();
+        let running = self.is_running();
         let (state, action, action_pid) = match inner.active.as_ref() {
             Some(active) => (
-                State::Busy,
+                if running { State::Busy } else { State::Stopped },
                 Some(active.action.as_str().to_string()),
                 Some(active.child.id()),
             ),
-            None => (State::Idle, None, None),
+            None => (
+                if running { State::Idle } else { State::Stopped },
+                None,
+                None,
+            ),
         };
         Response {
             ok: true,
-            running: true,
+            running,
             state: Some(state),
             action,
             action_pid,
@@ -113,8 +141,12 @@ impl Service {
             return Response::error("无效启动参数");
         }
 
+        let _lifecycle = self.lock_lifecycle();
+        self.reap_finished_locked();
+        if !self.is_running() {
+            return Response::rejected("服务正在停止");
+        }
         let mut inner = self.lock();
-        reap_finished(&mut inner);
 
         // Long shot is a toggle: pressing the same global shortcut again
         // finishes the capture, so the user never has to move the pointer back
@@ -186,10 +218,11 @@ impl Service {
     fn watch(&self, mut child: Child, action: Action) {
         let pid = child.id();
         let code = child.wait().ok().and_then(|status| status.code());
-        self.finish_action(action, pid, code);
+        let _lifecycle = self.lock_lifecycle();
+        self.finish_action(action, pid, code, true);
     }
 
-    fn finish_action(&self, action: Action, pid: u32, code: Option<i32>) {
+    fn finish_action(&self, action: Action, pid: u32, code: Option<i32>, notify_abnormal: bool) {
         // Safety net for the hidden pointer. A long shot hides it while sampling
         // and restores it on the way out, but that relies on destructors, and
         // release builds abort on panic while `stop` kills the child outright -
@@ -211,7 +244,7 @@ impl Service {
             code.map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".into())
         ));
-        if !code.is_some_and(|c| NORMAL_EXITS.contains(&c)) {
+        if notify_abnormal && !code.is_some_and(|c| NORMAL_EXITS.contains(&c)) {
             vellum_core::io::notify(
                 "Vellum 启动失败",
                 &format!("{message}。请右键托盘运行诊断或执行 vellum doctor"),
@@ -234,6 +267,8 @@ impl Service {
         let errors = output.try_clone()?;
 
         let mut command = Command::new(self.exe.as_path());
+        #[cfg(test)]
+        command.args(self.test_prefix_args.iter());
         command
             .arg(action.as_str())
             .args(args)
@@ -261,6 +296,13 @@ impl Service {
     /// reported. Called from the accept loop, which also keeps the daemon from
     /// needing a SIGCHLD handler.
     pub fn poll_active(&self) {
+        let _lifecycle = self.lock_lifecycle();
+        self.reap_finished_locked();
+    }
+
+    /// Caller holds `lifecycle`, so completion cleanup cannot be overtaken by a
+    /// newer launch or by shutdown.
+    fn reap_finished_locked(&self) {
         let finished = {
             let mut inner = self.lock();
             match inner.active.as_mut() {
@@ -271,29 +313,95 @@ impl Service {
                         inner.active = None;
                         Some((action, pid, status.code()))
                     }
-                    _ => None,
+                    Ok(None) | Err(_) => None,
                 },
                 None => None,
             }
         };
         if let Some((action, pid, code)) = finished {
-            self.finish_action(action, pid, code);
+            self.finish_action(action, pid, code, true);
         }
     }
 
-    /// Terminate a tracked child on shutdown so no selector is left orphaned
-    /// covering the screen.
+    /// Terminate and reap a tracked child on shutdown so no selector is left
+    /// orphaned over the screen and no zombie remains under the daemon.
     pub fn stop(&self) {
+        let _lifecycle = self.lock_lifecycle();
         self.running.store(false, Ordering::SeqCst);
-        let mut inner = self.lock();
-        if let Some(mut active) = inner.active.take()
-            && matches!(active.child.try_wait(), Ok(None))
-        {
-            let _ = active.child.kill();
-            // A killed child never runs its destructors, so a long shot would
-            // leave the pointer hidden for the rest of the session.
-            if active.action == Action::Long {
+        let active = {
+            let mut inner = self.lock();
+            inner.active.take()
+        };
+        if let Some(mut active) = active {
+            let action = active.action;
+            let pid = active.child.id();
+
+            // Restore before any kill/wait operation: SIGKILL can be delayed by
+            // uninterruptible kernel I/O, and an invisible pointer must never be
+            // held hostage by child reaping. finish_action repeats this no-op
+            // safety net after reaping because restore_cursor is idempotent.
+            if action == Action::Long {
                 vellum_core::compositor::restore_cursor();
+            }
+
+            match self.stop_child(&mut active.child, pid) {
+                Some(code) => {
+                    // The daemon deliberately stopped this action, so still run
+                    // cleanup but do not claim that startup failed.
+                    self.finish_action(action, pid, code, false);
+                }
+                None => {
+                    // Do not block daemon shutdown forever on an uninterruptible
+                    // child. Keep a waiter alive while the daemon remains up; if
+                    // the daemon exits first, the OS reparents the child.
+                    vellum_core::proc::reap_in_background(active.child);
+                    let message = format!("{}正在终止", action.display_name());
+                    {
+                        let mut inner = self.lock();
+                        set_event(&mut inner, message);
+                    }
+                    self.log.info(format!(
+                        "action={} child={pid} stop requested; reap deferred",
+                        action.as_str()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Kill a tracked action and wait briefly for the kernel to make it
+    /// waitable. `None` means a background reaper must take ownership.
+    fn stop_child(&self, child: &mut Child, pid: u32) -> Option<Option<i32>> {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.code()),
+            Ok(None) => {}
+            Err(err) => self.log.error(format!(
+                "cannot query action child={pid} during stop: {err}"
+            )),
+        }
+        if let Err(err) = child.kill() {
+            self.log
+                .error(format!("cannot kill action child={pid} during stop: {err}"));
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status.code()),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    self.log.error(format!(
+                        "action child={pid} did not exit within 1 s; deferring reap"
+                    ));
+                    return None;
+                }
+                Err(err) => {
+                    self.log
+                        .error(format!("cannot reap action child={pid} during stop: {err}"));
+                    return None;
+                }
             }
         }
     }
@@ -309,6 +417,7 @@ impl Service {
             Request::Ping | Request::Status => self.snapshot(),
             Request::Action { action, args } => self.launch(action, &args),
             Request::Shutdown => {
+                let _lifecycle = self.lock_lifecycle();
                 self.running.store(false, Ordering::SeqCst);
                 Response {
                     message: Some("服务正在停止".to_string()),
@@ -316,14 +425,6 @@ impl Service {
                 }
             }
         }
-    }
-}
-
-fn reap_finished(inner: &mut Inner) {
-    if let Some(active) = inner.active.as_mut()
-        && matches!(active.child.try_wait(), Ok(Some(_)))
-    {
-        inner.active = None;
     }
 }
 
@@ -493,19 +594,16 @@ mod tests {
         Service::new(log(), PathBuf::from("/bin/true"))
     }
 
-    /// Service whose action binary stays alive, so the child remains tracked.
-    ///
-    /// A plain `/bin/sleep` cannot be used: `spawn_action` passes the action
-    /// name as the first argument, so `sleep region 5` fails immediately and the
-    /// busy-state assertions would then depend on a race with reaping.
-    fn busy_service(name: &str) -> Service {
-        let path =
-            std::env::temp_dir().join(format!("vellum-stub-{name}-{}.sh", std::process::id()));
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 5\n").unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
-        std::fs::set_permissions(&path, perms).unwrap();
-        Service::new(log(), path)
+    /// Service whose action command stays alive, so the child remains tracked.
+    /// Prefix arguments are test-only: `/bin/sh -c` consumes the action name as
+    /// a harmless positional argument, avoiding writable executable fixtures
+    /// and their cross-test `ETXTBSY` race.
+    fn busy_service(_name: &str) -> Service {
+        Service::new(log(), PathBuf::from("/bin/sh")).with_test_prefix_args(&[
+            "-c",
+            "exec sleep 2",
+            "vellum-action-test",
+        ])
     }
 
     #[test]
@@ -563,12 +661,41 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_child_clears_the_busy_state() {
+    fn a_finished_child_runs_the_full_completion_path() {
         let service = service();
         assert!(service.launch(Action::Region, &[]).accepted);
-        // /bin/true exits immediately; the next snapshot must reap it.
+        // /bin/true exits immediately; the next snapshot must reap it and
+        // record the completion, not merely clear the busy flag.
         std::thread::sleep(std::time::Duration::from_millis(120));
-        assert_eq!(service.snapshot().state, Some(State::Idle));
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.state, Some(State::Idle));
+        assert_eq!(snapshot.last_event.as_deref(), Some("区域截图已完成"));
+    }
+
+    #[test]
+    fn shutdown_rejects_actions_that_arrive_after_it_begins() {
+        let service = service();
+        assert!(service.handle(Request::Shutdown).ok);
+
+        let response = service.launch(Action::Region, &[]);
+        assert!(!response.accepted);
+        assert_eq!(response.message.as_deref(), Some("服务正在停止"));
+    }
+
+    #[test]
+    fn stop_reaps_the_tracked_child() {
+        let service = busy_service("reap");
+        let response = service.launch(Action::Region, &[]);
+        assert!(response.accepted);
+        let pid = response.pid.expect("spawned child pid");
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+
+        service.stop();
+
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "stopped action {pid} was left as a zombie"
+        );
     }
 
     #[test]

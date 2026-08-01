@@ -29,6 +29,17 @@ pub fn command<S: AsRef<OsStr>>(program: S) -> Command {
     command
 }
 
+/// Reap a detached child without blocking the caller.
+///
+/// Long-lived processes such as the daemon and tray must never drop `Child`
+/// handles: an exited notification or fallback action would otherwise remain a
+/// zombie until the parent itself exits.
+pub fn reap_in_background(mut child: Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
 /// Resolve `program` against `PATH`.
 ///
 /// Used instead of spawning and inspecting the error so `doctor` can report the
@@ -37,7 +48,17 @@ pub fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable(candidate))
+}
+
+/// True only for regular files with at least one executable permission bit.
+/// PATH lookup and sibling-binary handover share this check so `doctor` cannot
+/// report a shadowing, non-executable file as healthy.
+pub fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// What a caller needs from a finished child.
@@ -238,6 +259,48 @@ pub fn run<S: AsRef<OsStr>>(program: &Path, args: &[S], timeout: Duration) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_detection_rejects_plain_files_and_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vellum-executable-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join("tool");
+        std::fs::write(&candidate, b"#!/bin/sh\nexit 0\n").unwrap();
+
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!is_executable(&candidate));
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(is_executable(&candidate));
+        assert!(!is_executable(&dir));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detached_children_are_reaped_in_the_background() {
+        let Some(sh) = which("sh") else {
+            return;
+        };
+        let child = Command::new(sh)
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("shell spawns");
+        let pid = child.id();
+        reap_in_background(child);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let proc_path = PathBuf::from(format!("/proc/{pid}"));
+        while proc_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!proc_path.exists(), "detached child {pid} became a zombie");
+    }
 
     #[test]
     fn a_hanging_child_is_killed_at_the_deadline() {

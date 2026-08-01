@@ -173,7 +173,9 @@ fn spawn_daemon() -> std::io::Result<()> {
             Ok(())
         });
     }
-    command.spawn().map(|_| ())
+    let child = command.spawn()?;
+    vellum_core::proc::reap_in_background(child);
+    Ok(())
 }
 
 fn wait_for_service(timeout: Duration) -> bool {
