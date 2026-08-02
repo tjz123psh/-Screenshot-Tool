@@ -24,6 +24,18 @@
 | `vellum-ui` | overlay、标注、长截图、钉图和结果窗口 |
 | `vellum-tray` | D-Bus 系统托盘 |
 
+## 仓库结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `crates/` | 7 个 Rust crate；GTK 只存在于 `vellum-ui` |
+| `contrib/` | desktop、systemd、图标及 niri/Hyprland 示例 |
+| `tests/` | 安装器失败路径集成测试 |
+| `tools/` | 可选的本地 OCR 合成回归工具 |
+| `ARCHITECTURE.md` | Rust 重写时的原始需求契约，只作历史与验收参考 |
+| `DESIGN.md` | 当前实现的架构、进程边界和技术取舍 |
+| `PERFORMANCE.md` | 基准、真机验证方法和能力边界 |
+
 ## 系统要求
 
 - Arch Linux
@@ -39,7 +51,7 @@ grim wl-clipboard libnotify
 tesseract tesseract-data-chi_sim tesseract-data-eng
 ```
 
-翻译和可选视觉 OCR 还需要 PATH 中存在 `opencode`。不安装它不影响截图、标注、本地 OCR、钉图和长截图。
+默认的 OpenCode 翻译后端和可选视觉 OCR 还需要 PATH 中存在 `opencode`。翻译若改用 `[llm] provider = "openai"`，则该翻译路径只读取 `OPENAI_API_KEY`；视觉 OCR 仍依赖 `opencode`。不安装它不影响截图、标注、本地 OCR、钉图和长截图。
 
 ## 安装
 
@@ -138,6 +150,12 @@ VELLUM_LONGSHOT_TRACE=1 vellum long
 
 示例见 [`config.toml.example`](config.toml.example)。如果该文件不存在，vellum 会使用内置默认值；为便于旧用户迁移，也会只读回退到 `~/.config/pngshot/config.toml`，绝不会写入旧路径。
 
+### 翻译后端
+
+默认主模型是 `opencode/deepseek-v4-flash-free`。vellum 先访问本机 `opencode serve` 的 HTTP 接口，服务不可用或协议失败时才回退 `opencode run`；只有模型被上游明确拒绝时才按 `fallback_models` 轮换，网络或本机错误不会把整组模型全部重试一遍。
+
+可选的 `openai` 后端直接调用 OpenAI Chat Completions API。它不会使用 OpenCode 的免费模型别名：启用时必须同时把 `model` 改成该账号可用的 OpenAI 模型 ID，并通过环境变量 `OPENAI_API_KEY` 提供密钥。密钥不应写进仓库或 `config.toml`。
+
 其他路径：
 
 ```text
@@ -174,7 +192,7 @@ bash tests/install-dependency-query.sh
 python3 tools/ocr-regression.py
 ```
 
-当前实现包含 7 个 workspace crate、4 个安装二进制和 300 项 Rust 测试（默认 298 项，另有 2 项需 Wayland 真机显式运行）。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
+当前实现包含 7 个 workspace crate、4 个安装二进制和 300 余项 Rust 测试，其中 2 项需 Wayland 真机显式运行。101 帧、900×700 的长截图基准约为 0.15 秒，Unix socket 的 ping/status 往返 p50 约为 0.04 毫秒；方法和完整数据见 [`PERFORMANCE.md`](PERFORMANCE.md)。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
 
 ## 架构文档
 

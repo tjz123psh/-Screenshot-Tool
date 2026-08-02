@@ -2,6 +2,23 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [Unreleased]
+
+### Added
+
+- Add a persistent `wlr-screencopy` long-shot backend with bounded `grim` fallback, adaptive full/compact/micro controls and privacy-safe diagnostics.
+
+### Changed
+
+- Improve long-shot reconstruction across repeated content, reverse scrolling, history revisits, fixed regions and local animation without relaxing acceptance thresholds.
+- Improve OCR preprocessing and candidate ranking for dim, colored, gradient and isoluminant text.
+
+### Fixed
+
+- Install the long-shot finish signal handler before startup, ignore selection-stage presses and arm completion only after a valid region is confirmed.
+- Require each screencopy frame to negotiate a supported current `wl_shm` buffer before `BufferDone`, preventing stale-buffer submission.
+- Keep recorder controls and selection highlights outside sampled pixels, and fail closed when direct mode cannot expose a safe completion control.
+
 ## [0.1.2] - 2026-08-01
 
 ### Fixed
@@ -44,6 +61,7 @@ All notable changes to vellum are documented here. The Rust rewrite starts a new
 - Approximately 0.15 seconds for the 101-frame 900×700 long-shot benchmark.
 - Approximately 0.04 milliseconds p50 for local control-socket ping/status round trips.
 
+[Unreleased]: https://github.com/tjz123psh/-Screenshot-Tool/compare/v0.1.2...HEAD
 [0.1.2]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.2
 [0.1.1]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.0

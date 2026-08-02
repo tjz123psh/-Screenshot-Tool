@@ -44,7 +44,7 @@ vellum-ui      唯一链接 GTK 的 crate
 vellum-tray    托盘，只依赖 core + ipc + ksni
 ```
 
-`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 300 个 Rust 测试（默认 298 通过，另有 2 个真机 Wayland smoke）里绝大多数不需要 Wayland 会话。
+`vellum-stitch` 与 `vellum-text` 不依赖 `vellum-ipc` 或任何 UI 代码，所以 300 余项 Rust 测试里绝大多数不需要 Wayland 会话；只有 2 项真机 smoke 默认忽略并明确要求 Wayland 合成器。
 
 合成器抽象（`vellum-core/src/compositor/`）放在 core 而不是 GTK 二进制里，因为 `doctor` 也要报告检测到的合成器 —— 一份实现不会漂移，两份会。
 
