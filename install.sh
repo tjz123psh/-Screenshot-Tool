@@ -12,10 +12,13 @@
 #   4. Installs the desktop entry and the application/status icons
 #   5. Tries to write the default shortcuts into the user's Niri keybinds.kdl
 #   6. Installs and starts the systemd user service and the tray
-#   7. Reports anything still missing and whether ~/.local/bin is on PATH
+#   7. Removes the cargo build tree — an end-user install never rebuilds, so
+#      the cache is pure waste; set VELLUM_SKIP_CLEANUP=1 to keep it
+#   8. Reports anything still missing and whether ~/.local/bin is on PATH
 #
-# Re-running is idempotent: cargo rebuilds only what changed and every install
-# step overwrites in place.
+# Re-running is idempotent: every install step overwrites in place.  Unless the
+# build tree was cleaned at the end (see step 7), cargo rebuilds only what
+# changed; after a cleaned install a re-run simply rebuilds from scratch.
 #
 # Unlike its Python predecessor this script does not clone anything.  It builds
 # the tree it lives in, so there is no remote to drift from and no second copy
@@ -206,6 +209,18 @@ case ":$PATH:" in
     *) warn "$BIN_DIR 不在 PATH，请加入你的 shell 配置，例如：
     echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc" ;;
 esac
+
+# --- 7. Cleanup -----------------------------------------------------------
+# The build tree exists only to produce the installed binaries.  An end user
+# never rebuilds, so the cache would otherwise sit on disk for nothing; the
+# install is complete by this point, so nothing below depends on it.
+# VELLUM_SKIP_CLEANUP=1 keeps it for incremental rebuilds.
+if [[ "${VELLUM_SKIP_CLEANUP:-0}" != "1" ]]; then
+    rm -rf -- "$SRC_DIR/target"
+    ok "已清理编译缓存（target/）"
+else
+    info "已保留编译缓存（VELLUM_SKIP_CLEANUP=1）"
+fi
 
 echo
 ok "安装完成，vellum 图标已加入系统托盘。"
