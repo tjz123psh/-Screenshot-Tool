@@ -55,6 +55,16 @@ tesseract tesseract-data-chi_sim tesseract-data-eng
 
 ## 安装
 
+### 远程一键安装（不克隆源码）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install-remote.sh | bash
+```
+
+脚本下载最新版源码到临时目录并运行安装流程，安装完成后自动清理临时文件。想先审阅脚本内容再执行，可先打开上面的 URL。
+
+### 从源码安装
+
 克隆后运行可审查的安装脚本：
 
 ```sh
