@@ -38,4 +38,6 @@ tar -xzf "$tmp_dir/vellum.tar.gz" -C "$tmp_dir/src" --strip-components=1
 [[ -f "$tmp_dir/src/install.sh" ]] || die "下载的源码缺少 install.sh，已中止"
 
 cd "$tmp_dir/src"
-bash install.sh
+# Mark this as a remote install so install.sh skips the "source tree kept"
+# hint: the source lives in our temp dir and vanishes on exit.
+VELLUM_REMOTE_INSTALL=1 bash install.sh

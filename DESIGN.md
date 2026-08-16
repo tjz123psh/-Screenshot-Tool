@@ -240,6 +240,8 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 | 窗口规则按 app-id / class 匹配，不按 title | Rust 版窗口标题是本地化文案（「vellum 钉图」），改语言就失效；app-id 稳定 |
 | 同时支持 niri 与 Hyprland，不再是 niri-only | 用户要求「这个版本适配 niri 和 hyprland」；抽象层见 §8 |
 | `install.sh` 不 clone，直接构建脚本所在的树 | 没有远端可漂移，没有第二份源码要同步 |
+| `install-remote.sh` 把源码下载到临时目录再跑 `install.sh` | `curl \| bash` 一键安装；trap 在退出时删除整个临时目录，用户侧零残留 |
+| `install.sh` 装完自动删除 `target/`，`VELLUM_SKIP_CLEANUP=1` 可保留 | 用户安装后不再需要编译缓存；保留开关供增量重建 |
 | `install.sh` 的依赖复核直接跑 `vellum doctor` | Python 版有两份会漂移的依赖清单；doctor 是唯一事实来源 |
 | `doctor` 检查 GTK4/layer-shell/leptonica 运行库，不检查 Python 模块 | 检查本构建真正加载的东西 |
 | 托盘用 ksni（Rust + zbus）而非 GTK 3 + Ayatana | 托盘进程不再链接任何 GTK |

@@ -7,11 +7,13 @@ All notable changes to vellum are documented here. The Rust rewrite starts a new
 ### Added
 
 - Add a persistent `wlr-screencopy` long-shot backend with bounded `grim` fallback, adaptive full/compact/micro controls and privacy-safe diagnostics.
+- Add `install-remote.sh`: a `curl | bash` one-liner that stages the source in a temporary directory, runs the in-tree installer and removes every trace on exit.
 
 ### Changed
 
 - Improve long-shot reconstruction across repeated content, reverse scrolling, history revisits, fixed regions and local animation without relaxing acceptance thresholds.
 - Improve OCR preprocessing and candidate ranking for dim, colored, gradient and isoluminant text.
+- `install.sh` now removes the cargo build tree after a successful install, since an end-user install never rebuilds; `VELLUM_SKIP_CLEANUP=1` keeps it for incremental rebuilds.
 
 ### Fixed
 

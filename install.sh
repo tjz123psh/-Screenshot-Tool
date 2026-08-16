@@ -226,3 +226,6 @@ echo
 ok "安装完成，vellum 图标已加入系统托盘。"
 info "状态检查：vellum status；完整诊断：vellum doctor"
 info "键位与窗口规则示例见 $SRC_DIR/contrib/：niri-vellum.kdl、hyprland-vellum.conf、hyprland-vellum.lua"
+if [[ "${VELLUM_REMOTE_INSTALL:-0}" != "1" ]]; then
+    info "源码目录 $SRC_DIR 已保留；确认无需保留时可自行删除"
+fi
