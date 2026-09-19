@@ -157,6 +157,18 @@ struct CaptureStats {
     max_queue_depth: usize,
 }
 
+impl CaptureStats {
+    /// True when no frame ever reached the stitcher and no capture error was
+    /// reported: every successful grab was still a discarded warm-up. A finish
+    /// request in that state is a user cancellation, not a backend failure.
+    ///
+    /// "successful" counts the warm-up grab too, so it is compared against
+    /// "warmup_discarded" rather than tested against zero.
+    fn ended_before_the_first_stitched_frame(self) -> bool {
+        self.failures == 0 && self.successful == self.warmup_discarded
+    }
+}
+
 /// Frames handed from the capture thread to the main loop.
 ///
 /// `latest` is kept separate from the queue so that clicking 完成 can still use
@@ -2042,7 +2054,7 @@ impl Recorder {
         // A grab may be in flight when 完成 is clicked. Waiting briefly *after*
         // the UI is hidden lets that final frame land, so the saved image is not
         // one scroll step short.
-        if let Some(handle) = self.worker.borrow_mut().take() {
+        let worker_joined = if let Some(handle) = self.worker.borrow_mut().take() {
             let deadline = Instant::now() + FINAL_GRAB_WAIT;
             while !handle.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
@@ -2067,6 +2079,7 @@ impl Recorder {
             let joined = handle.join().is_ok();
             self.trace
                 .emit("capture_worker_joined", &[("ok", TraceField::Bool(joined))]);
+            joined
         } else {
             self.trace.emit(
                 "capture_worker_joined",
@@ -2075,7 +2088,8 @@ impl Recorder {
                     ("worker", TraceField::Static("not_started")),
                 ],
             );
-        }
+            true
+        };
 
         // The worker may have captured several frames while the main loop was
         // updating status. Stitch everything already owned before taking the
@@ -2115,8 +2129,27 @@ impl Recorder {
                 (self.on_done)(Some(result.image), result.warnings);
             }
             Err(err) => {
-                self.emit_summary("failed", None, false, 1);
-                (self.on_done)(None, vec![err.to_string()]);
+                // result() fails only when no frame reached the canvas. If the
+                // worker joined cleanly and no capture error was reported, the
+                // finish request simply beat the first frame: a second hotkey
+                // inside the overlay-to-recorder handoff, or the 完成 button
+                // pressed during panel verification. Reporting that as a
+                // failure would fire a critical notification and a second
+                // "startup failed (code 1)" one from the daemon for a legitimate
+                // user action, so it takes the cancellation path instead: no
+                // image, no notification, exit 130.
+                let empty_session = worker_joined
+                    && self
+                        .shared
+                        .capture_stats()
+                        .ended_before_the_first_stitched_frame();
+                if empty_session {
+                    self.emit_summary("cancelled", None, false, 0);
+                    (self.on_done)(None, Vec::new());
+                } else {
+                    self.emit_summary("failed", None, false, 1);
+                    (self.on_done)(None, vec![err.to_string()]);
+                }
             }
         }
     }
@@ -2177,8 +2210,20 @@ impl Recorder {
     }
 }
 
+/// How many consecutive screencopy timeouts are tolerated before the session
+/// degrades to grim for good.
+///
+/// One timeout usually means a stalled compositor or a slow DRM readback, not a
+/// dead connection: `capture()` has already retried with an ordinary copy by
+/// then. Degrading on the first one would cost every later frame a fork/exec of
+/// grim, and the move is irreversible, so a short run is required.
+const SCREENCOPY_TIMEOUT_TOLERANCE: u32 = 3;
+
 enum FrameSource {
-    Screencopy(Box<ScreencopyCapturer>),
+    Screencopy {
+        capturer: Box<ScreencopyCapturer>,
+        consecutive_timeouts: u32,
+    },
     Grim,
 }
 
@@ -2199,7 +2244,10 @@ impl FrameSource {
                     &[("backend", TraceField::Static("wlr_screencopy"))],
                 );
                 eprintln!("[vellum] long-shot backend: persistent wlr-screencopy");
-                Self::Screencopy(Box::new(capturer))
+                Self::Screencopy {
+                    capturer: Box::new(capturer),
+                    consecutive_timeouts: 0,
+                }
             }
             Err(error) => {
                 shared.trace.emit(
@@ -2219,11 +2267,33 @@ impl FrameSource {
     }
 
     fn grab(&mut self, shared: &Shared, rect: Rect) -> Result<Rgb8, capture::CaptureError> {
-        if let Self::Screencopy(capturer) = self {
+        if let Self::Screencopy {
+            capturer,
+            consecutive_timeouts,
+        } = self
+        {
             match capturer.capture(shared.stop_fd(), || shared.aborting()) {
-                Ok(frame) => return Ok(frame),
+                Ok(frame) => {
+                    *consecutive_timeouts = 0;
+                    return Ok(frame);
+                }
                 Err(ScreencopyError::Cancelled) if shared.aborting() => {
                     return Err(capture::CaptureError::Cancelled);
+                }
+                // Keep the persistent connection and let the capture loop retry:
+                // the UI already reports "采集重连中" for a timed-out grab.
+                Err(ScreencopyError::Timeout)
+                    if *consecutive_timeouts + 1 < SCREENCOPY_TIMEOUT_TOLERANCE =>
+                {
+                    *consecutive_timeouts += 1;
+                    shared.trace.emit(
+                        "capture_backend_timeout",
+                        &[(
+                            "consecutive",
+                            TraceField::U64(u64::from(*consecutive_timeouts)),
+                        )],
+                    );
+                    return Err(capture::CaptureError::Timeout);
                 }
                 Err(error) => {
                     // A changed output layout or a protocol failure invalidates
@@ -2574,6 +2644,36 @@ mod tests {
         }
         assert_eq!(history.len(), SEAM_HISTORY_LEN);
         assert_eq!(history.back(), Some(&StitchDecision::Accepted));
+    }
+
+    /// A finish that arrives before the first frame is a cancellation: it must
+    /// not reach the "failed" branch that fires a critical notification, and a
+    /// real backend problem must still be reported as one.
+    #[test]
+    fn finishing_before_the_first_stitched_frame_is_a_user_cancellation() {
+        assert!(CaptureStats::default().ended_before_the_first_stitched_frame());
+
+        // The warm-up grab is the only successful one, and it was discarded
+        // rather than handed to the stitcher.
+        let only_warmup = CaptureStats {
+            successful: 1,
+            warmup_discarded: 1,
+            ..CaptureStats::default()
+        };
+        assert!(only_warmup.ended_before_the_first_stitched_frame());
+
+        let stitched = CaptureStats {
+            successful: 2,
+            warmup_discarded: 1,
+            ..CaptureStats::default()
+        };
+        assert!(!stitched.ended_before_the_first_stitched_frame());
+
+        let failed = CaptureStats {
+            failures: 1,
+            ..CaptureStats::default()
+        };
+        assert!(!failed.ended_before_the_first_stitched_frame());
     }
 
     #[test]
