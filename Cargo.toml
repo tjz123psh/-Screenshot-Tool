@@ -73,5 +73,6 @@ panic = "abort"
 strip = "symbols"
 
 [profile.bench]
+# Benchmarks are harness-free release programs. Do not set `panic` here: cargo
+# ignores it for bench/test targets and warns on every bench invocation.
 inherits = "release"
-panic = "unwind"
