@@ -4,13 +4,16 @@
 // Niri config, or `include` it from config.kdl. `install.sh` only ever touches
 // an already-included keybinds.kdl, and never this file.
 
-// The pin window, the OCR/translation result window and the settings panel are
-// reference overlays: they should float above the scrolling layout instead of
-// joining a column.
+// The pin window and the OCR/translation result window are reference overlays:
+// they should float above the scrolling layout instead of joining a column.
 //
 // Both windows also ask Niri to float them from code (move-window-to-floating,
 // 60 ms after map), so these rules are optional. Keeping them removes the brief
 // tiled flash before that call lands, and lets you pin down a default size.
+//
+// The settings panel needs none of this: it is built as a fixed-size window,
+// which Niri (like Hyprland) opens floating from the first frame, so it never
+// joins a column and never scrolls the layout.
 //
 // Match on app-id, not title: the titles are localized ("vellum 钉图",
 // "提取的文字") and would break the moment the UI language changes. The app-id
@@ -33,6 +36,7 @@ window-rule {
     open-floating true
 }
 
+// Only as belt-and-braces for a compositor that ignores the fixed-size hint.
 window-rule {
     match app-id="^ai\\.vellum\\.panel$"
     open-floating true

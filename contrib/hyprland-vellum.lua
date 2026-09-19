@@ -39,11 +39,13 @@ hl.window_rule({
 	size = { 560, 400 },
 })
 
+-- The settings panel needs no rule: it is a fixed-size window, which Hyprland
+-- and niri both open floating from the first frame. A size rule here would fight
+-- the window's own dimensions (900x840), so this only asks for the float.
 hl.window_rule({
 	name = "float-vellum-panel",
 	match = { class = "^ai\\.vellum\\.panel$" },
 	float = true,
-	size = { 820, 640 },
 })
 
 -- Keybindings. Add these to your keybinds.lua.

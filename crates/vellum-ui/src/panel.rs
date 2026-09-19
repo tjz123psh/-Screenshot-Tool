@@ -127,6 +127,7 @@ struct FormValues {
     model: String,
     target_lang: String,
     fallback_models: String,
+    glossary: String,
     engine: String,
     langs: String,
     preprocess: bool,
@@ -150,6 +151,7 @@ impl FormValues {
             model: cfg.llm.model.clone(),
             target_lang: cfg.llm.target_lang.clone(),
             fallback_models: fallback_models_to_text(&cfg.llm.fallback_models),
+            glossary: glossary_to_text(&cfg.llm.glossary),
             engine: cfg.ocr.engine.clone(),
             langs: cfg.ocr.langs.clone(),
             preprocess: cfg.ocr.preprocess,
@@ -177,6 +179,7 @@ impl FormValues {
         cfg.llm.model = trimmed_or(&self.model, DEFAULT_LLM_MODEL);
         cfg.llm.target_lang = trimmed_or(&self.target_lang, DEFAULT_TARGET_LANG);
         cfg.llm.fallback_models = fallback_models_from_text(&self.fallback_models);
+        cfg.llm.glossary = glossary_from_text(&self.glossary);
         // Anything that is not the API engine is the built-in one: writing an
         // unknown string would make the loader silently keep the old engine.
         cfg.ocr.engine = if self.engine == OCR_ENGINE_API {
@@ -206,18 +209,36 @@ impl FormValues {
 /// typed by hand from documentation that uses either. Duplicates are dropped
 /// while keeping the first occurrence: the order is the whole point of the list,
 /// and retrying the same refused model only doubles the wait.
-fn fallback_models_from_text(text: &str) -> Vec<String> {
+/// Split a panel field into list entries.
+///
+/// All four separators a user might reach for, de-duplicated, with empties
+/// dropped: a stray comma should not become a glossary entry.
+fn split_list(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
-    let mut models = Vec::new();
+    let mut items = Vec::new();
     for item in text.split([',', '，', ';', '；', '\n', '\r', '\t']) {
-        let model = item.trim();
-        if model.is_empty() || seen.contains(model) {
+        let item = item.trim();
+        if item.is_empty() || seen.contains(item) {
             continue;
         }
-        seen.insert(model.to_string());
-        models.push(model.to_string());
+        seen.insert(item.to_string());
+        items.push(item.to_string());
     }
-    models
+    items
+}
+
+fn fallback_models_from_text(text: &str) -> Vec<String> {
+    split_list(text)
+}
+
+fn glossary_to_text(entries: &[String]) -> String {
+    entries.join(", ")
+}
+
+/// Glossary entries are arbitrary terms, so unlike model ids they are never
+/// run through the legacy-prefix stripper.
+fn glossary_from_text(text: &str) -> Vec<String> {
+    split_list(text)
 }
 
 fn fallback_models_to_text(models: &[String]) -> String {
@@ -329,6 +350,7 @@ struct FormWidgets {
     model: ModelPicker,
     target_lang: Entry,
     fallback: Entry,
+    glossary: Entry,
     engine_builtin: CheckButton,
     engine_api: CheckButton,
     langs: Entry,
@@ -386,6 +408,13 @@ impl FormWidgets {
             .placeholder_text("留空表示不重试其他模型")
             .hexpand(true)
             .build();
+        let glossary = Entry::builder()
+            .placeholder_text("如 Nexus, Vellum=vellum 截图工具")
+            .hexpand(true)
+            .build();
+        glossary.set_tooltip_text(Some(
+            "写 term 表示原样保留不翻译；写 term=译法 表示固定用这个译法。逗号是分隔符，词条本身不能含逗号",
+        ));
 
         // Short labels: the segmented control reads as a choice, and the
         // trade-off between the two engines belongs in the row's own hint, not
@@ -432,6 +461,7 @@ impl FormWidgets {
             model,
             target_lang,
             fallback,
+            glossary,
             engine_builtin,
             engine_api,
             langs,
@@ -465,6 +495,7 @@ impl FormWidgets {
             model: self.model.text().to_string(),
             target_lang: self.target_lang.text().to_string(),
             fallback_models: self.fallback.text().to_string(),
+            glossary: self.glossary.text().to_string(),
             engine: if self.engine_api.is_active() {
                 OCR_ENGINE_API
             } else {
@@ -491,6 +522,7 @@ impl FormWidgets {
         self.model.set_text(&values.model);
         self.target_lang.set_text(&values.target_lang);
         self.fallback.set_text(&values.fallback_models);
+        self.glossary.set_text(&values.glossary);
         let api = values.engine == OCR_ENGINE_API;
         self.engine_api.set_active(api);
         self.engine_builtin.set_active(!api);
@@ -597,13 +629,31 @@ impl Panel {
         let prefs = prefs::load();
         let form = FormWidgets::build();
 
+        // resizable(false) is not cosmetic: it is what makes the panel an
+        // independent window instead of a layout participant.
+        //
+        // MEASURED on Hyprland with the scrolling layout: a resizable panel maps
+        // as a tiling COLUMN (926x996) first, which scrolls the whole desktop
+        // sideways (firefox moved 940px), and the float requested 60ms later
+        // removes the column but leaves the scroll. With resizable(false) the
+        // window declares a fixed size, and both Hyprland and niri open a
+        // fixed-size window floating from its first frame: no tiled frame, no
+        // scroll, and no compositor window rule needed. Same shape as the
+        // layer-shell surfaces, without giving up a normal toplevel (drag,
+        // blur).
         let window = ApplicationWindow::builder()
             .application(app)
             .default_width(WIDTH)
             .default_height(HEIGHT)
+            .resizable(false)
             .title("设置")
             .build();
         window.add_css_class("vellum-window");
+        // Panel-only glass hook: the compositor blurs whatever shows through, but
+        // .vellum-window is shared with the pin and result windows and .vellum-card
+        // with the long-shot panel, so translucency lives on a class only this
+        // window carries.
+        window.add_css_class("vellum-glass");
 
         let root = GtkBox::new(Orientation::Vertical, 0);
 
@@ -915,10 +965,13 @@ impl Panel {
             glib::Propagation::Proceed
         });
 
-        // The user runs Hyprland with a Lua config, which vellum never writes
-        // (DESIGN.md §8): without this the panel would open tiled, and nothing
-        // else would float it. Looked up by pid rather than acting on the
-        // focused window, because focus may have moved during the delay.
+        // Fallback for a compositor that does not float fixed-size windows on
+        // its own. vellum never writes the user's compositor config (DESIGN.md
+        // §8), so this is how the panel floated before the fixed-size hint
+        // above existed; it is kept because it costs one no-op dispatch on a
+        // compositor that already floated the window. Looked up by pid rather
+        // than acting on the focused window, because focus may have moved
+        // during the delay.
         self.window.connect_map(|_| {
             glib::timeout_add_local_once(FLOAT_DELAY, || {
                 crate::own_window::float_own_window_soon();
@@ -1239,6 +1292,38 @@ fn probe_row(probe: &ProbeWidgets) -> GtkBox {
     row
 }
 
+/// Grey out the rows that only affect the built-in engine.
+///
+/// They are not dead settings under the API engine: `recognize()` falls back to
+/// Tesseract whenever the vision call fails, and that path does read the
+/// language pack, the upscale factor and the preprocess switch. What they do not
+/// do is shape the API attempt itself, so the row is disabled — with the hint
+/// saying why — instead of sitting there looking like it applies to the vision
+/// model. Tuning the fallback means selecting the built-in engine, which is what
+/// a user does when the fallback is what they are relying on.
+fn scope_to_builtin_engine(form: &FormWidgets, rows: &[GtkBox]) {
+    let rows: Vec<GtkBox> = rows.to_vec();
+    let api = form.engine_api.clone();
+    let update = Rc::new({
+        let rows = rows.clone();
+        move || {
+            let on_api = api.is_active();
+            for row in &rows {
+                row.set_sensitive(!on_api);
+            }
+        }
+    });
+    update();
+    {
+        let update = update.clone();
+        form.engine_builtin.connect_toggled(move |_| update());
+    }
+    {
+        let update = update.clone();
+        form.engine_api.connect_toggled(move |_| update());
+    }
+}
+
 /// The OCR engine choice as one segmented control.
 ///
 /// The CheckButtons keep their group and their `is_active` semantics; only the
@@ -1261,7 +1346,7 @@ fn engine_row(form: &FormWidgets) -> GtkBox {
     row.append(&head);
 
     let hint = Label::builder()
-        .label("内置引擎离线可用；API 引擎把选区图片发给上面的接口")
+        .label("内置引擎离线可用，API 失败时也回退到它；下方三项只作用于内置引擎")
         .xalign(0.0)
         .wrap(true)
         .build();
@@ -1351,6 +1436,16 @@ fn text_page(form: &FormWidgets) -> ScrolledWindow {
             &form.fallback,
         ),
     );
+    // A screenshot is full of text that must survive translation unchanged:
+    // identifiers, paths, flags, product names.
+    controls::push_row(
+        &translate_rows,
+        &controls::action_row_stacked(
+            "术语表",
+            Some("逗号分隔；写 term 原样保留，写 term=译法 固定译法"),
+            &form.glossary,
+        ),
+    );
     translate_body.append(&translate_rows);
     content.append(&translate_card);
 
@@ -1360,24 +1455,28 @@ fn text_page(form: &FormWidgets) -> ScrolledWindow {
     );
     let ocr_rows = controls::row_group();
     controls::push_row(&ocr_rows, &engine_row(form));
-    controls::push_row(
-        &ocr_rows,
-        &controls::action_row("Tesseract 语言包", None, &form.langs),
-    );
-    controls::push_row(
-        &ocr_rows,
+
+    // These three only affect the built-in engine: recognize_api() hands the raw
+    // crop to the vision model, so an upscale or a preprocess set here would do
+    // nothing while still looking active. They are greyed out under the API
+    // engine instead of implying an effect that does not exist.
+    let langs_row = controls::action_row("Tesseract 语言包", None, &form.langs);
+    let upscale_row = controls::action_row(
+        "放大倍数",
         // A glyph unit (the multiplication sign) reads as a broken icon at this
         // size, so the unit is spelled out like the two second-valued steppers.
-        &controls::action_row("放大倍数", None, &controls::stepper(&form.upscale, "倍")),
+        None,
+        &controls::stepper(&form.upscale, "倍"),
     );
-    controls::push_row(
-        &ocr_rows,
-        &controls::action_row(
-            "图像预处理",
-            Some("自适应灰度、极性与对比度，提升困难场景的识别率"),
-            &form.preprocess,
-        ),
+    let preprocess_row = controls::action_row(
+        "图像预处理",
+        Some("自适应灰度、极性与对比度，提升困难场景的识别率"),
+        &form.preprocess,
     );
+    controls::push_row(&ocr_rows, &langs_row);
+    controls::push_row(&ocr_rows, &upscale_row);
+    controls::push_row(&ocr_rows, &preprocess_row);
+    scope_to_builtin_engine(form, &[langs_row, upscale_row, preprocess_row]);
     controls::push_row(
         &ocr_rows,
         &controls::action_row(
@@ -1479,6 +1578,60 @@ mod tests {
         assert_eq!(cfg.ocr.langs, DEFAULT_OCR_LANGS);
     }
 
+    /// The widget layer, not just `FormValues`.
+    ///
+    /// A field that `from_config` fills but `populate` never writes into the
+    /// widget reads back empty, and the next save writes that emptiness over the
+    /// user's config. That is exactly how `[llm].glossary` was being lost: the
+    /// FormValues round-trip test below cannot see it, because it never touches a
+    /// widget.
+    #[test]
+    fn the_form_widgets_round_trip_every_field_including_the_glossary() {
+        crate::test_support::with_gtk(|| {
+            // A widget needs a display; without one there is nothing to check.
+
+            let cfg = Config::from_toml_str(
+                r#"
+            [api]
+            base_url = "http://localhost:11434/v1"
+            api_key = "sk-panel"
+            timeout_s = 12
+            [llm]
+            model = "qwen2.5:7b"
+            target_lang = "English"
+            fallback_models = ["qwen2.5:3b"]
+            glossary = ["Nexus", "API=接口"]
+            [ocr]
+            engine = "api"
+            langs = "eng"
+            upscale = 2.5
+            api_model = "llava"
+            api_timeout_s = 90
+            "#,
+            );
+            let prefs = Preferences {
+                save: false,
+                copy: true,
+            };
+
+            let form = FormWidgets::build();
+            form.populate(&cfg, &prefs);
+            let values = form.values();
+
+            // Named one by one: a field that is read but never populated fails here.
+            assert_eq!(values.glossary, "Nexus, API=接口");
+            assert_eq!(values.fallback_models, "qwen2.5:3b");
+            assert_eq!(values.target_lang, "English");
+            assert_eq!(values.model, "qwen2.5:7b");
+            assert_eq!(values.langs, "eng");
+            assert_eq!(values.upscale, 2.5);
+            assert_eq!(values.engine, OCR_ENGINE_API);
+            assert_eq!(values.api_model, "llava");
+
+            // The path the user actually takes: open the panel, press save.
+            assert_eq!(values.to_config(&cfg), cfg);
+        });
+    }
     #[test]
     fn a_filled_form_round_trips_through_the_config() {
         let cfg = Config::from_toml_str(
