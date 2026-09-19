@@ -31,6 +31,9 @@ mod result;
 mod screencopy;
 mod selector;
 mod surface;
+
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod toolbar;
 mod trace;
