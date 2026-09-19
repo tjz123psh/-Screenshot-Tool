@@ -51,9 +51,15 @@ fn trim_newline(line: &[u8]) -> &[u8] {
     &line[..end]
 }
 
-/// True when a daemon is listening and answering.
+/// True when a daemon is listening, answering and still running.
+///
+/// A daemon that has accepted a shutdown request keeps the socket alive for a
+/// few more milliseconds while it tears down. Counting that as "up" would make
+/// ensure_service skip activation and restart_service report a restart that
+/// never happened, so the check uses the same ok-and-running pair the protocol
+/// documents.
 pub fn ping() -> bool {
-    send(&Request::Ping, PING_TIMEOUT).is_some_and(|response| response.ok)
+    send(&Request::Ping, PING_TIMEOUT).is_some_and(|response| response.is_running())
 }
 
 /// Status for the CLI and tray. Never fails: a missing daemon reports
@@ -100,12 +106,20 @@ pub fn route_action(action: Action, args: &[String]) -> Routed {
 fn classify(response: Response) -> Routed {
     if response.accepted {
         Routed::Accepted
-    } else {
+    } else if response.running {
+        // The daemon is alive and declined on purpose: a selector already owns
+        // the screen, or the long shot it tried to signal had already exited.
         Routed::Rejected(
             response
                 .message
                 .unwrap_or_else(|| "无法启动截图".to_string()),
         )
+    } else {
+        // The daemon answered while shutting down, or it could not start the
+        // action at all (a failed spawn reports ok: false). Neither is a
+        // deliberate rejection, and the hotkey must still do something, so the
+        // caller runs the action in its own process.
+        Routed::Unavailable
     }
 }
 
@@ -143,8 +157,12 @@ pub fn ensure_service(timeout: Duration) -> bool {
 /// Ask a running daemon to exit, then start a fresh one.
 pub fn restart_service() -> bool {
     let _ = send(&Request::Shutdown, Duration::from_millis(400));
-    let deadline = Instant::now() + Duration::from_millis(1000);
-    while Instant::now() < deadline && ping() {
+    // Wait for the socket to stop answering, not merely for the running flag to
+    // drop: stop() may spend a second reaping the tracked action, and starting a
+    // second daemon before the old one released the lock would report a restart
+    // that never happened.
+    let deadline = Instant::now() + Duration::from_millis(2000);
+    while Instant::now() < deadline && send(&Request::Ping, PING_TIMEOUT).is_some() {
         std::thread::sleep(Duration::from_millis(40));
     }
     ensure_service(Duration::from_millis(1500))
@@ -224,6 +242,7 @@ mod tests {
     #[test]
     fn a_rejected_response_carries_the_daemon_message() {
         let response = Response {
+            running: true,
             busy: true,
             message: Some("截图选择器已经打开".to_string()),
             ..Response::default()
@@ -231,6 +250,29 @@ mod tests {
         assert_eq!(
             classify(response),
             Routed::Rejected("截图选择器已经打开".to_string())
+        );
+    }
+
+    /// A daemon that is shutting down answers a hotkey with a rejection, but it
+    /// is not going to run the action. Treating that as a deliberate rejection
+    /// would drop the keypress; the caller must run it in-process instead.
+    #[test]
+    fn a_stopping_daemon_hands_the_action_back_to_the_caller() {
+        let stopping = Response {
+            message: Some("服务正在停止".to_string()),
+            ..Response::default()
+        };
+        assert_eq!(classify(stopping), Routed::Unavailable);
+    }
+
+    /// A failed spawn reports "ok": false. The daemon is alive but cannot do the
+    /// work (its own binary may have been replaced or removed), so the hotkey
+    /// still falls back to an in-process action instead of doing nothing.
+    #[test]
+    fn a_failed_spawn_falls_back_to_an_in_process_action() {
+        assert_eq!(
+            classify(Response::error("cannot launch region")),
+            Routed::Unavailable
         );
     }
 }

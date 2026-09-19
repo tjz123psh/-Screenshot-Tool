@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use vellum_ipc::client;
-use vellum_ipc::protocol::{Action, BYPASS_ENV, Request};
+use vellum_ipc::protocol::{Action, BYPASS_ENV, Request, Response};
 
 /// Same budget the Python client used: long enough for a busy daemon to answer,
 /// short enough that a dead socket falls back before the user notices.
@@ -47,19 +47,43 @@ fn main() -> ExitCode {
         args: request_args,
     };
 
-    match client::send(&request, TIMEOUT) {
-        Some(response) if response.accepted => ExitCode::SUCCESS,
-        Some(response) => {
-            // The daemon answered and declined: another selector owns the
-            // screen, or the long shot it tried to signal had already exited.
-            // Telling the user is the whole point, since there is no terminal.
-            let message = response.message.as_deref().unwrap_or("无法启动截图");
-            vellum_core::io::notify("vellum", message, "normal");
+    match decide(client::send(&request, TIMEOUT)) {
+        Decision::Accepted => ExitCode::SUCCESS,
+        Decision::Rejected(message) => {
+            // The daemon is alive and declined on purpose: another selector owns
+            // the screen, or the long shot it tried to signal had already
+            // exited. Telling the user is the whole point, since there is no
+            // terminal.
+            vellum_core::io::notify("vellum", &message, "normal");
             ExitCode::from(EXIT_REJECTED)
         }
-        // No daemon (or an unparsable reply): run the capture in this process
-        // rather than dropping the keypress.
-        None => fallback(&args),
+        // No daemon, a daemon that is shutting down, or a daemon that could not
+        // start the action: run the capture in this process rather than
+        // dropping the keypress.
+        Decision::Fallback => fallback(&args),
+    }
+}
+
+/// What one daemon reply means for the hotkey client.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    /// The daemon accepted the request: the action is running.
+    Accepted,
+    /// The daemon is alive and declined on purpose; the message says why.
+    Rejected(String),
+    /// No usable daemon: run the action in this process.
+    Fallback,
+}
+
+fn decide(response: Option<Response>) -> Decision {
+    match response {
+        Some(response) if response.accepted => Decision::Accepted,
+        Some(response) if response.running => Decision::Rejected(
+            response
+                .message
+                .unwrap_or_else(|| "无法启动截图".to_string()),
+        ),
+        _ => Decision::Fallback,
     }
 }
 
@@ -124,4 +148,49 @@ fn locate(program: &str) -> Option<PathBuf> {
     }
 
     vellum_core::proc::which(program)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_accepted_reply_finishes_the_keypress() {
+        let reply = Some(Response {
+            running: true,
+            accepted: true,
+            ..Response::default()
+        });
+        assert_eq!(decide(reply), Decision::Accepted);
+    }
+
+    #[test]
+    fn a_busy_daemon_reports_its_reason() {
+        let reply = Some(Response {
+            running: true,
+            busy: true,
+            message: Some("截图选择器已经打开".to_string()),
+            ..Response::default()
+        });
+        assert_eq!(
+            decide(reply),
+            Decision::Rejected("截图选择器已经打开".to_string())
+        );
+    }
+
+    /// Shutting down, unreachable, or unable to spawn: the keypress must still
+    /// produce a screenshot through the in-process path.
+    #[test]
+    fn an_unusable_daemon_still_runs_the_capture() {
+        assert_eq!(decide(None), Decision::Fallback);
+        let stopping = Some(Response {
+            message: Some("服务正在停止".to_string()),
+            ..Response::default()
+        });
+        assert_eq!(decide(stopping), Decision::Fallback);
+        assert_eq!(
+            decide(Some(Response::error("cannot launch region"))),
+            Decision::Fallback
+        );
+    }
 }

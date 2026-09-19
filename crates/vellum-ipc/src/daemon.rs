@@ -38,6 +38,14 @@ const NORMAL_EXITS: [i32; 2] = [0, 130];
 /// cost on requests: an incoming connection wakes `poll()` immediately.
 const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
+/// How many consecutive transient `accept` failures the accept loop tolerates
+/// before treating the listener as broken. A peer that aborts a connection or a
+/// momentary descriptor shortage must not take the control service down.
+const MAX_TRANSIENT_ACCEPT_FAILURES: u32 = 5;
+/// Pause between those retries, so a persistently broken listener still exits
+/// quickly instead of spinning.
+const TRANSIENT_ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
 struct Active {
     child: Child,
     action: Action,
@@ -165,6 +173,7 @@ impl Service {
             let trace = active.trace.clone();
             if !signal_child(pid, FINISH_SIGNAL) {
                 return Response {
+                    running: true,
                     busy: true,
                     message: Some("长截图进程已结束，请重新启动".to_string()),
                     ..Response::default()
@@ -179,6 +188,7 @@ impl Service {
                 &[("child_pid", TraceField::U64(u64::from(pid)))],
             );
             return Response {
+                running: true,
                 accepted: true,
                 toggled: true,
                 pid: Some(pid),
@@ -189,6 +199,7 @@ impl Service {
 
         if action.is_exclusive() && inner.active.is_some() {
             return Response {
+                running: true,
                 busy: true,
                 message: Some("截图选择器已经打开".to_string()),
                 ..Response::default()
@@ -253,6 +264,7 @@ impl Service {
         }
 
         Response {
+            running: true,
             accepted: true,
             pid: Some(pid),
             action: Some(action.as_str().to_string()),
@@ -659,9 +671,16 @@ pub fn run() -> std::io::Result<i32> {
     // the loop a chance to reap the tracked child and observe `shutdown`
     // without a second thread.
     listener.set_nonblocking(true)?;
+    // accept() can fail transiently: a peer aborted the connection, or the
+    // process briefly hit its descriptor limit. Exiting on the first error would
+    // unlink the socket and take the long-shot toggle and the daemon-managed
+    // finish path down with it, so retry a bounded number of times before
+    // treating the listener as broken for good.
+    let mut accept_failures = 0u32;
     while service.is_running() {
         match listener.accept() {
             Ok((stream, _)) => {
+                accept_failures = 0;
                 let service = service.clone();
                 std::thread::spawn(move || serve_connection(&service, stream));
             }
@@ -670,8 +689,14 @@ pub fn run() -> std::io::Result<i32> {
                 wait_readable(&listener, REAP_INTERVAL);
             }
             Err(err) => {
-                log.error(format!("accept failed: {err}"));
-                break;
+                accept_failures += 1;
+                log.error(format!(
+                    "accept failed ({accept_failures}/{MAX_TRANSIENT_ACCEPT_FAILURES}): {err}"
+                ));
+                if accept_failures >= MAX_TRANSIENT_ACCEPT_FAILURES {
+                    break;
+                }
+                std::thread::sleep(TRANSIENT_ACCEPT_RETRY_DELAY);
             }
         }
     }
@@ -772,6 +797,12 @@ mod tests {
         let second = service.launch(Action::Region, &[]);
         assert!(!second.accepted);
         assert!(second.busy);
+        // A deliberate rejection from a live daemon: the client must surface it
+        // instead of silently running the action itself.
+        assert!(
+            second.running,
+            "a busy rejection must report a running daemon"
+        );
         service.stop();
     }
 
@@ -831,6 +862,9 @@ mod tests {
         let response = service.launch(Action::Region, &[]);
         assert!(!response.accepted);
         assert_eq!(response.message.as_deref(), Some("服务正在停止"));
+        // The client keys its in-process fallback on this flag: a daemon that is
+        // going away must not look like a deliberate rejection.
+        assert!(!response.running);
     }
 
     #[test]

@@ -92,6 +92,12 @@ pub enum State {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
+    /// True when the daemon that produced this response is still running.
+    ///
+    /// A daemon that has begun shutting down answers with "running": false, so a
+    /// client can tell "the daemon declined on purpose" (busy) apart from "the
+    /// daemon is going away or could not do the work", and fall back to running
+    /// the action in its own process instead of reporting a rejection.
     #[serde(default, skip_serializing_if = "is_false")]
     pub running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
