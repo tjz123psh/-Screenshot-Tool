@@ -91,8 +91,6 @@ impl Tray {
 
     /// While a long shot is running the same entry ends it, mirroring the
     /// toggle semantics of the keyboard shortcut.
-    /// While a long shot is running the same entry ends it, mirroring the
-    /// toggle semantics of the keyboard shortcut.
     fn long_label(&self) -> &'static str {
         if self.active_action() == Some(Action::Long) {
             "完成长截图"
@@ -177,6 +175,35 @@ impl Tray {
             let _ = tx.send(Message::Refresh);
         });
     }
+
+    /// Opens the settings panel.
+    ///
+    /// Launched as «vellum panel» rather than by re-executing this binary: the
+    /// tray deliberately links no GTK (DESIGN.md §1), and the full CLI already
+    /// owns the handover to «vellum-ui». Spawning happens on a thread because
+    /// the menu callback must not block the tray's service task.
+    fn open_panel(&self) {
+        std::thread::spawn(move || {
+            let Some(exe) = locate("vellum") else {
+                vellum_core::io::notify("vellum", "未找到 vellum 可执行文件", "critical");
+                return;
+            };
+            use std::os::unix::process::CommandExt;
+            let spawned = std::process::Command::new(exe)
+                .arg("panel")
+                // Without this the panel would die with the tray, and a settings
+                // window must outlive a tray restart.
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match spawned {
+                Ok(child) => vellum_core::proc::reap_in_background(child),
+                Err(_) => vellum_core::io::notify("vellum", "设置面板无法启动", "critical"),
+            }
+        });
+    }
 }
 
 impl ksni::Tray for Tray {
@@ -237,6 +264,14 @@ impl ksni::Tray for Tray {
             }
             .into(),
             MenuItem::Separator,
+            // The panel is where the API key lives, so it sits with the output
+            // preferences it also carries rather than next to the capture items.
+            StandardItem {
+                label: "设置面板".into(),
+                activate: Box::new(|tray: &mut Self| tray.open_panel()),
+                ..Default::default()
+            }
+            .into(),
             CheckmarkItem {
                 label: "截图后保存".into(),
                 checked: self.prefs.save,
@@ -370,6 +405,36 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// How long the tray waits for the shell's `StatusNotifierWatcher`.
+///
+/// Registration fails with `ServiceUnknown` when the tray starts before the
+/// shell (a user manager reached `default.target` long before the compositor
+/// spawned the shell). Exiting there would leave the session without a tray
+/// icon for good, and systemd's start limit would stop trying after a few
+/// seconds, so the process waits it out itself.
+const WATCHER_ATTEMPTS: u32 = 60;
+const WATCHER_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+fn spawn_with_retry(
+    tx: mpsc::Sender<Message>,
+) -> Result<ksni::blocking::Handle<Tray>, Box<dyn std::error::Error>> {
+    for attempt in 1..=WATCHER_ATTEMPTS {
+        match Tray::new(tx.clone()).spawn() {
+            Ok(handle) => return Ok(handle),
+            Err(err) if attempt == WATCHER_ATTEMPTS => return Err(err.into()),
+            Err(err) => {
+                if attempt == 1 || attempt % 6 == 0 {
+                    eprintln!(
+                        "[vellum-tray] 等待托盘宿主（第 {attempt}/{WATCHER_ATTEMPTS} 次）：{err}"
+                    );
+                }
+                std::thread::sleep(WATCHER_RETRY_DELAY);
+            }
+        }
+    }
+    unreachable!("the loop returns on the final attempt")
+}
+
 fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let _lock = match acquire_lock()? {
         Some(lock) => lock,
@@ -379,7 +444,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     };
 
     let (tx, rx) = mpsc::channel();
-    let handle = Tray::new(tx.clone()).spawn()?;
+    let handle = spawn_with_retry(tx.clone())?;
 
     // Bringing the service up can take a moment; do it off the tray thread so
     // the icon appears immediately.
@@ -486,6 +551,25 @@ mod tests {
     #[test]
     fn the_long_entry_starts_a_capture_when_none_is_running() {
         assert_eq!(tray().long_label(), "长截图");
+    }
+
+    #[test]
+    fn the_menu_offers_the_settings_panel() {
+        use ksni::Tray as _;
+
+        let labels: Vec<String> = tray()
+            .menu()
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Standard(item) => Some(item.label),
+                MenuItem::Checkmark(item) => Some(item.label),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|label| label == "设置面板"),
+            "menu lost the panel entry: {labels:?}"
+        );
     }
 
     #[test]
