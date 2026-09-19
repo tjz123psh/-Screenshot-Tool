@@ -162,6 +162,8 @@ sed "s|@VELLUM_TRAY@|$TRAY_BIN|g" \
     "$SRC_DIR/contrib/vellum-tray.service" > "$SYSTEMD_DIR/vellum-tray.service"
 sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" \
     "$SRC_DIR/contrib/ai.vellum.desktop" > "$APPLICATION_DIR/ai.vellum.desktop"
+sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" \
+    "$SRC_DIR/contrib/ai.vellum-panel.desktop" > "$APPLICATION_DIR/ai.vellum-panel.desktop"
 install -m 0644 "$SRC_DIR/contrib/icons/ai.vellum.svg" \
     "$ICON_APP_DIR/ai.vellum.svg"
 for icon in ai.vellum-symbolic ai.vellum-recording-symbolic ai.vellum-warning-symbolic; do
@@ -178,7 +180,13 @@ if command -v update-desktop-database >/dev/null; then
 fi
 
 if command -v systemctl >/dev/null; then
-    systemctl --user daemon-reload
+    # Best-effort: under sudo (which strips XDG_RUNTIME_DIR) or in a session
+    # without a user manager this fails, and an unguarded failure would abort
+    # the install after the binaries were replaced but before the environment
+    # check and the build-tree cleanup. The hotkey path can still start the
+    # daemon on demand.
+    systemctl --user daemon-reload \
+        || warn "systemd 用户实例不可达，跳过服务单元刷新"
     # `enable --now` will not replace an already-running daemon after an
     # upgrade.  `vellum restart` also shuts down an instance that a hotkey
     # spawned directly, before systemd starts the freshly installed code.

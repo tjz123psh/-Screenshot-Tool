@@ -48,6 +48,9 @@ jobs:
       - name: Test installer dependency failures
         run: bash tests/install-dependency-query.sh
 
+      - name: Test installer without a systemd user instance
+        run: bash tests/install-systemd-unreachable.sh
+
       - name: Check whitespace
         run: |
           if git grep -nI -E '[[:blank:]]+$' -- .; then
