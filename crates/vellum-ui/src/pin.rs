@@ -25,7 +25,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, DrawingArea, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, GestureClick, Overlay, PopoverMenu, PositionType, WindowHandle,
+    EventControllerScrollFlags, GestureClick, Overlay, PopoverMenu, PositionType,
 };
 use vellum_core::Rgb8;
 
@@ -155,8 +155,7 @@ impl PinWindow {
         // A WindowHandle is what makes dragging empty space move the window:
         // Wayland has no client-side "warp the window" call, the compositor
         // needs a real move-drag gesture from a handle widget.
-        let handle = WindowHandle::new();
-        handle.set_child(Some(&area));
+        let handle = crate::drag::draggable(&area);
 
         let menu = PopoverMenu::builder()
             .menu_model(&build_menu())
@@ -311,20 +310,10 @@ impl PinWindow {
                 // Look the window up by pid rather than acting on "the focused
                 // window": between mapping and this callback the user may have
                 // focused something else, and floating their window instead
-                // would be a visible, confusing side effect.
-                let handle = compositor::window_for_pid(std::process::id());
-                match &handle {
-                    Some(window) => {
-                        compositor::float(window);
-                    }
-                    // No handle: still worth asking the compositor to float
-                    // whatever it considers current, since this window was just
-                    // presented and is the likely candidate.
-                    None => {
-                        compositor::float_focused();
-                    }
-                }
-                *this.handle.borrow_mut() = handle;
+                // would be a visible, confusing side effect. Retried on the main
+                // loop because the compositor's client list can lag the map.
+                crate::own_window::float_own_window_soon();
+                *this.handle.borrow_mut() = compositor::window_for_pid(std::process::id());
             });
         });
     }

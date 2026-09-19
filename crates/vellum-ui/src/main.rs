@@ -17,8 +17,10 @@
 //!   selection overlay and creating the recorder.
 
 mod annotate;
+mod drag;
 mod highlight;
 mod imaging;
+mod own_window;
 mod paint;
 mod pin;
 mod recorder;

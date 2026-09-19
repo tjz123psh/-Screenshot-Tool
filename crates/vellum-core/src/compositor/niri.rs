@@ -99,14 +99,6 @@ pub(super) fn float(id: u64) -> bool {
     action("move-window-to-floating", &["--id", &id])
 }
 
-/// Moves the focused window to the floating layer.
-pub(super) fn float_focused() -> bool {
-    if request(&json!({"Action": {"MoveWindowToFloating": {"id": null}}})).is_some() {
-        return true;
-    }
-    action("move-window-to-floating", &[])
-}
-
 /// Reads the current size of a window in logical pixels.
 pub(super) fn window_size(id: u64) -> Option<(i32, i32)> {
     let windows = windows()?;

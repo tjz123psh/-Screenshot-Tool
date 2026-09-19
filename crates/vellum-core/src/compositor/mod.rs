@@ -134,20 +134,24 @@ pub fn window_for_pid(pid: u32) -> Option<Window> {
 pub fn float(window: &Window) -> bool {
     match window {
         Window::Niri(id) => niri::float(*id),
-        Window::Hyprland(address) => hyprland::float(Some(address.as_str())),
+        Window::Hyprland(address) => hyprland::float(address),
     }
 }
 
-/// Floats the focused window.
+/// Moves this process's own window to the floating layer.
 ///
-/// Only for callers that have no handle: looking the window up first is always
-/// preferable. Returns `false` on an unknown compositor.
-pub fn float_focused() -> bool {
-    match detect() {
-        Compositor::Niri => niri::float_focused(),
-        Compositor::Hyprland => hyprland::float(None),
-        Compositor::Unknown => false,
-    }
+/// Single-shot: the caller retries on its own main loop, because a window that
+/// was just mapped may not be in the compositor's client list yet, and sleeping
+/// inside a GUI callback would freeze the window it is trying to place.
+///
+/// There is deliberately **no** "float the focused window" fallback. Between the
+/// map and this call the user may have focused one of their own windows, and a
+/// dispatcher without a target floats that one: opening the settings panel once
+/// floated — and visibly shrank — the user's browser. A caller that cannot
+/// identify its window keeps the tiled position instead, which is a cosmetic
+/// loss rather than a side effect on somebody else's window.
+pub fn float_own_window(pid: u32) -> bool {
+    window_for_pid(pid).is_some_and(|window| float(&window))
 }
 
 /// Reads a window's current size in logical pixels.
@@ -283,9 +287,10 @@ mod tests {
         let _hypr = EnvGuard::clear("HYPRLAND_INSTANCE_SIGNATURE");
         assert_eq!(detect(), Compositor::Unknown);
         assert!(!detect().controls_windows());
-        // The whole point of the fallback: no handle, no calls, no errors.
+        // No compositor control: no handle, no calls, no errors — and in
+        // particular no attempt to float whatever happens to be focused.
         assert!(window_for_pid(std::process::id()).is_none());
-        assert!(!float_focused());
+        assert!(!float_own_window(std::process::id()));
     }
 
     #[test]

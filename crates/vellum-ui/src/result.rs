@@ -188,7 +188,10 @@ impl ResultWindow {
         close.add_css_class("vellum-quiet");
         close.add_css_class("vellum-icon-button");
         header.append(&close);
-        root.append(&header);
+        // The header doubles as the drag handle: vellum draws its own title bar
+        // (the session runs without server-side decorations), so without a
+        // WindowHandle there would be no way to move the window at all.
+        root.append(&crate::drag::draggable(&header));
 
         let divider = Separator::new(Orientation::Horizontal);
         divider.add_css_class("vellum-divider");
@@ -328,16 +331,10 @@ impl ResultWindow {
         self.window.connect_map(|_| {
             glib::timeout_add_local_once(FLOAT_DELAY, || {
                 // Looked up by pid rather than acting on the focused window:
-                // the user may have moved on during the delay above.
-                let pid = std::process::id();
-                match vellum_core::compositor::window_for_pid(pid) {
-                    Some(window) => {
-                        vellum_core::compositor::float(&window);
-                    }
-                    None => {
-                        vellum_core::compositor::float_focused();
-                    }
-                }
+                // the user may have moved on during the delay above. Retried on
+                // the main loop because the compositor's client list can lag the
+                // map, and a miss must not fall back to the user's window.
+                crate::own_window::float_own_window_soon();
             });
         });
     }

@@ -115,18 +115,19 @@ fn selector(address: &str) -> String {
     format!("address:{address}")
 }
 
-/// Moves a window to the floating layer, or the focused one when `address` is
-/// `None`.
+/// Moves a specific window to the floating layer.
 ///
 /// `action = "enable"` rather than `"toggle"`: floating has to be idempotent
 /// here, otherwise a retry would tile the pin window again.
-pub(super) fn float(address: Option<&str>) -> bool {
-    let target = match address {
-        Some(address) => format!(r#", window = "{}""#, selector(address)),
-        None => String::new(),
-    };
+///
+/// The window is always named. A dispatcher without a target floats whatever is
+/// focused at that instant, and "the focused window" is the user's, not ours:
+/// that is how opening vellum's settings panel once floated and shrank a
+/// browser window.
+pub(super) fn float(address: &str) -> bool {
     dispatch(&format!(
-        r#"hl.dsp.window.float({{ action = "enable"{target} }})"#
+        r#"hl.dsp.window.float({{ action = "enable", window = "{}" }})"#,
+        selector(address)
     ))
 }
 
