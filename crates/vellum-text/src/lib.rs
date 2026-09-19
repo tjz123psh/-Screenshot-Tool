@@ -5,6 +5,7 @@
 //! from unit tests and from non-UI processes.
 
 pub mod api;
+pub(crate) mod clean;
 pub mod llm;
 pub mod ocr;
 pub mod prep;

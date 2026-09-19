@@ -33,6 +33,13 @@ pub enum ApiError {
     Upstream(String),
     /// The endpoint answered, but not with the documented shape.
     Protocol(String),
+    /// The answer stopped because the model ran out of output budget.
+    ///
+    /// A separate variant because the text that does come back looks like a
+    /// perfectly good answer: shipping it would silently hand the user half a
+    /// translation, which is worse than an error. Callers can react — try a
+    /// model with a larger budget, or fall back to the local OCR engine.
+    Truncated(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -41,9 +48,10 @@ impl std::fmt::Display for ApiError {
             Self::MissingKey => f.write_str(
                 "未配置 API 密钥：请在设置面板填写，或设置环境变量 VELLUM_API_KEY / OPENAI_API_KEY",
             ),
-            Self::Transport(message) | Self::Upstream(message) | Self::Protocol(message) => {
-                f.write_str(message)
-            }
+            Self::Transport(message)
+            | Self::Upstream(message)
+            | Self::Protocol(message)
+            | Self::Truncated(message) => f.write_str(message),
         }
     }
 }
@@ -95,10 +103,30 @@ pub(crate) fn chat_at(
 
     let payload: Value = serde_json::from_str(&response.body)
         .map_err(|_| ApiError::Protocol("接口返回了非 JSON 响应".into()))?;
-    let content = payload
+    let choice = payload
         .get("choices")
         .and_then(|choices| choices.get(0))
-        .and_then(|choice| choice.get("message"))
+        .ok_or_else(|| ApiError::Protocol("接口响应缺少 choices".into()))?;
+
+    // Read the stop reason before the content: a truncated answer is
+    // well-formed, so nothing else in this function can tell it apart from a
+    // complete one.
+    match choice.get("finish_reason").and_then(Value::as_str) {
+        Some("length") => {
+            return Err(ApiError::Truncated(
+                "输出达到上限而被截断：请改用输出上限更大的模型，或缩小选区后重试".into(),
+            ));
+        }
+        Some("content_filter") => {
+            return Err(ApiError::Upstream(
+                "该内容被上游内容策略拦截，无法翻译或识别".into(),
+            ));
+        }
+        _ => {}
+    }
+
+    let content = choice
+        .get("message")
         .and_then(|message| message.get("content"))
         .and_then(content_text)
         .ok_or_else(|| ApiError::Protocol("接口响应缺少 choices[0].message.content".into()))?;
@@ -367,6 +395,67 @@ mod tests {
         serde_json::json!({ "choices": [{ "message": { "content": text } }] }).to_string()
     }
 
+    /// A truncated answer is well formed, so nothing but finish_reason can tell
+    /// it from a complete one. Shipping it would hand the user half a
+    /// translation while looking like success.
+    #[test]
+    fn a_length_finish_reason_is_not_a_result() {
+        let server = MockServer::start(vec![Script::reply(
+            200,
+            serde_json::json!({
+                "choices": [{
+                    "message": { "content": "Open the set" },
+                    "finish_reason": "length",
+                }]
+            })
+            .to_string(),
+        )]);
+        let err = chat(&api(server.base_url()), "mock-model", message(), timeout()).unwrap_err();
+        assert!(matches!(err, ApiError::Truncated(_)), "{err:?}");
+        assert!(err.to_string().contains("截断"), "{err}");
+    }
+
+    /// A filtered answer is an upstream refusal rather than a malformed
+    /// response: the translation path may try another model, and the OCR path
+    /// falls back to the local engine.
+    #[test]
+    fn a_content_filter_finish_reason_is_an_upstream_refusal() {
+        let server = MockServer::start(vec![Script::reply(
+            200,
+            serde_json::json!({
+                "choices": [{
+                    "message": { "content": "" },
+                    "finish_reason": "content_filter",
+                }]
+            })
+            .to_string(),
+        )]);
+        let err = chat(&api(server.base_url()), "mock-model", message(), timeout()).unwrap_err();
+        assert!(matches!(err, ApiError::Upstream(_)), "{err:?}");
+        assert!(err.to_string().contains("内容策略"), "{err}");
+    }
+
+    /// The ordinary stop reason must not be mistaken for either of the above,
+    /// and neither must its absence.
+    #[test]
+    fn a_normal_completion_is_returned_untouched() {
+        let server = MockServer::start(vec![
+            Script::reply(
+                200,
+                serde_json::json!({
+                    "choices": [{
+                        "message": { "content": "hello" },
+                        "finish_reason": "stop",
+                    }]
+                })
+                .to_string(),
+            ),
+            Script::reply(200, choices("hello")),
+        ]);
+        let api = api(server.base_url());
+        assert_eq!(chat(&api, "m", message(), timeout()).unwrap(), "hello");
+        assert_eq!(chat(&api, "m", message(), timeout()).unwrap(), "hello");
+    }
     /// A blocked endpoint must not surface as ureq's own text ("timeout:
     /// global"): the message names the host and points at the proxy, because
     /// that is the failure a user hits with api.openai.com or Google from a

@@ -212,6 +212,14 @@ pub struct LlmConfig {
     /// works. Only explicit upstream refusals advance to the next model; a
     /// transport error is a local problem and aborts immediately.
     pub fallback_models: Vec<String>,
+    /// Terms to keep verbatim, or to pin to one wording.
+    ///
+    /// A screenshot is full of things that must survive translation unchanged —
+    /// identifiers, file paths, flags, product names — and "Nexus" is not
+    /// improved by being rendered as 关系. Each entry is either `term` (keep it
+    /// as-is) or `term=译法` (always use this wording). Empty by default: a
+    /// glossary is a preference, not a policy.
+    pub glossary: Vec<String>,
 }
 
 impl Default for LlmConfig {
@@ -220,6 +228,7 @@ impl Default for LlmConfig {
             model: DEFAULT_LLM_MODEL.into(),
             target_lang: DEFAULT_TARGET_LANG.into(),
             fallback_models: Vec::new(),
+            glossary: Vec::new(),
         }
     }
 }
@@ -328,6 +337,7 @@ struct RawLlm {
     model: Option<toml::Value>,
     target_lang: Option<toml::Value>,
     fallback_models: Option<toml::Value>,
+    glossary: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -513,6 +523,11 @@ impl Config {
         if let Some(v) = string_list(&raw.llm.fallback_models) {
             cfg.llm.fallback_models = v.into_iter().map(strip_legacy_model_prefix).collect();
         }
+        if let Some(v) = string_list(&raw.llm.glossary) {
+            // Deliberately not run through the model-prefix stripper: these are
+            // arbitrary terms, and "vendor/Name" is a legitimate entry.
+            cfg.llm.glossary = v;
+        }
 
         // `tesseract`/`vision` were the pre-panel engine names.
         if let Some(v) = one_of(
@@ -588,6 +603,8 @@ model = {model}
 target_lang = {target_lang}
 # 主模型被上游明确拒绝时依次尝试的模型
 fallback_models = {fallback_models}
+# 术语表：写 term 表示原样保留，写 term=译法 表示固定译法
+glossary = {glossary}
 
 [ocr]
 # \"builtin\" = 本地 Tesseract；\"api\" = 调用上面的 API 做视觉识别
@@ -613,6 +630,7 @@ max_diff = {max_diff}
             model = toml_string(&self.llm.model),
             target_lang = toml_string(&self.llm.target_lang),
             fallback_models = toml_list(&self.llm.fallback_models),
+            glossary = toml_list(&self.llm.glossary),
             ocr_engine = toml_string(&self.ocr.engine),
             ocr_langs = toml_string(&self.ocr.langs),
             ocr_preprocess = self.ocr.preprocess,
@@ -667,6 +685,43 @@ mod tests {
         assert!(cfg.llm.fallback_models.is_empty());
     }
 
+    /// A glossary entry is arbitrary user text, and the model-id prefix
+    /// stripper must not touch it: "vendor/Name" is a legitimate term.
+    #[test]
+    fn a_glossary_survives_a_round_trip_and_is_not_treated_as_a_model_id() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [llm]
+            model = "qwen2.5:7b"
+            glossary = ["Nexus", "vendor/Name", "API=接口"]
+            [api]
+            api_key = "sk-test"
+            "#,
+        );
+        assert_eq!(cfg.llm.glossary, vec!["Nexus", "vendor/Name", "API=接口"]);
+
+        // Emitted, then re-read: the field has to survive the writer too.
+        let text = cfg.to_toml_string();
+        assert!(text.contains("glossary"), "{text}");
+        let again = Config::from_toml_str(&text);
+        assert_eq!(again.llm.glossary, cfg.llm.glossary);
+    }
+
+    /// Empty entries are dropped rather than becoming glossary terms that match
+    /// nothing.
+    #[test]
+    fn empty_glossary_entries_are_dropped() {
+        let cfg = Config::from_toml_str(
+            r#"
+            [api]
+            api_key = "sk-test"
+            [llm]
+            glossary = ["Nexus", "  ", ""]
+            "#,
+        );
+        assert_eq!(cfg.llm.glossary, vec!["Nexus"]);
+        assert_eq!(Config::default().llm.glossary, Vec::<String>::new());
+    }
     #[test]
     fn valid_values_are_applied() {
         let cfg = Config::from_toml_str(
