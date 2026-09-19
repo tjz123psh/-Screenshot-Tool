@@ -13,10 +13,10 @@
 | --- | --- | --- |
 | `vellumctl` | 否 | 快捷键唯一入口。手工解析 argv，只认 `region`/`long`/`pin-last`，发一条 JSON 到 socket 就退出 |
 | `vellum` | 否 | 完整 CLI（含 `daemon` 子命令）。`status`/`doctor`/`logs`/`restart`/`shortcuts`/`tray` |
-| `vellum-ui` | 是 | 唯一的 GTK 进程：选区 overlay、标注、长截图面板、钉图窗口、OCR/翻译结果窗 |
+| `vellum-ui` | 是 | 唯一的 GTK 进程：选区 overlay、标注、长截图面板、钉图窗口、OCR/翻译结果窗、设置面板 |
 | `vellum-tray` | 否 | 托盘。只走 D-Bus（SNI + `com.canonical.dbusmenu`） |
 
-**为什么不做成一个二进制**：GTK 的动态链接与初始化在本机实测占端到端延迟的约三分之二（`PERFORMANCE.md` §2）。快捷键路径每次按键都要付这笔账，而它 99% 的情况下只是把一条 20 字节的 JSON 递给已经在跑的守护进程。`vellumctl` 不链接 GTK、不链接 clap、不链接 regex。
+**为什么不做成一个二进制**：GTK 的动态链接与初始化在本机实测占端到端延迟的约三分之二（`PERFORMANCE.md` §3）。快捷键路径每次按键都要付这笔账，而它 99% 的情况下只是把一条 20 字节的 JSON 递给已经在跑的守护进程。`vellumctl` 不链接 GTK、不链接 clap、不链接 regex。
 
 **交接用 `execv` 而不是 `spawn`**：守护进程记录它启动的子进程 pid，并向该 pid 发 `SIGUSR1` 结束长截图。若 `vellum` 用 spawn 再退出，pid 就断了。`execv` 原地替换镜像，pid 跨交接存活。
 
@@ -84,8 +84,9 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 ### 托盘：`ksni` 0.3.6
 
 - **放弃 `libappindicator`/`ayatana` 绑定**：要拖 GTK 3 进来，而托盘进程本该是最轻的一个。
-- **选中理由**：ksni 从同一个对象同时导出 `org.kde.StatusNotifierItem` 与 `com.canonical.dbusmenu`。传统 dbusmenu 是硬约束——本机宿主（niri/Hyprland 下的 QuickShell）读的是它，只答现代接口的表现是「图标出现但菜单为空」。已用 `GetLayout` 实测拿到完整 13 项菜单树。
+- **选中理由**：ksni 从同一个对象同时导出 `org.kde.StatusNotifierItem` 与 `com.canonical.dbusmenu`。传统 dbusmenu 是硬约束——本机宿主（niri/Hyprland 下的 QuickShell）读的是它，只答现代接口的表现是「图标出现但菜单为空」。已用 `GetLayout` 实测拿到完整菜单树（2026-09-18 加入「设置面板」后为 14 项子菜单）。
 - 开 `blocking` feature 保留默认 tokio runtime，托盘代码里不出现 async main。
+- **托盘注册要等宿主**：`default.target` 在登录时就到达，而 shell 的 `StatusNotifierWatcher` 往往几十秒后才出现；注册失败即退出会让整个会话没有托盘图标（systemd 的重启预算也只有几秒）。所以 unit 同时装进 `default.target` 与 `graphical-session.target`，进程自身最多等 5 分钟再放弃。
 
 ### OCR：`tesseract` 子进程，不用 `leptess`
 
@@ -97,7 +98,18 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 
 ### HTTP：`ureq` 3.3.0
 
-同步阻塞 API，正好配合「worker 线程 + `glib::idle_add` 回填」的结构。**放弃 `reqwest`**：会拖入 tokio，而这里没有任何需要 async 的并发。注意 ureq 默认无超时，所有调用点都显式设了（健康探测 200 ms、清理 1 s、翻译取 `timeout_s`）。
+同步阻塞 API，正好配合「worker 线程 + `glib::idle_add` 回填」的结构。**放弃 `reqwest`**：会拖入 tokio，而这里没有任何需要 async 的并发。注意 ureq 默认无超时，所有调用点都显式设了（`[api] timeout_s`、API OCR 取 `[ocr] api_timeout_s`、面板的连接测试另给一个短超时）。
+
+### 模型接入：一个 OpenAI 兼容客户端
+
+翻译与 API 视觉 OCR 共用 `crates/vellum-text/src/api.rs` 里的同一个客户端，都打 `POST {base_url}/chat/completions`，这样请求形状、密钥优先级与错误分类只存在一份。
+
+- **为什么是 OpenAI 兼容而不是绑定某家**：用户要求"给 OCR 和翻译功能提供 api 接入大模型"；OpenAI 兼容是事实标准，同一个实现同时覆盖 OpenAI、DeepSeek、OpenRouter、Ollama、vLLM、LM Studio。
+- **为什么不再调用 `opencode`**：旧实现优先复用本机 `opencode serve`、失败回退 `opencode run`。它把翻译质量绑在 PATH 上的一个 CLI 与它的免费模型池上；本机实测该服务的 HTTP 接口并非 OpenAI 兼容（`/v1/models` 返回 SPA HTML），无法用同一套客户端覆盖，于是整条路径被"可配置的 API"取代。旧配置里的 `opencode/` 模型前缀在加载时剥离，其余字段保留。
+- **错误分类决定重试策略**：4xx/5xx 且服务端说明了原因 → `Upstream`，只在这种情况下换 `fallback_models` 里的下一个模型；连接/超时 → `Transport`，立即返回（换模型不会让网络变好）；没有密钥且不是本机地址 → `MissingKey`，在发起请求前就拒绝。
+- **密钥不进日志**：`doctor` 只报接口地址、模型和"密钥来自哪里"，面板回显密钥时需要显式点开。
+- **代理是配置项，不是环境变量**：动作进程由 systemd 服务拉起，看不到用户 shell 里 export 的 `HTTPS_PROXY`；所以 `[api] proxy` 优先，留空才回退到标准环境变量，`none` 表示强制直连。ureq 对 `http://` 目标也走 `CONNECT` 隧道，本地 Clash 之类的 HTTP 代理可以直接用。
+- **错误信息要能指路**：连接超时/无法解析/连接被拒分别给出主机名、秒数与"是否配置了代理"的提示，而不是把 ureq 的 `timeout: global` 原样抛给用户；面板的"测试连接"还会把当前模型与 `/models` 列表比对，因为"接口可达但模型名错"是独立的一类失败。
 
 ### 其他
 
@@ -155,11 +167,25 @@ Wayland 下普通应用无法安全合成滚轮事件。这是事实陈述，不
 
 ## 5. UI 侧的硬约束
 
+### 设置面板（模型接入）
+
+面板是 `vellum-ui panel` 的一个模式，从托盘的「设置面板」、`vellum panel` 或桌面入口打开。它不是"另一个设置文件"：面板只是 `config.toml` 的可视化编辑器，读写都走 `vellum_core::config`，所以手写配置和面板可以混用。
+
+- **侧边栏 + 内容区，而不是顶部 tabs**：左栏 184 px 放三个互斥分类（模型接入 / 翻译与 OCR / 截图行为），右栏是限宽 640 px 的滚动表单。翻页只有两个来源（侧边栏点击与 `Ctrl+1`/`Ctrl+2`/`Ctrl+3`），两者都走同一个 `show_page`，所以侧边栏高亮永远与实际页一致；表单限宽是为了不让 URL/代理输入框横跨整窗。`Ctrl+S` 保存、`Esc` 关闭。
+- **三层材质，而不是平涂半透明**：窗口底板 `#0e1015` + 顶部极淡渐光；卡片 `rgba(255,255,255,0.04)` + 发丝边 `rgba(255,255,255,0.08)` + 顶部内高光；输入框下沉 `rgba(0,0,0,0.25)`，focus 才出现品牌色描边环 `#4f6ef7`。状态用带柔光的圆点 + 低饱和胶囊（`.vellum-pill`）表达，颜色由 class 派生，文字与圆点不可能互相矛盾。
+- **行级单元（Action Row）是唯一的表单语法**：左侧加粗名称 + 一句说明，右侧控件，行间发丝分隔线由 `controls::push_row` 自动插入（避免最后一行留一条孤线）。密码框的"显示"是内嵌的眼睛图标（`view-reveal-symbolic`/`view-conceal-symbolic`），不再是外挂的文字按钮；步进器是一个凹槽外壳 + 无边框 SpinButton + 尾部单位。宽控件（URL、模型选择器、分段控件）用 `action_row_stacked` 占满整行。
+- **CSS 的节点名要按 GTK 文档写**：分组后的 `GtkCheckButton` 指示器节点是 `radio` 而不是 `check`，用错选择器不会报错、只是静默不生效（分段控件里残留两个圆点就是这么来的）。`theme.rs` 因此加了两个测试：用 GTK 解析整张样式表并断言零 parsing error，以及断言 panel/picker 用到的每个 class 都仍有规则。
+- **模型名必须能从接口读回来**：「获取模型」请求 `/models`，把结果同时灌进两个模型选择器（可搜索的下拉 + 可手写）。每个 OpenAI 兼容服务命名模型的方式都不同（Gemini 端点会 404 `gpt-4o-mini`），手写一个不存在的名字是这里唯一的高频错误，所以列表之外的名字会当场标红，而不是等到翻译时才报错。
+- **保存语义**：原子写 + 0600（配置里可能有密钥），保存后提示"下一次截图生效"，不重启任何服务。`Config::load` 在每个动作进程里重新读，所以"下一次动作生效"是事实而不是承诺。
+- **测试连接只打 `GET /models`**：它验证地址、密钥与网络，不消耗生成额度；失败时把服务端的错误文案原样显示，而不是"连接失败"。
+- **密钥的处理**：显示为密码框，默认不回显；面板会说明当前密钥来自"配置文件"还是哪个环境变量（`ApiConfig::key_source`），`doctor` 只报来源不报内容。
+- **窗口必须能被鼠标拖动**：Wayland 没有客户端移动窗口的调用，只有 `gtk4::WindowHandle` 能让合成器进入交互式移动。结果窗与面板都自带标题栏（会话没有服务端装饰），所以标题栏同时是拖动手柄；面板还会在 map 后 60 ms 自己请求浮动，不依赖用户的窗口规则。
+
 ### 长截图面板收口设计（实时 viewport + 累计 canvas）
 
 **场景与唯一主任务。** 面板服务正在 niri/Hyprland 中手动滚动网页、终端或列表的用户；主任务不是浏览一张缩略长图，而是立即确认“目标 viewport 正在被采集/向哪边移动”和“唯一内容是否继续累积”，然后可靠完成。完成是唯一 suggested action，取消保持 quiet；面板仍用 `KeyboardMode::OnDemand`，不抢目标窗口焦点。
 
-**视觉 tokens。** 单一深色 surface `rgba(23,26,33,.97)`；正文 `#f2f4f8`、次要文字 `#aab1c0`；蓝色 `#8ea9ff` 只表示拼接增长/主动作；绿色 `#7ed9ad` 只表示采集健康；琥珀 `#f0c674` 表示校准/减速；红色 `#ff8995` 只用于真正失败。标题走 GNOME heading，状态/说明走 body/caption，数字保持 tabular-feeling 但不引入自带字体。签名元素是一条紧凑的“拼接缝轨”：最近若干 decision 中，新增行是蓝段、已捕获回访是紫灰段、静止是暗点、拒绝/恢复是琥珀段；它表达历史变化而不是伪造未知终点的百分比。
+**视觉 tokens。** 单一深色 surface `rgba(23,26,33,.97)`；正文 `#f2f4f8`、次要文字 `rgba(232,236,245,.58)`（`.vellum-dim` 为 `.60`）；蓝色 `#8ea9ff`/`#b9c8ff` 只表示拼接增长/主动作；绿色 `#7ed9ad` 表示采集健康与重定位；琥珀 `rgba(240,199,115,.95)` 表示校准/减速与拒绝；红色 `#ff8995` 只用于真正失败。标题走 GNOME heading，状态/说明走 body/caption，数字保持 tabular-feeling 但不引入自带字体。签名元素是一条紧凑的“拼接缝轨”：最近若干 decision 中，新增行是蓝段、已捕获回访是紫灰段、静止是暗点、重定位（re-anchor）是绿段、拒绝是琥珀段；它表达历史变化而不是伪造未知终点的百分比。色值以 `theme.rs` 与 `recorder.rs` 的实现为准。
 
 **两种反馈语义必须分离。** “实时画面”是节流到约 12 fps 的最新 viewport 小缩略图和 `↑/↓ N px`/“回访已捕获区域”文案；distinct frame（包括 rejected/revisit）在 80 ms 窗口内合并到 newest 并安排尾部刷新，不能直接丢弃最后一帧；“累计拼接”只显示 unique canvas height、约等于多少 viewport、处理/对齐数和拼接缝轨，仅在 matcher decision 改变时更新。不能再让一张 accumulated thumbnail 同时冒充这两个信号。
 
@@ -248,10 +274,14 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 | 未移植 `run_result` 与 `Annotator::cycle_color/cycle_width` | Python 里已是死代码（全仓库无调用者） |
 | `anno.done` 无内容时返回选区工具栏而不是直接完成 | 修正：Python `_exit_annotate(apply=True)` 本就是这个语义，早期移植写错了 |
 | 钉图窗口缩放先查合成器实时尺寸，再回退自记账 | 用户用合成器键位改过窗口大小后，自记账会漂移 |
+| `pin-last` 不接受 `--no-save`/`--no-copy` | `ARCHITECTURE.md` §2.10 把三个动作写成同形；钉图只是把剪贴板图片贴到屏幕上，既不保存也不复制，加开关只会是空动作（见 `vellum-tray/src/main.rs` 的同一注释） |
+| 翻译与 API OCR 只走可配置的 OpenAI 兼容接口 | 用户要求把模型接入交给用户自己配置；不再依赖 PATH 里的 `opencode`，同一客户端同时服务翻译与视觉 OCR（见 §3「模型接入」） |
+| OCR 提供"内置 Tesseract / API 视觉模型"两种引擎 | 用户要求两者可选；内置路径保持原来的离线识别与增强候选，API 路径把选区交给视觉模型 |
+| 配置可由设置面板写入 | 以前只能手写；面板保存走临时文件 + `rename` 原子替换并收紧到 0600，下一次动作生效，无需重启服务 |
 
 ## 8. 合成器抽象（niri + Hyprland）
 
-`ARCHITECTURE.md` §22 原本写的是 niri-only。用户后来要求「这个版本适配 niri 和 hyprland」，所以加了一层抽象。
+`ARCHITECTURE.md` §1 原本写的是 niri-only。用户后来要求「这个版本适配 niri 和 hyprland」，所以加了一层抽象。
 
 ### vellum 到底需要合成器做什么
 
@@ -274,7 +304,9 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 
 ### 为什么按 pid 查窗口，而不是操作「聚焦窗口」
 
-映射与延迟 60 ms 的浮动调用之间，用户完全可能已经切换焦点。浮动别人的窗口是可见且困惑的副作用。只有拿不到 handle 时才退回 `float_focused()`。
+映射与延迟 60 ms 的浮动调用之间，用户完全可能已经切换焦点，而**不带目标的 dispatcher 浮动的是「当前聚焦窗口」——那是用户的窗口，不是我们的**。所以这条路径只有一个做法：按 pid 找到自己的窗口再浮动，**没有「找不到就浮动聚焦窗口」的兜底**。
+
+**曾经真的踩过**：设置面板打开时（映射后 60 ms）若合成器的 client 列表还没更新，pid 查询会落空，旧代码于是退回到「浮动聚焦窗口」，把用户当时聚焦的浏览器窗口浮起来并缩到浮动尺寸。现在改成在主循环上重试（`float_own_window_soon`，5 次 × 120 ms），**全部落空就什么都不做**——窗口保持平铺只是观感损失，动到别人的窗口才是缺陷。
 
 ### Hyprland 协议的三个坑
 

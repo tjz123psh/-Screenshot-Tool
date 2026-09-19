@@ -27,7 +27,7 @@ cargo bench -p vellum-stitch
 
 两组场景：不透明，以及 `apply_translucency(0.72, [24,26,38])` 的半透明窗口（Python 基线最慢的场景）。
 
-### 数据
+### 数据（2026-08-01 主表）
 
 | 场景 | 实现 | 总计 | add | 每帧 | finish |
 |---|---|---|---|---|---|
@@ -39,6 +39,17 @@ cargo bench -p vellum-stitch
 两边都是 101 帧全部使用、输出 900x2700、keyframe 2.2 MiB、走了 offline rebuild，即同等工作量下 **约 10 倍**。ARCHITECTURE.md §4.2 记载的 Python 基线 1.4~2.3 秒与此处复现的 1.42/1.32 秒一致。
 
 keyframe 内存 2.2 MiB 远低于 48 MiB 硬上限，`_trim_keyframes` 在该规格下不会触发。
+
+### 2026-09-18 复测（当前 HEAD，rustc 1.97.1）
+
+同一台机器、同一 release profile 复跑 6 次 `cargo bench -p vellum-stitch`（次数在本机同时进行的编译/测试负载下采集，单次值因此有波动）：
+
+| 场景 | 总计 | 每帧 | finish |
+|---|---|---|---|
+| 不透明 | **129.1–143.9 ms** | 0.84–0.98 ms | 44.0–45.7 ms |
+| 半透明 | **134.7–147.0 ms** | 0.91–1.03 ms | 42.4–43.7 ms |
+
+口径与主表一致：101 帧全部使用、输出 900x2700、keyframe 2.2 MiB、走 offline rebuild。相对 2026-08-01 主表（151.5/135.1 ms），不透明方向更快、半透明基本持平；两次测量之间没有做逐提交归因，只记录区间，匹配阈值与验收门限未改动。
 
 ### 超长画布失配恢复
 
@@ -65,7 +76,14 @@ keyframe 内存 2.2 MiB 远低于 48 MiB 硬上限，`_trim_keyframes` 在该规
 - `finish_started`、`capture_worker_joined`、`finish_latest_frame`：完成时 queue/latest/in-flight 是否收干净；
 - `session_summary` 的 online/output height 与 `offline_rebuilt`：在线 canvas 正确但离线重建变短，还是输入/在线阶段已经缺桥。
 
-trace 未开启时 emitter 本身不分配或序列化；capture sequence/汇总计数仍使用已有 queue mutex，以便尾帧去重语义不依赖诊断开关。其对 101 帧 stitch benchmark 与 niri capture cadence 的影响必须在 Phase F 重跑后再记录，当前不把“clippy/tests 通过”冒充性能结论。
+trace 未开启时 emitter 本身不分配或序列化；capture sequence/汇总计数仍使用已有 queue mutex，以便尾帧去重语义不依赖诊断开关。
+
+**trace 开销实测（2026-09-18）。** 分两层，避免用“测试通过”代替数据：
+
+1. `vellum-stitch` 的在线/离线拼接路径没有任何 trace 调用，101 帧基准不因开关改变，本次复测（trace 关闭）见 §1 的 129.1/134.7 ms。
+2. emitter 本身用一次性 release probe 量过（200,000 次 `LongshotTrace::line()`，测完已删除）：关闭时 **7.2 ns/事件**，字段数不影响（无分配、无序列化）；开启时 991.8 ns（0 字段）、1358.1 ns（4 字段）、1912.5 ns（9 字段）。recorder 每帧最多 4 个事件（`capture_succeeded`/`capture_enqueued`/`capture_dequeued`/`stitch_frame`），即开启时约 **4–7.7 µs/帧**，相对普通 copy 的 2 ms 或 damage 驱动帧间隔的 7 ms 约为 0.06–0.1%。
+
+结论：trace 开关不会把 101 帧 stitch benchmark 或 niri 采样 cadence 拉出可测区间。未覆盖的边界是多输出/多 seat 下日志写放大的影响，本次没有测量，不能由单输出数据外推。
 
 ### recorder UI 隔离的 niri 像素证明
 
@@ -146,7 +164,7 @@ cargo bench -p vellum-ipc
 
 报告百分位而非只报均值：均值会掩盖「多数请求瞬间返回、偶尔卡满一个轮询周期」这个失败模式——而那正是本次抓到的缺陷。
 
-### 数据
+### 数据（2026-08-01 主表）
 
 | 命令 | mean | p50 | p95 | p99 | max |
 |---|---|---|---|---|---|
@@ -154,6 +172,8 @@ cargo bench -p vellum-ipc
 | status | **0.049 ms** | 0.042 ms | 0.072 ms | 0.108 ms | 1.015 ms |
 
 落在 §6 要求的亚毫秒区间。
+
+2026-09-18 复测（同机、同方法、1000 次采样，共 6 次运行）：ping mean 0.041–0.052 / p50 **0.037–0.049** ms；status mean 0.040–0.061 / p50 **0.037–0.056** ms；最差的单次 p99 为 0.17 ms、max 为 0.76 ms。仍落在亚毫秒区间，与主表差异在噪声量级，不改变任何结论。
 
 ### 这个基准抓到的真实缺陷
 
@@ -233,6 +253,20 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 
 这里优化的重点不是只省 14 ms，而是消除“每帧新建一个无 timeout 子进程”的无界状态：持久连接可被完成信号立即唤醒，连续失败有 UI 状态，输出变化最多触发一次降级。当前 niri 已用 3 帧 2×2 与 31 帧 900×700 两种真机路径验证 buffer 复用；Hyprland 仍需在切换到该会话后做同一真机 smoke，不能用 niri 的通过替代。
 
+#### 2026-09-18 复测：copy 原语与 `capture()` 语义（niri 26.04、144 Hz、1920×1080 scale 1）
+
+同机一次性 probe（临时改写 ignored live test 量完即还原，仓库不保留非确定性基准）：
+
+| 路径 | n | mean | p50 | p90 | min | max |
+|---|---:|---:|---:|---:|---:|---:|
+| 强制普通 copy 900×700（run 1） | 30 | **2.08 ms** | 1.99 ms | 2.75 ms | 1.66 ms | 3.17 ms |
+| 强制普通 copy 900×700（run 2） | 30 | **1.68 ms** | 1.58 ms | 2.46 ms | 1.35 ms | 2.96 ms |
+| 生产 `capture()`（首帧后 damage copy） | 30 | 7.5 / 7.0 ms | 7.03 / 6.95 ms | 9.78 / 7.63 ms | 4.33 ms | 14.33 ms |
+
+- 2026-08-01 记录的 2.01 ms/帧在 niri 26.04 上仍成立（本次 1.68–2.08 ms）。
+- 生产路径的调用间隔不是 copy 原语耗时：`capture()` 首帧后走 `copy_with_damage`，画面静止时会等到 1 秒 heartbeat 才返回；本次屏幕持续有 damage，p50 约 7.0 ms，与 144 Hz 的 6.94 ms 帧周期一致，疑似按输出刷新节拍交付。60 Hz 输出上的对应数字没有测量（切换输出模式会打断用户会话），不能把 7 ms 外推。
+- 把两者混为一谈会得出“采样率掉到 130 fps 以下”的错误结论：真正约束是合成器刷新节拍与主循环消费速度，不是 2 ms 的 copy 原语。
+
 ---
 
 ## 4. OCR 与翻译
@@ -285,6 +319,18 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 
 因此用户观察到的旧版慢路径确实是“困难场景用更多 Tesseract 候选换识别率”，但不是必须串行付完所有候选。现在保留同样的质量复核，最慢合成场景从约 4.9 秒降到约 2.5 秒。`VELLUM_OCR_TRACE=1` 可记录候选种类、PSM、预处理/Tesseract 耗时、置信度与最终选择，不记录 OCR 文本。
 
+#### 小字号多行选区的布局判定（2026-09-18）
+
+`layout_psm` 原本只看宽高比与高度：宽而矮的作物一律按单行（PSM 7）识别。但"三行小字"和"横幅"的包围盒完全一样，PSM 7 在多行作物上返回 0 字符，随后 `should_retry_layout` 再花一次 Tesseract 启动换成 PSM 6。现在在返回 PSM 7 之前先数一次文本行（与背景亮度差 ≥ 48 的"墨"行，且行带高度 ≥ 3 px，避免把 1 px 边框当文字），行数 > 1 就直接用 PSM 6：
+
+| 场景 | 旧行为 | 当前 |
+|---|---|---|
+| 760×96 三行 20px 清晰文本 | PSM 7（0 字符）→ 重试 PSM 6，两次 Tesseract，约 1.0 s | **PSM 6 一次通过，0.52 s** |
+| 720×82 单行横幅 | PSM 7 一次通过 | PSM 7 一次通过（未变） |
+| 620×96 三行 15px 低置信文本 | PSM 7 → PSM 6，两次 | PSM 6 → PSM 11 复核，两次（置信度低时本来就会换布局复核，耗时持平） |
+
+行计数只在"宽高比 ≥ 2.4 且高度 ≤ 96"的小作物上运行，两遍步长 2 的采样在 96 px 高的作物上是几万次读取，远低于一次 Tesseract 启动。
+
 #### 可重复的本地回归门禁
 
 历史表保留的是 v0.1.0 与增强提交的原始并排测量；为避免 fixture 只存在于临时目录，仓库另提供 `tools/ocr-regression.py`。它用固定随机种子生成 8 个双行场景和 2 个短横幅，在临时目录构建并调用 `vellum-text` 的 developer-only `ocr_probe` example，按同一 Levenshtein 规则返回人类表格或 `--json`，任何场景低于阈值即退出 1。脚本不读取截图目录或剪贴板。
@@ -299,16 +345,21 @@ python3 tools/ocr-regression.py --json
 
 ### 翻译
 
-| 路径 | 耗时 |
+翻译自 2026-09-18 起**只走 OpenAI 兼容的 HTTP 接口**（`POST {base_url}/chat/completions`），不再调用本机 `opencode serve` / `opencode run`。下表是旧后端的历史测量，保留下来只为说明"为什么不把翻译绑在一个 CLI 上"，**不代表当前实现**：
+
+| 旧路径（2026-08-01，已移除） | 耗时 |
 |---|---|
-`opencode serve` HTTP（复用常驻服务） | **2.96 s**
-`opencode run` CLI 回退 | 7.03 s
+| `opencode serve` HTTP（复用常驻服务） | **2.96 s** |
+| `opencode run` CLI 回退 | 7.03 s |
 
-服务路径约快 2.4 倍，这是 §2.7 优先复用常驻服务的实测依据。
+服务路径比 CLI 快约 2.4 倍，当时据此优先复用常驻服务；现在这条路径整体删除，改由用户配置的接口承担。
 
-验证服务路径真的在跑，用的是决定性方法而非看日志：**把 `opencode` 从 `PATH` 移除**，只剩 HTTP 路由可能成功——仍然返回正确译文。
+当前实现的能力与边界：
 
-两个容易写错的点已核实：服务器返回的 `parts` 数组包含 `step-start` / `reasoning` / `text` / `step-finish`，其中 **`reasoning` 项也带 `text` 字段**，按字段而非按 `type == "text"` 过滤会把模型的思考过程当成译文；一次性 session 在 finally 里 DELETE，跑完检查服务器上标题为 `vellum translation` 的 session 数为 0，不污染用户的 session 列表。
+- **只换模型，不换传输**：4xx/5xx 且服务端说明原因（`Upstream`）才按 `fallback_models` 试下一个模型；连接/超时（`Transport`）立即返回，因为换模型不会让网络变好；非本机地址且没有任何密钥时在开 socket 之前就拒绝（`MissingKey`）。
+- **译文里的思考过程**：旧 `opencode` 的 nd-JSON 流会把 `reasoning` 事件也带上 `text` 字段，需要按 `type == "text"` 过滤；OpenAI 兼容接口没有这个问题——`choices[0].message.content` 就是译文本身，响应里混入别的内容会被当作 `Protocol` 错误报出来。
+- **耗时构成**：客户端自身只做一次 JSON 序列化与一次阻塞请求，毫秒级；端到端时间由所选模型与网络决定，所以这里不再记录"毫秒级基准"，只记录错误分类与轮换语义（`crates/vellum-text/src/api.rs`）。
+- **可复现的验证**：仓库内的 mock HTTP 测试用 `std::net::TcpListener` 脚本化 401/403/404/422/429/500/503、连接中断与超时，断言请求 shape（model/messages/temperature/Authorization）与错误映射；面板的「测试连接」走 `GET /models`，不消耗生成额度。
 
 ---
 
@@ -348,6 +399,7 @@ python3 tools/ocr-regression.py --json
 16. `zoom_window` 优先从 `compositor::window_size` 读当前尺寸，而不是从自己记账的值推算。用户用合成器键位改过窗口大小后，自记账会漂移。
 
 17. **同时支持 niri 与 Hyprland**（Python 版是 niri-only）。合成器在运行期按环境变量识别，两边都不在时退化为普通 Wayland 客户端。见 `DESIGN.md` §8。
+18. **`pin-last` 不接受 `--no-save`/`--no-copy`**（`ARCHITECTURE.md` §2.10 把三个动作写成同形）。钉图只把剪贴板图片贴到屏幕上，既不保存也不复制，这两个开关在它身上没有作用对象。
 
 ---
 
@@ -371,5 +423,22 @@ layer-shell 行为（overlay 呈现、namespace、exclusive zone）也在 Hyprla
 **niri 既有路径：已真机验收。** 合成器探测、按 pid 找自己的窗口、pin 浮动与精确改尺寸、layer-shell overlay，以及迁移后的快捷键均曾在 niri 会话跑通。
 
 **本轮长截图采集改动的环境边界：** 2026-08-01 的最终验证会话是 niri（`NIRI_SOCKET` 已设置、`HYPRLAND_INSTANCE_SIGNATURE` 未设置）。忽略测试在内存中连续采集 3 帧，覆盖持久 `wlr-screencopy` 连接、damage copy 与 wl_shm buffer 复用；像素没有写盘。当前会话无法对新增后端做 Hyprland 真机 smoke，因此该项是“不可用”，不是通过。安装新构建后的完整 GUI 手动滚动手感也仍属于环境依赖验收。
+
+**2026-09-18 niri 复测（niri 26.04）：** release 构建下两项 ignored live test 均通过——`screencopy::tests::live_screencopy_captures_without_persisting_pixels`（内存中 3 帧，0.19 s）与 `recorder::tests::live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels`（full panel 分支）。后者实测 footprint 为 full 332×401、compact 280×242、micro 横条 298×62、micro 竖条 94×176，与 2026-08-01 记录一致；采样区偏离 fixture 的像素为 0，结束后 vellum layer 数量为 0。Hyprland 一侧的同一 smoke 仍是“不可用”，不能由本次 niri 结果替代。
+
+**2026-09-18 Hyprland 真机验收（Hyprland，1920×1080 scale 1，用户从 niri 切回 Hyprland 后）：** 之前记为“不可用”的两项 Hyprland smoke 全部补齐：
+
+| 检查 | 结果 |
+|---|---|
+| 合成器探测（`doctor`） | `Hyprland（支持窗口控制）` |
+| 快捷键发现（只读解析 Lua 配置） | `SUPER+Print`→区域截图、`SUPER+SHIFT+Print`→长截图、`SUPER+CTRL+Print`→钉图，位置 `~/.config/hypr/conf/keybinds.lua` |
+| 钉图窗口（用户配置里本来就有 float 规则） | class `ai.vellum.pin`、floating、按图片尺寸铺满浮动层，退出后无残留窗口 |
+| 设置面板（用户配置里**没有** panel 规则） | class `ai.vellum.panel`、820×720、**floating=true** —— 说明 `window_for_pid` + `float()` 的 Hyprland 分支真的生效，不是被用户的规则兜住 |
+| 托盘「设置面板」菜单项 | 用 `com.canonical.dbusmenu.GetLayout` 读出 14 项子菜单（新增 id=7「设置面板」），再用 `Event(7, clicked)` 激活，面板窗口如期映射 |
+| `live_screencopy_captures_without_persisting_pixels` | 通过（0.02 s） |
+| `live_solid_fixture_proves_recorder_ui_has_zero_sampled_pixels` | 通过；footprint 与 niri 记录一致（full 332×401、compact 280×242、micro 横 298×62、竖 94×176），采样区偏离 0；1.25 s 内 130 次成功抓帧、129 次精确重复被去重，说明 Hyprland 的 damage copy 与去重都在工作 |
+| 翻译 API 端到端（本地 mock OpenAI 兼容服务，隔离 `XDG_CONFIG_HOME`） | `POST /v1/chat/completions` 收到 model/messages/temperature=0.2；结果窗显示「内置 Tesseract · API · mock-model」；loopback 无密钥时不发 Authorization |
+
+**仍未自动化的部分**：鼠标拖动窗口需要真实的指针输入，本机没有 `/dev/uinput` 或 `wlrctl`，也没有免密 sudo，因此只能结构性地确认面板与结果窗的标题栏包在 `gtk4::WindowHandle` 里（与钉图窗同一机制），实际手感仍需用户手动验收。多输出、非 1.0 缩放下的面板几何同样未复测。
 
 **Hyprland 快捷键的已知限制**：Lua 配置下，`vellum shortcuts install` 只打印可粘贴片段、不自动写入（理由见 `DESIGN.md` §8：该 build 拒绝 `hyprctl keyword`，没有生效前校验手段）；经典 `hyprland.conf` 格式可以自动写入。两种格式的示例都在 `contrib/`，实际用户配置是否应用需由安装流程另行验证。
