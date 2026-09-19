@@ -7,11 +7,16 @@
 //! * niri's config is KDL. A managed block can be inserted between marker
 //!   comments, validated with `niri validate`, and rolled back on failure. So
 //!   `install`/`remove` genuinely write there.
-//! * Hyprland (0.5x) parses Lua. Editing it means generating and splicing code
-//!   into a program, and this build refuses `hyprctl keyword` outright
-//!   ("keyword can't work with non-legacy parsers"), so there is no validation
-//!   step to catch a bad edit either. vellum therefore never writes Hyprland
-//!   config; `install` prints a snippet for the user to paste.
+//! * Hyprland's Lua config (0.5x) is code, not settings: editing it means
+//!   generating and splicing code into a program, and this build refuses
+//!   `hyprctl keyword` outright ("keyword can't work with non-legacy
+//!   parsers"), so there is no validation step to catch a bad edit either.
+//! * The classic `hyprland.conf` (hyprlang) path is writable with the same
+//!   safety net as niri: back up, write a managed block, `hyprctl reload`,
+//!   then check `hyprctl configerrors` and roll back on failure.
+//!
+//! So `install` writes niri KDL and classic hyprlang, and only prints a
+//! snippet for the Hyprland Lua dialect.
 //!
 //! Discovery is read-only and works for both. It has to parse config text
 //! rather than ask the compositor: `hyprctl binds` reports every Lua binding as

@@ -51,6 +51,8 @@ enum Command {
     PinLast,
     /// 托盘图标
     Tray,
+    /// 打开设置面板（配置 OCR 与翻译的 API 接入）
+    Panel,
     /// 查看服务状态
     Status {
         /// 以 JSON 输出
@@ -200,6 +202,7 @@ fn run() -> anyhow::Result<u8> {
         }
         Command::PinLast => capture(Action::PinLast, &OutputFlags::default(), &[]),
         Command::Tray => handover(ui::TRAY_BINARY, &[]),
+        Command::Panel => handover(ui::UI_BINARY, &["panel".to_string()]),
         Command::Status { json } => status(json),
         Command::Doctor { json } => Ok(doctor(json)),
         Command::Restart => Ok(restart()),
@@ -463,6 +466,12 @@ fn report_shortcuts(result: shortcuts::InstallResult) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_panel_subcommand_is_reachable_from_the_cli() {
+        let cli = Cli::try_parse_from(["vellum", "panel"]).expect("panel parses");
+        assert!(matches!(cli.command, Command::Panel));
+    }
 
     #[test]
     fn longshot_service_fallback_explains_that_toggle_is_unavailable() {

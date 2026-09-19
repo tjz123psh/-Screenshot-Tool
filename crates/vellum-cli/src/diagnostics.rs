@@ -290,24 +290,70 @@ pub fn run() -> Report {
 
     checks.push(ocr_languages_check());
 
-    checks.push(match which("opencode") {
-        Some(path) => check(
-            "opencode",
-            "翻译后端",
-            Level::Ok,
-            path.display().to_string(),
-        ),
-        None => check(
-            "opencode",
-            "翻译后端",
-            Level::Warning,
-            "未找到 opencode；翻译功能不可用",
-        ),
-    });
+    checks.push(translation_api_check());
+    checks.push(ocr_engine_check());
 
     checks.push(shortcuts_check());
 
     Report { checks }
+}
+
+/// Translation is API-only since the settings panel exists: report the
+/// configured endpoint and model, never the key itself.
+fn translation_api_check() -> Check {
+    let cfg = vellum_core::Config::load();
+    if !cfg.api.has_usable_credentials() {
+        return check(
+            "llm-api",
+            "翻译接口",
+            Level::Warning,
+            "未配置 API 密钥；运行 vellum panel 填写接口与密钥",
+        );
+    }
+    let source = cfg.api.key_source().unwrap_or("本机接口");
+    let proxy = cfg
+        .api
+        .resolve_proxy()
+        .map(|url| format!("，代理 {url}"))
+        .unwrap_or_default();
+    check(
+        "llm-api",
+        "翻译接口",
+        Level::Ok,
+        format!(
+            "{} · {}（{source}{proxy}）",
+            cfg.api.base_url, cfg.llm.model
+        ),
+    )
+}
+
+/// The OCR engine is a user choice: local Tesseract or a vision model over the
+/// same API. Only the API engine needs credentials.
+fn ocr_engine_check() -> Check {
+    let cfg = vellum_core::Config::load();
+    if cfg.ocr.uses_api() {
+        let model = cfg.ocr.effective_api_model(&cfg.llm);
+        if !cfg.api.has_usable_credentials() {
+            return check(
+                "ocr-engine",
+                "OCR 引擎",
+                Level::Warning,
+                "API 视觉模型缺少密钥；运行 vellum panel 填写",
+            );
+        }
+        return check(
+            "ocr-engine",
+            "OCR 引擎",
+            Level::Ok,
+            format!("API 视觉 · {model}"),
+        );
+    }
+    check(
+        "ocr-engine",
+        "OCR 引擎",
+        Level::Ok,
+        format!("本地 Tesseract · {}", cfg.ocr.langs),
+    )
 }
 
 #[cfg(test)]
@@ -354,7 +400,8 @@ mod tests {
             "layer-shell",
             "leptonica",
             "ocr-langs",
-            "opencode",
+            "llm-api",
+            "ocr-engine",
             "shortcuts",
         ] {
             assert!(ids.contains(&expected), "missing check: {expected}");
