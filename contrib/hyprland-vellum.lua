@@ -39,6 +39,13 @@ hl.window_rule({
 	size = { 560, 400 },
 })
 
+hl.window_rule({
+	name = "float-vellum-panel",
+	match = { class = "^ai\\.vellum\\.panel$" },
+	float = true,
+	size = { 820, 640 },
+})
+
 -- Keybindings. Add these to your keybinds.lua.
 --
 -- Absolute path on purpose: ~/.local/bin is not on the PATH the compositor

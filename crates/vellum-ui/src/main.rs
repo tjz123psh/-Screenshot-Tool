@@ -17,11 +17,14 @@
 //!   selection overlay and creating the recorder.
 
 mod annotate;
+mod controls;
 mod drag;
 mod highlight;
 mod imaging;
+mod model_picker;
 mod own_window;
 mod paint;
+mod panel;
 mod pin;
 mod recorder;
 mod result;
@@ -137,7 +140,9 @@ fn main() -> std::process::ExitCode {
 
 fn dispatch(args: &[String]) -> anyhow::Result<i32> {
     let Some(action) = args.first().map(String::as_str) else {
-        eprintln!("usage: vellum-ui <region|long|pin-last|debug-capture|pin-file|text-file> [..]");
+        eprintln!(
+            "usage: vellum-ui <region|long|pin-last|debug-capture|pin-file|text-file|panel> [..]"
+        );
         return Ok(1);
     };
     let flags = OutputFlags::parse(&args[1..]);
@@ -158,6 +163,10 @@ fn dispatch(args: &[String]) -> anyhow::Result<i32> {
             let image = load_image(&path, cleanup)?;
             Ok(pin::run(image))
         }
+        // The settings panel is a normal application window: it has no
+        // capture data and no flags, so it is dispatched straight to its own
+        // Application (see `panel.rs` for why it is NON_UNIQUE).
+        "panel" => Ok(panel::run_panel()),
         "text-file" => {
             let (path, cleanup) = file_args(&args[1..])?;
             let mode = flag_value(&args[1..], "--mode").unwrap_or_else(|| "ocr".to_string());

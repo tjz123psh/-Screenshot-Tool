@@ -4,8 +4,9 @@
 // Niri config, or `include` it from config.kdl. `install.sh` only ever touches
 // an already-included keybinds.kdl, and never this file.
 
-// The pin window and the OCR/translation result window are reference overlays:
-// they should float above the scrolling layout instead of joining a column.
+// The pin window, the OCR/translation result window and the settings panel are
+// reference overlays: they should float above the scrolling layout instead of
+// joining a column.
 //
 // Both windows also ask Niri to float them from code (move-window-to-floating,
 // 60 ms after map), so these rules are optional. Keeping them removes the brief
@@ -29,6 +30,11 @@ window-rule {
 
 window-rule {
     match app-id="^ai\\.vellum\\.result$"
+    open-floating true
+}
+
+window-rule {
+    match app-id="^ai\\.vellum\\.panel$"
     open-floating true
 }
 
