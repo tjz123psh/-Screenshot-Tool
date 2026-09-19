@@ -1,35 +1,39 @@
 # vellum 配置示例。
 # 复制到 ~/.config/vellum/config.toml 后按需修改；所有字段都可省略。
+# 图形化的设置面板（托盘菜单「设置面板」或 `vellum panel`）会写入同一份文件。
+
+[api]
+# 任何 OpenAI 兼容服务都可以：OpenAI、DeepSeek、OpenRouter、Ollama、vLLM、LM Studio...
+# 只填到 /v1 为止，不要带 /chat/completions。
+base_url = "https://api.openai.com/v1"
+# 密钥优先读这个环境变量；留空则依次尝试 VELLUM_API_KEY、OPENAI_API_KEY。
+api_key_env = "VELLUM_API_KEY"
+# 也可以直接写在这里（文件权限 0600，但仍是明文，不推荐）。
+api_key = ""
+# 单次请求超时（秒）。
+timeout_s = 60
+# HTTP 代理。需要代理才能访问接口时填，例如 http://127.0.0.1:7890；
+# 留空则依次读 HTTPS_PROXY / ALL_PROXY / HTTP_PROXY；填 none 强制直连。
+proxy = ""
 
 [llm]
-# opencode：优先复用本机 `opencode serve --pure --port 47823`，失败时走 CLI。
-# openai：直接调用 OpenAI Chat Completions API，需要环境变量 OPENAI_API_KEY；
-#          同时必须把 model 改成该 OpenAI 账号实际可用的模型 ID。
-provider = "opencode"
-model = "opencode/deepseek-v4-flash-free"
+# 翻译只走上面的 API。
+model = "gpt-4o-mini"
 target_lang = "简体中文"
-timeout_s = 30
-serve_port = 47823
-
-# 仅供 opencode 后端使用：上一个模型被上游明确拒绝时依次尝试；
-# 网络错误不会遍历整组。设为空数组可禁用模型轮换。
-fallback_models = [
-  "opencode/nemotron-3-ultra-free",
-  "opencode/ling-3.0-flash-free",
-  "opencode/north-mini-code-free",
-  "opencode/mimo-v2.5-free",
-  "opencode/laguna-s-2.1-free",
-]
+# 主模型被上游明确拒绝时依次尝试；网络错误不会遍历整组。
+fallback_models = []
 
 [ocr]
-# "tesseract" 默认走本地识别，并自动处理彩色干扰、暗淡字色与低对比度；
-# "vision" 先尝试视觉模型，失败回退同一套增强后的本地 OCR。
-engine = "tesseract"
+# "builtin" = 本地 Tesseract（离线、无需密钥、会自动处理彩色干扰/暗淡字色/低对比度）；
+# "api"     = 把选区交给视觉模型识别，需要上面配置的接口与密钥。
+engine = "builtin"
+# 本地引擎的语言包。
 langs = "chi_sim+eng"
 preprocess = true # 建议保持开启；关闭后只把原图直接交给 Tesseract
 upscale = 3.0
-vision_model = "google/gemini-flash-latest"
-vision_timeout_s = 30
+# engine = "api" 时使用；留空表示复用 [llm].model。
+api_model = ""
+api_timeout_s = 60
 
 [longshot]
 # 这些是经过回归测试和实机验证的生产阈值，通常不建议修改。

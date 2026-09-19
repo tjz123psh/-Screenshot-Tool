@@ -99,8 +99,9 @@ enum Update {
         busy: bool,
         error: bool,
     },
-    /// A translation finished: it gets its own window.
-    Translation(String),
+    /// A translation finished: it gets its own window, and the footer names
+    /// the model that produced it ("API · gpt-4o-mini").
+    Translation { text: String, transport: String },
 }
 
 /// Hands `update` to the main loop for the window with `id`.
@@ -367,13 +368,13 @@ impl ResultWindow {
                 busy,
                 error,
             } => self.flash(&message, busy, error),
-            Update::Translation(text) => {
+            Update::Translation { text, transport } => {
                 self.translating.set(false);
                 if let Some(button) = &self.translate_button {
                     button.set_sensitive(true);
                 }
                 self.flash("", false, false);
-                let window = Self::new(&self.app, Mode::Translate, &text, "", false, true);
+                let window = Self::new(&self.app, Mode::Translate, &text, &transport, false, true);
                 window.present();
             }
         }
@@ -436,8 +437,14 @@ impl ResultWindow {
         let id = self.id;
         std::thread::spawn(move || {
             let config = Config::load();
-            match vellum_text::translate(&text, &config.llm) {
-                Ok(translated) => post(id, Update::Translation(translated)),
+            match vellum_text::translate(&text, &config.api, &config.llm) {
+                Ok(translated) => post(
+                    id,
+                    Update::Translation {
+                        text: translated.text,
+                        transport: translated.transport.label(),
+                    },
+                ),
                 Err(err) => post(
                     id,
                     Update::Flash {
@@ -488,11 +495,22 @@ pub fn run_text_action(image: Rgb8, translate: bool) -> i32 {
     run(&app)
 }
 
+/// One short line naming the OCR engine that produced the text, so a user who
+/// switched engines can see which one actually ran.
+fn engine_label(engine: &str) -> String {
+    if engine == vellum_core::config::OCR_ENGINE_API {
+        "API 视觉识别".to_string()
+    } else {
+        "内置 Tesseract".to_string()
+    }
+}
+
 /// The OCR (and optional translation) pipeline, off the main loop.
 fn run_pipeline(id: u64, image: Rgb8, translate: bool) {
     let config = Config::load();
-    let text = match vellum_text::recognize(&image, &config.ocr) {
-        Ok(text) => text,
+    let (text, engine) = match vellum_text::recognize(&image, &config.api, &config.ocr, &config.llm)
+    {
+        Ok(recognized) => (recognized.text, engine_label(recognized.engine)),
         Err(err) => {
             post(
                 id,
@@ -525,7 +543,8 @@ fn run_pipeline(id: u64, image: Rgb8, translate: bool) {
             id,
             Update::Result {
                 text,
-                status: String::new(),
+                // The engine is a user choice, so the window says which one ran.
+                status: engine,
                 busy: false,
                 usable: true,
             },
@@ -544,12 +563,15 @@ fn run_pipeline(id: u64, image: Rgb8, translate: bool) {
             usable: false,
         },
     );
-    match vellum_text::translate(&text, &config.llm) {
+    match vellum_text::translate(&text, &config.api, &config.llm) {
         Ok(translated) => post(
             id,
             Update::Result {
-                text: translated,
-                status: String::new(),
+                text: translated.text,
+                // ARCHITECTURE.md section 2.4: the result window says which
+                // model produced the translation, in one short line together
+                // with the engine that read the pixels.
+                status: format!("{engine} · {}", translated.transport.label()),
                 busy: false,
                 usable: true,
             },

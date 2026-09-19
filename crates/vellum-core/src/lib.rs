@@ -12,6 +12,7 @@ pub mod image;
 pub mod io;
 pub mod longshot_trace;
 pub mod paths;
+pub mod prefs;
 pub mod proc;
 
 pub use config::Config;

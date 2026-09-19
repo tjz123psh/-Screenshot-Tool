@@ -1,20 +1,23 @@
-//! Text recognition. Two engines: local Tesseract (default) and an OpenCode
-//! vision model. Local OCR ranks a small scene-adaptive preprocessing set using
-//! TSV confidence, removes weak color-edge noise, retries ambiguous layout and
-//! fuses mixed-language lines. Vision failures still fall back locally, because
-//! a weaker result beats an empty one.
+//! Text recognition. Two engines: local Tesseract (default) and a vision model
+//! reached through the shared OpenAI-compatible endpoint. Local OCR ranks a
+//! small scene-adaptive preprocessing set using TSV confidence, removes weak
+//! color-edge noise, retries ambiguous layout and fuses mixed-language lines.
+//! API failures still fall back locally, because a weaker result beats an empty
+//! one - and the returned engine says which path answered.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use vellum_core::config::OcrConfig;
-use vellum_core::{Rgb8, io as core_io};
+use vellum_core::Rgb8;
+use vellum_core::config::{ApiConfig, LlmConfig, OCR_ENGINE_API, OCR_ENGINE_BUILTIN, OcrConfig};
 
+use crate::api::{self, ApiError};
 use crate::prep;
 
-/// Prompt for the vision engine. Kept verbatim: it is tuned to suppress the
-/// explanations and code fences that chat-tuned models add by default.
-const VISION_PROMPT: &str = "识别这张图片里的所有文字，逐行原样输出。只输出文字本身，保持原始的换行和顺序，不要翻译，不要解释，不要加任何前后缀或代码块标记。";
+/// Prompt for the vision engine. Tuned to suppress the explanations, the
+/// translations and the code fences that chat-tuned models add by default: the
+/// text is recognized as-is here and translated in a separate step.
+const VISION_PROMPT: &str = "识别这张图片中的文字，逐行原样输出。只输出图片中的文字本身，保持原始的换行和顺序，不要翻译，不要解释，不要加任何前后缀或代码块标记。";
 
 const TESSERACT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -43,18 +46,41 @@ impl std::fmt::Display for OcrError {
 
 impl std::error::Error for OcrError {}
 
-/// Recognize text in `image`. `engine = "vision"` tries the remote model first
-/// and falls back to tesseract; anything else goes straight to tesseract.
-pub fn recognize(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError> {
-    if cfg.engine == "vision" {
-        match recognize_vision(image, cfg) {
-            Ok(text) => return Ok(text),
-            Err(_) => {
-                // Deliberately swallowed: the local engine is the safety net.
-            }
-        }
+/// One recognized crop and the engine that produced it.
+///
+/// The engine is reported because the API path keeps the local fallback: the
+/// user asked for the API, and only this label can tell them whether they got
+/// it or the silent safety net.
+#[derive(Debug)]
+pub struct Recognized {
+    pub text: String,
+    pub engine: &'static str,
+}
+
+/// Recognize text in an image.
+///
+/// The API engine tries the vision model first and falls back to Tesseract;
+/// anything else goes straight to Tesseract.
+pub fn recognize(
+    image: &Rgb8,
+    api: &ApiConfig,
+    ocr: &OcrConfig,
+    llm: &LlmConfig,
+) -> Result<Recognized, OcrError> {
+    // An API failure is deliberately swallowed: a weaker local result beats an
+    // empty one, and the returned engine tells the caller which path answered.
+    if ocr.uses_api()
+        && let Ok(text) = recognize_api(image, api, ocr, llm)
+    {
+        return Ok(Recognized {
+            text,
+            engine: OCR_ENGINE_API,
+        });
     }
-    recognize_tesseract(image, cfg)
+    recognize_tesseract(image, ocr).map(|text| Recognized {
+        text,
+        engine: OCR_ENGINE_BUILTIN,
+    })
 }
 
 fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError> {
@@ -658,13 +684,19 @@ fn alternate_language_order(langs: &str) -> Option<String> {
 /// Pick a tesseract page segmentation mode from the crop geometry. A wide, short
 /// crop is a single line; a very wide crop is scattered UI text; anything else
 /// is treated as a text block.
+///
+/// The box alone cannot tell a banner from a small wrapped paragraph: a three
+/// line snippet in a 96 px crop has exactly the same shape. PSM 7 on that crop
+/// returns an empty result, and the layout retry then pays for a second
+/// Tesseract start. Counting text rows costs one cheap pass over a small crop
+/// and removes that wasted run.
 fn layout_psm(image: &Rgb8) -> u8 {
     if image.width == 0 || image.height == 0 {
         return 6;
     }
     let ratio = image.width as f64 / image.height as f64;
     if ratio >= 2.4 && image.height <= 96 {
-        7
+        if text_row_bands(image) > 1 { 6 } else { 7 }
     } else if ratio >= 3.6 {
         11
     } else {
@@ -672,57 +704,112 @@ fn layout_psm(image: &Rgb8) -> u8 {
     }
 }
 
-fn recognize_vision(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError> {
+/// Rec.601 luma of one pixel, the same weighting the preprocessing uses.
+fn luma(pixel: [u8; 3]) -> i32 {
+    (77 * i32::from(pixel[0]) + 150 * i32::from(pixel[1]) + 29 * i32::from(pixel[2])) >> 8
+}
+
+/// Coarse count of text rows in a crop.
+///
+/// A row is "ink" when its luminance differs from the crop's dominant
+/// (background) luminance by a clear margin; a band counts as a text row only
+/// when it is at least three rows tall, so a one-pixel frame or underline is not
+/// mistaken for a line of text. Deliberately coarse: this only has to reject the
+/// single-line segmentation, not to find glyph boundaries.
+fn text_row_bands(image: &Rgb8) -> usize {
+    if image.width < 8 || image.height < 8 {
+        return 0;
+    }
+
+    // Background estimate: the most common coarse luminance bucket.
+    let mut histogram = [0usize; 64];
+    for y in 0..image.height {
+        for x in (0..image.width).step_by(2) {
+            histogram[(luma(image.pixel(x, y)) >> 2) as usize] += 1;
+        }
+    }
+    let background = histogram
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| **count)
+        .map_or(0, |(bucket, _)| bucket * 4 + 2) as i32;
+
+    let ink_floor = (image.width / 50).max(2);
+    let mut bands = 0usize;
+    let mut run = 0usize;
+    for y in 0..image.height {
+        let ink = (0..image.width)
+            .step_by(2)
+            .filter(|&x| (luma(image.pixel(x, y)) - background).abs() >= 48)
+            .count();
+        if ink >= ink_floor {
+            run += 1;
+        } else {
+            if run >= 3 {
+                bands += 1;
+            }
+            run = 0;
+        }
+    }
+    if run >= 3 {
+        bands += 1;
+    }
+    bands
+}
+
+/// Recognize through a vision model on the shared OpenAI-compatible endpoint.
+///
+/// The crop travels as a PNG data URL inside a normal chat message: that is the
+/// shape every vision-capable provider accepts, and it reuses the same key and
+/// base URL as translation instead of inventing a second configuration.
+fn recognize_api(
+    image: &Rgb8,
+    api: &ApiConfig,
+    ocr: &OcrConfig,
+    llm: &LlmConfig,
+) -> Result<String, OcrError> {
+    let model = ocr.effective_api_model(llm);
+    if model.trim().is_empty() {
+        return Err(OcrError::Missing(
+            "未配置 OCR 模型：[ocr].api_model 与 [llm].model 均为空".into(),
+        ));
+    }
+
     let png = image
         .to_png()
         .map_err(|e| OcrError::Failed(format!("failed to encode image for OCR: {e}")))?;
-    let dir = std::env::temp_dir();
-    let path = core_io::save_bytes(&dir, "vellum-ocr", &png)
-        .map_err(|e| OcrError::Failed(format!("failed to stage image for OCR: {e}")))?;
+    let messages = serde_json::json!([{
+        "role": "user",
+        "content": [
+            { "type": "text", "text": VISION_PROMPT },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:image/png;base64,{}", api::base64_encode(&png)),
+                },
+            },
+        ],
+    }]);
 
-    let result = run_vision(&path, cfg);
-    let _ = std::fs::remove_file(&path);
-    result
+    let timeout = Duration::from_secs(ocr.api_timeout_s.max(1));
+    // Zero temperature: OCR is a transcription, not a generation, and a model
+    // that paraphrases an invoice line is worse than one that fails.
+    let text = api::chat_at(api, model, messages, 0.0, timeout).map_err(api_ocr_error)?;
+    let text = cleanup(&text);
+    if text.is_empty() {
+        return Err(OcrError::Empty("API OCR 未返回文字".into()));
+    }
+    Ok(text)
 }
 
-fn run_vision(path: &std::path::Path, cfg: &OcrConfig) -> Result<String, OcrError> {
-    // Argument order is load-bearing: `-f` swallows every following argument,
-    // so the prompt must come first and the file must come last.
-    let child = vellum_core::proc::command("opencode")
-        .args(["run", "--pure", "--format", "json", "-m", &cfg.vision_model])
-        .arg(VISION_PROMPT)
-        .arg("-f")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                OcrError::Missing("opencode not found for vision OCR".into())
-            }
-            _ => OcrError::Failed(format!("opencode failed to start: {e}")),
-        })?;
-
-    let timeout = Duration::from_secs(cfg.vision_timeout_s);
-    let output = vellum_core::proc::wait(child, timeout).ok_or_else(|| {
-        OcrError::Timeout(format!(
-            "vision OCR timed out after {}s",
-            cfg.vision_timeout_s
-        ))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let head: String = stderr.chars().take(400).collect();
-        return Err(OcrError::Failed(format!("vision OCR failed: {head}")));
+/// A missing key stays a provisioning error; anything else is a failed request,
+/// which is exactly what the local fallback exists for.
+fn api_ocr_error(err: ApiError) -> OcrError {
+    let message = err.to_string();
+    match err {
+        ApiError::MissingKey => OcrError::Missing(message),
+        _ => OcrError::Failed(message),
     }
-
-    let text = crate::llm::extract_text(&String::from_utf8_lossy(&output.stdout));
-    if text.is_empty() {
-        return Err(OcrError::Empty("vision OCR returned no text".into()));
-    }
-    Ok(cleanup(&text))
 }
 
 fn is_cjk(c: char) -> bool {
@@ -781,6 +868,8 @@ fn drop_cjk_spaces(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_support::{MockServer, Script, json_body};
 
     fn image(width: usize, height: usize) -> Rgb8 {
         Rgb8::new(width, height)
@@ -972,6 +1061,59 @@ mod tests {
         assert_eq!(layout_psm(&image(400, 60)), 7);
     }
 
+    /// White crop for the row-count tests: Rgb8::new zeroes the buffer, and a
+    /// text row is painted black.
+    fn white_crop(width: usize, height: usize) -> Rgb8 {
+        let mut image = image(width, height);
+        for y in 0..height {
+            image.row_mut(y).fill(255);
+        }
+        image
+    }
+
+    fn paint_band(image: &mut Rgb8, top: usize, height: usize) {
+        for y in top..(top + height).min(image.height) {
+            image.row_mut(y).fill(0);
+        }
+    }
+
+    /// A wrapped paragraph and a banner have the same box shape; the row count
+    /// is what keeps the single-line mode off the paragraph.
+    #[test]
+    fn a_wide_short_crop_with_several_text_rows_is_a_block() {
+        let mut image = white_crop(400, 60);
+        paint_band(&mut image, 12, 11);
+        paint_band(&mut image, 36, 11);
+        assert_eq!(text_row_bands(&image), 2);
+        assert_eq!(layout_psm(&image), 6);
+    }
+
+    #[test]
+    fn a_single_text_row_still_selects_the_single_line_mode() {
+        let mut image = white_crop(400, 60);
+        paint_band(&mut image, 22, 12);
+        assert_eq!(text_row_bands(&image), 1);
+        assert_eq!(layout_psm(&image), 7);
+    }
+
+    /// A frame or underline is one pixel tall: counting it as a text row would
+    /// flip every bordered banner to block mode and pay for a retry.
+    #[test]
+    fn thin_rules_do_not_count_as_text_rows() {
+        let mut image = white_crop(400, 60);
+        paint_band(&mut image, 0, 1);
+        paint_band(&mut image, 59, 1);
+        paint_band(&mut image, 24, 12);
+        assert_eq!(text_row_bands(&image), 1);
+        assert_eq!(layout_psm(&image), 7);
+    }
+
+    #[test]
+    fn a_blank_crop_has_no_text_rows() {
+        assert_eq!(text_row_bands(&image(400, 60)), 0);
+        assert_eq!(text_row_bands(&image(4, 4)), 0);
+    }
+
     #[test]
     fn a_very_wide_crop_is_read_as_sparse_text() {
         assert_eq!(layout_psm(&image(1200, 200)), 11);
@@ -1004,5 +1146,141 @@ mod tests {
         assert_eq!(meaningful_count("--- ... ---"), 0);
         assert_eq!(meaningful_count("ab12"), 4);
         assert!(meaningful_count("测试") >= 2);
+    }
+
+    fn api(base_url: String) -> ApiConfig {
+        ApiConfig {
+            base_url,
+            api_key: "sk-test".into(),
+            ..ApiConfig::default()
+        }
+    }
+
+    fn choices(text: &str) -> String {
+        serde_json::json!({ "choices": [{ "message": { "content": text } }] }).to_string()
+    }
+
+    /// The API path must send the crop as a PNG data URL, use the OCR model
+    /// override when one is set, and fall back to the translation model when it
+    /// is not.
+    #[test]
+    fn api_ocr_sends_a_data_url_and_reports_the_text() {
+        let server = MockServer::start(vec![
+            Script::reply(200, choices("第一行\n第二行")),
+            Script::reply(200, choices("回退模型")),
+        ]);
+        let api = api(server.base_url());
+        let llm = LlmConfig {
+            model: "gpt-4o-mini".into(),
+            ..LlmConfig::default()
+        };
+        let ocr = OcrConfig {
+            api_model: "vision-1".into(),
+            ..OcrConfig::default()
+        };
+
+        assert_eq!(
+            recognize_api(&image(24, 12), &api, &ocr, &llm).unwrap(),
+            "第一行\n第二行"
+        );
+
+        let fallback = OcrConfig {
+            api_model: String::new(),
+            ..ocr
+        };
+        assert_eq!(
+            recognize_api(&image(8, 8), &api, &fallback, &llm).unwrap(),
+            "回退模型"
+        );
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        let body = json_body(&requests[0]);
+        assert_eq!(body["model"], "vision-1");
+        // Transcription, not generation: no temperature at all.
+        assert_eq!(body["temperature"].as_f64(), Some(0.0));
+        let content = &body["messages"][0]["content"];
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("只输出图片中的文字"),
+            "the OCR prompt must forbid everything but the text"
+        );
+        let png = image(24, 12).to_png().unwrap();
+        assert_eq!(
+            content[1]["image_url"]["url"].as_str().unwrap(),
+            format!("data:image/png;base64,{}", api::base64_encode(&png))
+        );
+        assert_eq!(json_body(&requests[1])["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn api_ocr_reports_an_upstream_refusal() {
+        let server = MockServer::start(vec![Script::reply(
+            401,
+            r#"{"error":{"message":"Invalid API key"}}"#,
+        )]);
+        let api = api(server.base_url());
+        let err = recognize_api(
+            &image(4, 4),
+            &api,
+            &OcrConfig::default(),
+            &LlmConfig::default(),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, OcrError::Failed(_)), "{message}");
+        assert!(message.contains("Invalid API key"), "{message}");
+        assert!(message.contains("401"), "{message}");
+    }
+
+    /// Without any model there is nothing to ask, and no request is sent.
+    #[test]
+    fn api_ocr_requires_a_model() {
+        let server = MockServer::start(vec![Script::reply(200, choices("unused"))]);
+        let api = api(server.base_url());
+        let llm = LlmConfig {
+            model: String::new(),
+            ..LlmConfig::default()
+        };
+        let err = recognize_api(&image(4, 4), &api, &OcrConfig::default(), &llm).unwrap_err();
+        assert!(matches!(err, OcrError::Missing(_)), "{err:?}");
+        assert!(server.requests().is_empty());
+    }
+
+    /// The built-in engine must never open a socket, whatever the API settings
+    /// say.
+    #[test]
+    fn the_builtin_engine_never_calls_the_api() {
+        let server = MockServer::start(vec![Script::reply(200, choices("unused"))]);
+        let api = api(server.base_url());
+        let ocr = OcrConfig {
+            engine: OCR_ENGINE_BUILTIN.into(),
+            ..OcrConfig::default()
+        };
+        // Tesseract may not be installed here; either outcome is fine, the
+        // assertion is that the API was never consulted.
+        let _ = recognize(&image(8, 8), &api, &ocr, &LlmConfig::default());
+        assert!(server.requests().is_empty());
+    }
+
+    /// A failed API call falls back to the local engine, and the engine label
+    /// says which path answered.
+    #[test]
+    fn an_api_failure_falls_back_to_the_local_engine() {
+        let server = MockServer::start(vec![Script::reply(500, r#"{"error":{"message":"boom"}}"#)]);
+        let api = api(server.base_url());
+        let ocr = OcrConfig {
+            engine: OCR_ENGINE_API.into(),
+            ..OcrConfig::default()
+        };
+        match recognize(&image(16, 16), &api, &ocr, &LlmConfig::default()) {
+            Ok(recognized) => assert_eq!(recognized.engine, OCR_ENGINE_BUILTIN),
+            // No tesseract here: the failure that surfaces is the local one, not
+            // the API refusal the fallback was supposed to hide.
+            Err(err) => assert!(err.to_string().contains("tesseract"), "{err}"),
+        }
+        assert_eq!(server.requests().len(), 1, "the API is tried exactly once");
     }
 }
