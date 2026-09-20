@@ -55,8 +55,26 @@ const IDLE_POLL_S: u32 = 5;
 const FOCUS_GRACE_MS: u32 = 10_000;
 
 const DIM: (f64, f64, f64, f64) = (0.025, 0.03, 0.045, 0.56);
-const ACCENT: (f64, f64, f64, f64) = (0.39, 0.52, 0.91, 1.0);
-const HANDLE_DIAMETER: f64 = 9.0;
+/// Selection accent: indigo #4F46E5, the token the design system names.
+///
+/// The spec also wrote this as `(0.31, 0.36, 0.92)`, but those two forms are not
+/// the same colour — the triple resolves to `(79, 92, 235)`, a bluer hue than
+/// the named token's `(79, 70, 229)`. The hex wins because it is the precise,
+/// named value; the toolbar's primary button keeps the triple it was given, so
+/// the two accents stay one hue family rather than two.
+const ACCENT: (f64, f64, f64, f64) = (
+    0x4f as f64 / 255.0,
+    0x46 as f64 / 255.0,
+    0xe5 as f64 / 255.0,
+    1.0,
+);
+/// Dark backing line drawn just outside the accent frame. Without it the bright
+/// indigo frame disappears over a light screenshot (a white page, a document),
+/// which is exactly where users select most often.
+const FRAME_BACKING: (f64, f64, f64, f64) = (0.02, 0.03, 0.06, 0.55);
+/// Handle geometry: a flat capsule rather than a bulky circle.
+const HANDLE_RADIUS: f64 = 4.5;
+const HANDLE_RING: f64 = 1.5;
 const SIZE_HINT_FONT: &str = "Sans 9";
 const CENTER_HINT_FONT: &str = "Sans 13";
 const HANDOFF_HINT_FONT: &str = "Sans 11";
@@ -657,15 +675,7 @@ fn draw(state: &mut State, cr: &Context) {
         return;
     }
 
-    cr.set_source_rgba(ACCENT.0, ACCENT.1, ACCENT.2, ACCENT.3);
-    cr.set_line_width(2.0);
-    cr.rectangle(
-        f64::from(rect.x) + 0.5,
-        f64::from(rect.y) + 0.5,
-        f64::from(rect.w) - 1.0,
-        f64::from(rect.h) - 1.0,
-    );
-    let _ = cr.stroke();
+    draw_selection_frame(cr, rect);
 
     draw_size_hint(cr, rect);
     if state.long_shot {
@@ -713,44 +723,147 @@ fn draw(state: &mut State, cr: &Context) {
     }
 }
 
-fn draw_selection_handles(cr: &Context, rect: Rect) {
-    for (_, hx, hy) in rect.handle_positions() {
-        // Keep every handle independent even if a future decoration leaks a
-        // cairo current point. Without this, `arc` connects that point to the
-        // circle with a diagonal line before the stroke.
-        cr.new_sub_path();
-        cr.arc(hx, hy, HANDLE_DIAMETER / 2.0, 0.0, std::f64::consts::TAU);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-        let _ = cr.fill_preserve();
-        cr.set_source_rgba(ACCENT.0, ACCENT.1, ACCENT.2, ACCENT.3);
-        cr.set_line_width(2.0);
-        let _ = cr.stroke();
-    }
+/// Selection frame: a dark backing line, the accent body, and a 1 px glow.
+///
+/// Three passes exist for a reason. The backing line keeps a light screenshot
+/// from swallowing the frame; the accent body is the frame proper; the outer
+/// glow is a single 1 px translucent halo that lifts the edge off a busy
+/// background without softening the rectangle into a blur.
+fn draw_selection_frame(cr: &Context, rect: Rect) {
+    let x = f64::from(rect.x);
+    let y = f64::from(rect.y);
+    let w = f64::from(rect.w);
+    let h = f64::from(rect.h);
+
+    // Cairo centres a stroke on the path, so the offset that lands a line exactly
+    // on device pixels depends on its width: an odd width needs a half-pixel
+    // centre, an even width an integer one. Getting this backwards smears the
+    // line across an extra column -- measured, a 2 px body at +0.5 rendered as
+    // 0,0,128,255,128,0 (a 3 px blur) instead of a true 0,0,0,255,255,0.
+    let odd = |v: f64| v.floor() + 0.5;
+    let even = |v: f64| v.round();
+
+    // `rectangle` ADDS a closed sub-path; it does not replace the path. Without
+    // the resets below every pass would also stroke whatever the previous painter
+    // left behind -- and the annotator runs on this same context before the frame
+    // is drawn. A seeded rectangle was measured being stroked in the frame's
+    // colour (alpha 140) before the first reset existed.
+    //
+    // Backing: 3 px wide, so a half-pixel centre, and inset by 2 px so it sits
+    // fully outside the 2 px body rather than bleeding 0.5 px into it.
+    cr.new_path();
+    cr.set_source_rgba(
+        FRAME_BACKING.0,
+        FRAME_BACKING.1,
+        FRAME_BACKING.2,
+        FRAME_BACKING.3,
+    );
+    cr.set_line_width(3.0);
+    cr.rectangle(
+        odd(x - 2.0),
+        odd(y - 2.0),
+        (w + 4.0).max(0.0),
+        (h + 4.0).max(0.0),
+    );
+    let _ = cr.stroke();
+
+    // Accent body: 2 px, so an integer centre.
+    cr.new_path();
+    cr.set_source_rgba(ACCENT.0, ACCENT.1, ACCENT.2, ACCENT.3);
+    cr.set_line_width(2.0);
+    cr.rectangle(
+        even(x + 1.0),
+        even(y + 1.0),
+        (w - 2.0).max(0.0),
+        (h - 2.0).max(0.0),
+    );
+    let _ = cr.stroke();
+
+    // Outer glow: 1 px, so a half-pixel centre.
+    cr.new_path();
+    cr.set_source_rgba(ACCENT.0, ACCENT.1, ACCENT.2, 0.28);
+    cr.set_line_width(1.0);
+    cr.rectangle(
+        odd(x - 2.0),
+        odd(y - 2.0),
+        (w + 4.0).max(0.0),
+        (h + 4.0).max(0.0),
+    );
+    let _ = cr.stroke();
+    // Leave the context clean for the handles and the toolbar that follow.
+    cr.new_path();
 }
 
+/// Selection handles: flat metallic capsules with a white core and a fine
+/// indigo ring.
+///
+/// The previous design drew a fat white disc with a 2 px ring, which read as a
+/// row of beads along the frame. Shrinking the core and thinning the ring keeps
+/// the same grab target (see `selector::HANDLE_HALF`, which is unchanged) while
+/// making the handles look machined rather than drawn.
+fn draw_selection_handles(cr: &Context, rect: Rect) {
+    for (_, hx, hy) in rect.handle_positions() {
+        // A dark seat under the core, so a white handle on a white page still
+        // has an edge.
+        paint::fill_circle(cr, hx, hy, HANDLE_RADIUS + 0.5, (0.02, 0.03, 0.06, 0.45));
+        // Fully opaque: the spec calls for a pure white centre, and anything
+        // less would let the seat tint the core grey.
+        paint::fill_circle(cr, hx, hy, HANDLE_RADIUS, (1.0, 1.0, 1.0, 1.0));
+        paint::stroke_circle(
+            cr,
+            hx,
+            hy,
+            HANDLE_RADIUS,
+            HANDLE_RING,
+            (ACCENT.0, ACCENT.1, ACCENT.2, 1.0),
+        );
+    }
+    // Independent sub-paths are not enough on their own: cairo keeps one
+    // current point for the whole context, so clear it explicitly.
+    cr.new_path();
+}
+
+/// Size readout under the selection frame's top-left corner.
+///
+/// Same material as the toolbar slab (crystal gradient plus specular edge) so
+/// the overlay reads as one design rather than a bar with a floating sticker.
 fn draw_size_hint(cr: &Context, rect: Rect) {
     let text = format!("{} × {}", rect.w, rect.h);
     let (tw, th) = paint::text_size(cr, SIZE_HINT_FONT, &text);
-    let bw = tw + 14.0;
-    let bh = th + 8.0;
-    let bx = f64::from(rect.x);
-    let mut by = f64::from(rect.y) - bh - 7.0;
+    let bw = tw + 16.0;
+    let bh = th + 9.0;
+    // Integer alignment keeps the frame crisp and stops the chip from shimmering
+    // as the selection is dragged one pixel at a time.
+    let bx = f64::from(rect.x).round();
+    let mut by = f64::from(rect.y).round() - bh - 7.0;
     if by < 0.0 {
-        by = f64::from(rect.y) + 7.0;
+        by = f64::from(rect.y).round() + 7.0;
     }
+    let bounds = Bounds::new(bx, by, bw, bh);
+
+    // The shared contact-shadow token, not a copy: a duplicated constant with a
+    // slightly different alpha drifts from the slab the moment either is retuned.
     paint::fill_rounded(
         cr,
-        Bounds::new(bx, by, bw, bh),
+        Bounds::new(bounds.x, bounds.y + 2.0, bounds.w, bounds.h),
         7.0,
-        (0.09, 0.105, 0.14, 0.92),
+        paint::SHADOW_CONTACT,
+    );
+    paint::fill_rounded_gradient(cr, bounds, 7.0, &[paint::SLAB_TOP, paint::SLAB_BOTTOM]);
+    paint::stroke_rounded_gradient(
+        cr,
+        bounds,
+        7.0,
+        1.0,
+        &[paint::EDGE_TOP, paint::EDGE_MID, paint::EDGE_BASE],
     );
     paint::draw_text(
         cr,
         SIZE_HINT_FONT,
         &text,
-        bx + 7.0,
-        by + 4.0,
-        (0.90, 0.93, 1.0, 0.95),
+        bx + 8.0,
+        by + 4.5,
+        (0.94, 0.96, 0.98, 0.97),
     );
 }
 
@@ -794,15 +907,13 @@ fn draw_longshot_handoff_hint(
     let bh = th + 14.0;
     let bx = (sw - bw) / 2.0;
     let by = (sh - bh - 34.0).max(12.0);
-    paint::fill_rounded(
-        cr,
-        Bounds::new(bx, by, bw, bh),
-        10.0,
-        (0.09, 0.105, 0.14, 0.94),
-    );
+    let bounds = Bounds::new(bx, by, bw, bh);
+    paint::crystal_slab(cr, bounds, 10.0);
+    // The handoff rail is the one surface that carries a state colour: amber
+    // when the control panel may not fit, cold blue otherwise.
     paint::stroke_rounded(
         cr,
-        Bounds::new(bx, by, bw, bh),
+        bounds,
         10.0,
         1.0,
         if warning {
@@ -831,12 +942,7 @@ fn draw_center_hint(cr: &Context, text: &str, sw: f64, sh: f64) {
     let bh = th + 18.0;
     let bx = (sw - bw) / 2.0;
     let by = (sh - bh) / 2.0 - 40.0;
-    paint::fill_rounded(
-        cr,
-        Bounds::new(bx, by, bw, bh),
-        12.0,
-        (0.09, 0.105, 0.14, 0.92),
-    );
+    paint::crystal_slab(cr, Bounds::new(bx, by, bw, bh), 12.0);
     paint::draw_text(
         cr,
         CENTER_HINT_FONT,
@@ -868,14 +974,19 @@ fn draw_swatches(state: &State, cr: &Context) {
                 );
             }
             "anno.width" => {
+                // Scaled, not clamped: WIDTHS is [2, 4, 7, 11], so a plain
+                // `.min(4.0)` rendered 4, 4 and 4 for the three thickest
+                // settings and the indicator silently stopped reporting the
+                // current stroke width.
                 let width = state.annotator.width();
+                let shown = (width * 0.45).clamp(1.0, 5.0);
                 paint::fill_rounded(
                     cr,
                     Bounds::new(
                         bounds.x + bounds.w - 18.0,
                         bounds.y + bounds.h - 8.0,
                         14.0,
-                        width.min(4.0),
+                        shown,
                     ),
                     1.0,
                     (0.90, 0.93, 1.0, 0.85),
@@ -947,8 +1058,7 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
     let Some(layout) = popup_layout(state, popup) else {
         return;
     };
-    paint::fill_rounded(cr, layout.bar, 11.0, (0.09, 0.105, 0.14, 0.97));
-    paint::stroke_rounded(cr, layout.bar, 11.0, 1.0, (0.76, 0.82, 0.96, 0.18));
+    paint::crystal_slab(cr, layout.bar, 11.0);
 
     let selected = match popup {
         Popup::Color => state.annotator.color_index(),
@@ -1032,6 +1142,398 @@ mod tests {
         assert_eq!(
             leaked_pixels, 0,
             "selection handles painted a diagonal path outside their circles"
+        );
+    }
+
+    /// Renders the full overlay through the real `draw` entry point.
+    ///
+    /// Ignored by default: it exists so a human can review the actual composed
+    /// output (dim wash, frame, handles, size chip, toolbar, annotation layer)
+    /// as an image instead of trusting a diff. Run with:
+    /// `cargo test -p vellum-ui -- --ignored render_the_overlay`
+    #[test]
+    #[ignore = "writes a review artifact to /tmp"]
+    fn render_the_overlay_for_review() {
+        let width = 900;
+        let height = 420;
+        let mut state = overlay_state(true);
+        state.screen_w = width;
+        state.screen_h = height;
+        state.selector = Selector::new(width, height);
+
+        // Two states: the region toolbar, and annotate mode with a popup open.
+        // Each is written as its own PNG so both can be reviewed.
+        for (label, annotating) in [("plain", false), ("annotate", true)] {
+            let mut surface =
+                ImageSurface::create(cairo::Format::ARgb32, width, height).expect("target");
+            let cr = Context::new(&surface).expect("cairo context");
+
+            // The overlay paints its own captured background first, so the
+            // "screenshot" has to live on that surface.
+            state.bg =
+                ImageSurface::create(cairo::Format::ARgb32, width, height).expect("bg surface");
+            {
+                let bg_cr = Context::new(&state.bg).expect("bg context");
+                // A light page with a saturated band: the worst case for a
+                // translucent dark slab and for a bright selection frame.
+                bg_cr.set_source_rgb(0.90, 0.91, 0.94);
+                bg_cr.paint().ok();
+                bg_cr.set_source_rgb(0.30, 0.38, 0.60);
+                bg_cr.rectangle(0.0, 0.0, f64::from(width), 90.0);
+                bg_cr.fill().ok();
+                bg_cr.set_source_rgb(1.0, 1.0, 1.0);
+                bg_cr.rectangle(0.0, 90.0, f64::from(width), 80.0);
+                bg_cr.fill().ok();
+            }
+
+            // A fresh selector per state: re-pressing an existing selection
+            // grabs its corner handle instead of dragging a new one.
+            state.selector = Selector::new(width, height);
+            state.selector.press(120.0, 130.0);
+            state.selector.motion(760.0, 360.0);
+            state.selector.release();
+            assert_eq!(state.selector.mode, Mode::HasSelection);
+
+            state.annotating = annotating;
+            state.popup = annotating.then_some(Popup::Color);
+            state.annotator = Annotator::new();
+            if annotating {
+                state.annotator.begin_canvas(state.selector.rect);
+            }
+            state.hover = Some(if annotating { "tool.arrow" } else { "ocr" }.to_string());
+
+            draw(&mut state, &cr);
+            drop(cr);
+            write_png(&mut surface, &format!("/tmp/vellum-overlay-{label}.png"));
+        }
+    }
+
+    /// Minimal PNG writer (stored deflate blocks) so a render test can produce
+    /// an image a human can actually open.
+    ///
+    /// The cairo crate's PNG writer needs a feature this project deliberately
+    /// does not enable, and adding an image dependency just for a review
+    /// artifact is not worth it. Stored blocks need no zlib at all.
+    mod png {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffffu32;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        fn chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(payload.len() + 12);
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(payload);
+            let mut crc_input = Vec::with_capacity(4 + payload.len());
+            crc_input.extend_from_slice(kind);
+            crc_input.extend_from_slice(payload);
+            out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+            out
+        }
+
+        fn adler32(bytes: &[u8]) -> u32 {
+            let (mut a, mut b) = (1u32, 0u32);
+            for &byte in bytes {
+                a = (a + u32::from(byte)) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }
+
+        /// Encodes 8-bit RGB scanlines, each prefixed with filter byte 0.
+        pub fn encode(width: u32, height: u32, raw: &[u8]) -> Vec<u8> {
+            let mut zlib = vec![0x78, 0x01];
+            for block in raw.chunks(65535) {
+                let last = block.len() < 65535;
+                zlib.push(u8::from(last));
+                zlib.extend_from_slice(&(block.len() as u16).to_le_bytes());
+                zlib.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+                zlib.extend_from_slice(block);
+            }
+            zlib.extend_from_slice(&adler32(raw).to_be_bytes());
+
+            let mut ihdr = Vec::new();
+            ihdr.extend_from_slice(&width.to_be_bytes());
+            ihdr.extend_from_slice(&height.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+
+            let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            png.extend(chunk(b"IHDR", &ihdr));
+            png.extend(chunk(b"IDAT", &zlib));
+            png.extend(chunk(b"IEND", &[]));
+            png
+        }
+    }
+
+    /// Writes a cairo surface as a PNG review artifact.
+    fn write_png(surface: &mut ImageSurface, path: &str) {
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let width = surface.width() as usize;
+        let height = surface.height() as usize;
+        let data = surface.data().expect("surface pixels").to_vec();
+        let mut raw = Vec::with_capacity(height * (1 + width * 3));
+        for y in 0..height {
+            raw.push(0u8);
+            for x in 0..width {
+                // cairo ARGB32 is B, G, R, A in memory on little-endian.
+                let offset = y * stride + x * 4;
+                raw.push(data[offset + 2]);
+                raw.push(data[offset + 1]);
+                raw.push(data[offset]);
+            }
+        }
+        std::fs::write(path, png::encode(width as u32, height as u32, &raw)).expect("png write");
+        println!("wrote {path} ({width}x{height})");
+    }
+
+    /// Builds a real `State` so the whole overlay draw path can be exercised.
+    ///
+    /// This is the strongest test available without a compositor: it calls the
+    /// actual `draw` entry point, so the selection frame, handles, size chip,
+    /// toolbar and annotation layer all run together exactly as they do on
+    /// screen, including whatever path state one stage leaves for the next.
+    fn overlay_state(selection: bool) -> State {
+        let width = 400;
+        let height = 300;
+        let bg =
+            ImageSurface::create(cairo::Format::ARgb32, width, height).expect("background surface");
+        let mut selector = Selector::new(width, height);
+        if selection {
+            selector.press(60.0, 50.0);
+            selector.motion(320.0, 240.0);
+            selector.release();
+            assert_eq!(selector.mode, Mode::HasSelection);
+        }
+        State {
+            bg,
+            screen_w: width,
+            screen_h: height,
+            selector,
+            toolbar: Toolbar::new(BUTTONS),
+            anno_toolbar: Toolbar::new(ANNOTATE_BUTTONS),
+            annotator: Annotator::new(),
+            annotating: false,
+            popup: None,
+            hover: None,
+            long_shot: false,
+            daemon_managed: false,
+            finished: false,
+            last_activity: glib::monotonic_time(),
+            ever_focused: false,
+            grace: None,
+        }
+    }
+
+    /// The whole overlay must draw without leaving a current point behind.
+    /// A leak here is the documented bug class: the next shape would be joined
+    /// to a stale origin by a diagonal line.
+    #[test]
+    fn drawing_the_whole_overlay_leaves_no_current_point() {
+        for annotating in [false, true] {
+            let mut state = overlay_state(true);
+            state.annotating = annotating;
+            if annotating {
+                state.annotator.begin_canvas(state.selector.rect);
+            }
+            let surface =
+                ImageSurface::create(cairo::Format::ARgb32, 400, 300).expect("target surface");
+            let cr = Context::new(&surface).expect("cairo context");
+            draw(&mut state, &cr);
+            assert!(
+                !cr.has_current_point().expect("valid cairo context"),
+                "the overlay leaked a current point (annotating={annotating})"
+            );
+        }
+    }
+
+    /// The toolbar only appears once a selection exists, and it must be fully
+    /// laid out by the time it is drawn.
+    #[test]
+    fn the_overlay_toolbar_is_laid_out_when_a_selection_exists() {
+        let mut state = overlay_state(true);
+        let surface =
+            ImageSurface::create(cairo::Format::ARgb32, 400, 300).expect("target surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        draw(&mut state, &cr);
+        assert_eq!(
+            state.toolbar.buttons().len(),
+            BUTTONS.len(),
+            "the region toolbar was not laid out before drawing"
+        );
+    }
+
+    /// An empty canvas draws the centre hint and must not touch the toolbar.
+    #[test]
+    fn the_centre_hint_draws_without_a_selection() {
+        let mut state = overlay_state(false);
+        let surface =
+            ImageSurface::create(cairo::Format::ARgb32, 400, 300).expect("target surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        draw(&mut state, &cr);
+        assert!(
+            state.toolbar.buttons().is_empty(),
+            "no selection must not lay out the toolbar"
+        );
+        assert!(!cr.has_current_point().expect("valid cairo context"));
+    }
+
+    /// The frame must stay visible over a light screenshot. Without the backing
+    /// line, a bright page left a bare 2 px indigo line that read as noise.
+    #[test]
+    fn the_selection_frame_is_dark_backed_outside_the_accent_body() {
+        let mut surface =
+            ImageSurface::create(cairo::Format::ARgb32, 128, 128).expect("test surface");
+        {
+            let cr = Context::new(&surface).expect("cairo context");
+            // A white desktop: the worst case for a bright frame.
+            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+            cr.paint().ok();
+            draw_selection_frame(&cr, Rect::new(40, 40, 48, 48));
+        }
+        surface.flush();
+
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface pixels");
+        let pixel = |x: usize, y: usize| -> (u8, u8, u8, u8) {
+            let offset = y * stride + x * 4;
+            let raw = u32::from_ne_bytes(data[offset..offset + 4].try_into().expect("one pixel"));
+            (
+                (raw & 0xff) as u8,
+                ((raw >> 8) & 0xff) as u8,
+                ((raw >> 16) & 0xff) as u8,
+                ((raw >> 24) & 0xff) as u8,
+            )
+        };
+
+        // Just outside the frame's top edge: the dark backing must have landed
+        // there. The margin is asserted, not merely "less than the 250 of the
+        // white desktop": measured, the backing brings this pixel to ~154, while
+        // deleting the backing pass leaves it at ~249. A threshold of 250 passed
+        // with the backing removed, i.e. it guarded nothing.
+        let outside = pixel(64, 38);
+        assert!(
+            outside.0 < 200,
+            "no dark backing outside the frame: got {outside:?} \
+             (a value near 249 means the backing pass is missing)"
+        );
+        // And the accent body itself must still be present, indigo-dominant.
+        let (b, _, r, _) = pixel(64, 40);
+        assert!(
+            u16::from(b) > u16::from(r) + 40,
+            "the accent frame body is not indigo: got b={b} r={r}"
+        );
+    }
+
+    #[test]
+    fn selection_handles_stay_compact_and_ringed() {
+        let mut surface =
+            ImageSurface::create(cairo::Format::ARgb32, 128, 128).expect("test surface");
+        {
+            let cr = Context::new(&surface).expect("cairo context");
+            draw_selection_handles(&cr, Rect::new(40, 40, 48, 48));
+        }
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface pixels");
+
+        // The south-east handle centre is the rect's bottom-right corner.
+        let (cx, cy) = (88usize, 88usize);
+        let centre = {
+            let offset = cy * stride + cx * 4;
+            u32::from_ne_bytes(data[offset..offset + 4].try_into().expect("one pixel"))
+        };
+        // White core: opaque and bright.
+        assert_eq!((centre >> 24) & 0xff, 0xff, "handle core must be opaque");
+        assert!(
+            ((centre >> 16) & 0xff) > 200,
+            "handle core must be white, got {centre:#010x}"
+        );
+
+        // The ring: sampling just inside the outer edge must find indigo, not
+        // white. Without this the test passed with the whole ring removed.
+        let pixel_at = |x: usize, y: usize| -> (u8, u8, u8, u8) {
+            let offset = y * stride + x * 4;
+            let raw = u32::from_ne_bytes(data[offset..offset + 4].try_into().expect("one pixel"));
+            (
+                (raw & 0xff) as u8,
+                ((raw >> 8) & 0xff) as u8,
+                ((raw >> 16) & 0xff) as u8,
+                ((raw >> 24) & 0xff) as u8,
+            )
+        };
+        // HANDLE_RADIUS is 4.5 and the ring is 1.5 wide, so the ring body spans
+        // roughly r = 4.5..5.25 from the centre. Sample at r = 5 to the left.
+        //
+        // The blue-minus-red margin is asserted, not merely "blue beats red":
+        // measured, the indigo ring gives b-r of about 150, while the grey seat
+        // visible once the ring is deleted gives b-r = 2. A bare check that blue
+        // exceeds red therefore passed with the entire ring removed.
+        let (b, g, r, a) = pixel_at(cx - 5, cy);
+        assert!(a > 0, "no ring pixel at r=5: got {a} alpha");
+        assert!(
+            i32::from(b) - i32::from(r) > 60,
+            "the handle is not ringed in indigo at r=5: got rgb({r},{g},{b})"
+        );
+
+        // Outside the outermost painted radius (4.5 + 1.5/2 = 5.25) plus the
+        // 0.5 anti-aliasing fringe, nothing may be painted.
+        let clear = pixel_at(cx, cy + 7);
+        assert_eq!(
+            clear.3, 0,
+            "handle paints outside its radius, got {clear:?}"
+        );
+    }
+
+    /// A stale sub-path must not be painted by the frame.
+    ///
+    /// Asserted on pixels, not on the path: stroke() clears the path by itself,
+    /// so both a current-point check and a copy_path check passed even with every
+    /// new_path() in the frame removed. What the user would actually see is the
+    /// stale shape getting stroked in the frame's colour, and only a pixel probe
+    /// detects that.
+    #[test]
+    fn the_frame_does_not_paint_a_stale_sub_path() {
+        let mut surface =
+            ImageSurface::create(cairo::Format::ARgb32, 128, 128).expect("test surface");
+        {
+            let cr = Context::new(&surface).expect("cairo context");
+            // A stale rectangle far from the frame's own geometry.
+            cr.rectangle(2.0, 2.0, 10.0, 10.0);
+            draw_selection_frame(&cr, Rect::new(40, 40, 48, 48));
+        }
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface pixels");
+        let alpha_at = |x: usize, y: usize| -> u8 {
+            let offset = y * stride + x * 4;
+            data[offset + 3]
+        };
+        // The stale rectangle's outline and interior must both be untouched.
+        for y in 2..=12usize {
+            assert_eq!(
+                alpha_at(2, y),
+                0,
+                "the frame stroked the stale sub-path at (2,{y})"
+            );
+            assert_eq!(
+                alpha_at(7, y),
+                0,
+                "the frame painted inside the stale sub-path at (7,{y})"
+            );
+        }
+        // The frame itself must still be drawn.
+        assert!(
+            alpha_at(64, 40) > 0 || alpha_at(64, 41) > 0,
+            "the selection frame was not painted at all"
         );
     }
 
