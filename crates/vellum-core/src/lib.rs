@@ -14,6 +14,7 @@ pub mod longshot_trace;
 pub mod paths;
 pub mod prefs;
 pub mod proc;
+pub mod session_env;
 
 pub use config::Config;
 pub use geom::Rect;

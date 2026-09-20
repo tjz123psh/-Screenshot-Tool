@@ -120,7 +120,39 @@ fn prefer_cairo_renderer() {
     unsafe { std::env::set_var("GSK_RENDERER", renderer) };
 }
 
+/// Recovers the session variables GTK needs when the parent could not pass them.
+///
+/// This is the last line of defence for the failure described in
+/// `vellum_core::session_env`: a GTK process started by a boot-time user
+/// service inherits no `WAYLAND_DISPLAY` and dies with "Failed to open
+/// display". The control service and the tray both fix it before spawning, so
+/// this normally costs one `stat()` and does nothing.
+///
+/// It is kept here anyway because this binary is the only one that *needs* a
+/// display: whatever launches it, a capture should not be lost to an
+/// environment the process can repair for itself. The `systemctl` round trip
+/// only happens when the display is genuinely unreachable, so the hot path
+/// never pays for it.
+fn recover_display_environment() {
+    if vellum_core::session_env::display_is_reachable() {
+        return;
+    }
+    let adopted = vellum_core::session_env::adopt_display_environment();
+    if adopted.is_empty() {
+        return;
+    }
+    // GTK has not initialised yet, and nothing else reads the environment
+    // before it does, so the write is safe here.
+    eprintln!(
+        "[vellum] recovered {} from the user manager",
+        adopted.join(", ")
+    );
+}
+
 fn main() -> std::process::ExitCode {
+    // Must run before GTK initialises: without a reachable display every later
+    // step fails with the same warning the user was seeing.
+    recover_display_environment();
     // The daemon can signal a freshly spawned long-shot process before GTK has
     // activated. Install the handler before any startup work so an early second
     // shortcut is ignored instead of taking SIGUSR1's default terminate action.

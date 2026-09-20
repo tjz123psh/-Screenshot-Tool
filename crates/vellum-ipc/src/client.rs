@@ -178,6 +178,11 @@ fn spawn_daemon() -> std::io::Result<()> {
     command
         .arg("daemon")
         .env(crate::protocol::BYPASS_ENV, "1")
+        // A daemon started by a hotkey inherits this client's environment,
+        // which can be as stripped as a user service's. Give it the session's
+        // display variables so the actions it later spawns can reach the
+        // compositor.
+        .envs(vellum_core::session_env::display_environment())
         // Trace is request-scoped. A one-off opt-in that happened to start the
         // fallback daemon must not leak into every later long-shot process.
         .env_remove(vellum_core::longshot_trace::TRACE_ENV)

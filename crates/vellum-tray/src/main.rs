@@ -189,15 +189,20 @@ impl Tray {
                 return;
             };
             use std::os::unix::process::CommandExt;
-            let spawned = std::process::Command::new(exe)
+            let mut command = std::process::Command::new(exe);
+            command
                 .arg("panel")
                 // Without this the panel would die with the tray, and a settings
                 // window must outlive a tray restart.
                 .process_group(0)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+                .stderr(std::process::Stdio::null());
+            // The tray starts at login, before the compositor exports its
+            // display variables, so a panel launched from it would otherwise
+            // die with "Failed to open display".
+            vellum_core::session_env::apply_to_command(&mut command);
+            let spawned = command.spawn();
             match spawned {
                 Ok(child) => vellum_core::proc::reap_in_background(child),
                 Err(_) => vellum_core::io::notify("vellum", "设置面板无法启动", "critical"),
@@ -336,7 +341,8 @@ fn spawn_direct(action: Action, args: &[String]) {
         return;
     };
     use std::os::unix::process::CommandExt;
-    let spawned = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg(action.as_str())
         .args(args)
         // Without this the capture would die with the tray, and it must outlive
@@ -345,8 +351,12 @@ fn spawn_direct(action: Action, args: &[String]) {
         .env(vellum_ipc::protocol::BYPASS_ENV, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    // Same boot-time hole as the control service: the tray is started before
+    // niri exports WAYLAND_DISPLAY, and this fallback exists precisely for the
+    // case where no daemon could be reached.
+    vellum_core::session_env::apply_to_command(&mut command);
+    let spawned = command.spawn();
     match spawned {
         Ok(child) => vellum_core::proc::reap_in_background(child),
         Err(_) => vellum_core::io::notify("vellum", "截图动作无法启动", "critical"),

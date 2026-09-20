@@ -52,6 +52,13 @@ struct Active {
     trace: LongshotTrace,
 }
 
+/// Session variables recovered from the user manager, as name/value pairs.
+///
+/// Named rather than inlined because the field's shape is
+/// `Arc<Mutex<Option<...>>>` and spelling that out on the struct hurts
+/// readability more than this alias does.
+type DisplayEnv = Vec<(String, String)>;
+
 struct Inner {
     started_at: f64,
     active: Option<Active>,
@@ -72,6 +79,20 @@ pub struct Service {
     /// cannot be dropped around cursor/notification side effects without
     /// letting a newer action overtake cleanup for the previous one.
     lifecycle: Arc<Mutex<()>>,
+    /// Session variables recovered from the user manager for spawned children.
+    ///
+    /// `None` means "not resolved yet" and is retried on the next spawn, which
+    /// is what lets a daemon started before the compositor self-heal. Once a
+    /// value is found it is kept: the manager is not going to forget it, and a
+    /// long-lived service should not pay a `systemctl` round trip per capture.
+    ///
+    /// Keeping it for the process lifetime is safe because a compositor restart
+    /// tears down `graphical-session.target`, and this unit is
+    /// `PartOf=graphical-session.target`, so a session whose display name
+    /// changes also restarts the daemon that cached the old one.
+    ///
+    /// See `vellum_core::session_env` for the failure this repairs.
+    display_env: Arc<Mutex<Option<DisplayEnv>>>,
     #[cfg(test)]
     test_prefix_args: Arc<Vec<String>>,
 }
@@ -89,6 +110,7 @@ impl Service {
             exe: Arc::new(exe),
             running: Arc::new(AtomicBool::new(true)),
             lifecycle: Arc::new(Mutex::new(())),
+            display_env: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             test_prefix_args: Arc::new(Vec::new()),
         }
@@ -346,6 +368,42 @@ impl Service {
         }
     }
 
+    /// Session variables a spawned action must be given.
+    ///
+    /// Resolved once and cached. A daemon that started before the compositor
+    /// exported `WAYLAND_DISPLAY` gets an empty answer the first time and keeps
+    /// asking until the manager can supply one, so the session heals itself
+    /// without a restart.
+    fn display_env(&self) -> Vec<(String, String)> {
+        let mut cache = match self.display_env.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(resolved) = cache.as_ref() {
+            // Re-check before reusing: a compositor restart renames its socket,
+            // and handing a capture the old name would reproduce the very
+            // failure this exists to prevent. A cached value that no longer
+            // resolves is discarded and resolved again below.
+            if vellum_core::session_env::values_are_live(resolved) {
+                return resolved.clone();
+            }
+            *cache = None;
+        }
+        let resolved = vellum_core::session_env::display_environment();
+        if resolved.is_empty() {
+            // Nothing to add *yet*, or nothing needed. Do not cache: a session
+            // that is still starting up must be retried on the next spawn.
+            return resolved;
+        }
+        for (name, _) in &resolved {
+            self.log.info(format!(
+                "supplied {name} to action children from the user manager"
+            ));
+        }
+        *cache = Some(resolved.clone());
+        resolved
+    }
+
     fn spawn_action(&self, action: Action, args: &[String]) -> std::io::Result<Child> {
         if let Some(parent) = self.log.path().parent() {
             let _ = create_private_dir(parent);
@@ -354,6 +412,9 @@ impl Service {
         let mut command = Command::new(self.exe.as_path());
         #[cfg(test)]
         command.args(self.test_prefix_args.iter());
+        // Set before the caller's explicit spawn variables so an action can
+        // still override them, and inherited by every descendant of the action.
+        command.envs(self.display_env());
         command
             .arg(action.as_str())
             .args(args)
