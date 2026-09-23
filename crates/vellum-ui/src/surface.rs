@@ -1163,6 +1163,31 @@ struct PopupLayout {
     items: Vec<Bounds>,
 }
 
+/// Popup padding: horizontal, vertical, and the gap between entries.
+const POPUP_PAD: (f64, f64, f64) = (10.0, 9.0, 7.0);
+/// Height of the popup's heading row, and the font it is drawn in.
+///
+/// Constants rather than measurements: `popup_hit` has no cairo context and must
+/// produce exactly the geometry `draw_popup` paints, so the heading cannot be
+/// measured at draw time only.
+const POPUP_TITLE_H: f64 = 15.0;
+const POPUP_TITLE_FONT: &str = "Sans Bold 9";
+/// Space between the heading and the row of entries.
+const POPUP_TITLE_GAP: f64 = 5.0;
+
+/// What a popup controls, as shown in its heading.
+///
+/// The 大小 button carries a different ladder per tool, so the heading is what
+/// makes the current meaning visible: a bare row of numbers reads the same
+/// whether it means px of stroke or px of type.
+fn popup_title(popup: Popup) -> &'static str {
+    match popup {
+        Popup::Color => "颜色",
+        Popup::Width => "线宽",
+        Popup::TextSize => "字号",
+    }
+}
+
 /// Popup geometry. Anchored to its own toolbar button, above when there is
 /// room, and clamped so it never leaves the output.
 fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
@@ -1184,9 +1209,10 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
         Popup::Width => (64.0, 42.0, WIDTHS.len()),
         Popup::TextSize => (40.0, 34.0, TEXT_SIZES.len()),
     };
-    let (pad_x, pad_y, gap) = (10.0, 9.0, 7.0);
+    let (pad_x, pad_y, gap) = POPUP_PAD;
+    let title_block = POPUP_TITLE_H + POPUP_TITLE_GAP;
     let popup_w = pad_x * 2.0 + item_w * count as f64 + gap * (count as f64 - 1.0);
-    let popup_h = pad_y * 2.0 + item_h;
+    let popup_h = pad_y * 2.0 + title_block + item_h;
 
     let mut bx = anchor.x + (anchor.w - popup_w) / 2.0;
     bx = bx.clamp(8.0, (f64::from(state.screen_w) - popup_w - 8.0).max(8.0));
@@ -1199,9 +1225,10 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
 
     let items = (0..count)
         .map(|index| {
+            // Offset past the heading, which is painted from the bar's top edge.
             Bounds::new(
                 bx + pad_x + (item_w + gap) * index as f64,
-                by + pad_y,
+                by + pad_y + title_block,
                 item_w,
                 item_h,
             )
@@ -1238,6 +1265,19 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
         return;
     };
     paint::crystal_slab(cr, layout.bar, 11.0);
+
+    // Heading first: it names which ladder this is, which is what stops the
+    // shared 大小 button from being ambiguous.
+    let title = popup_title(popup);
+    let (tw, _) = paint::text_size(cr, POPUP_TITLE_FONT, title);
+    paint::draw_text(
+        cr,
+        POPUP_TITLE_FONT,
+        title,
+        layout.bar.x + (layout.bar.w - tw) / 2.0,
+        layout.bar.y + POPUP_PAD.1,
+        (0.86, 0.90, 1.0, 0.62),
+    );
 
     let selected = match popup {
         Popup::Color => state.annotator.color_index(),
@@ -1812,6 +1852,46 @@ mod tests {
              silently fell back to GtkIMContextSimple and composed input (Chinese, \
              Japanese, dead keys) cannot work"
         );
+    }
+
+    /// Every popup names what it controls.
+    ///
+    /// This is not decoration on the size popup: the same button carries a
+    /// different ladder per tool, so the heading is the only thing distinguishing
+    /// "px of stroke" from "px of type".
+    #[test]
+    fn each_popup_says_what_it_controls() {
+        assert_eq!(popup_title(Popup::Color), "颜色");
+        assert_eq!(popup_title(Popup::Width), "线宽");
+        assert_eq!(popup_title(Popup::TextSize), "字号");
+    }
+
+    /// The heading row must not overlap the entries it captions, nor push them
+    /// out of the slab.
+    #[test]
+    fn the_heading_sits_above_the_entries() {
+        let mut state = overlay_state(true);
+        let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        let rect = state.selector.rect;
+        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+
+        for popup in [Popup::Color, Popup::Width, Popup::TextSize] {
+            let layout = popup_layout(&state, popup).expect("popup layout");
+            let name = popup_title(popup);
+            let first = layout.items.first().expect("at least one entry");
+            assert!(
+                first.y >= layout.bar.y + POPUP_TITLE_H,
+                "{name}: the entries start at {:.1}, inside the heading row",
+                first.y
+            );
+            for item in &layout.items {
+                assert!(
+                    item.y + item.h <= layout.bar.y + layout.bar.h,
+                    "{name}: an entry overflows the slab"
+                );
+            }
+        }
     }
 
     /// The 大小 button shows the size ladder for text and the line-weight ladder
