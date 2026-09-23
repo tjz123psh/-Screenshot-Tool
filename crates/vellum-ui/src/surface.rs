@@ -660,12 +660,22 @@ fn annotate_key(
         return true;
     }
     if modifiers.contains(ModifierType::CONTROL_MASK)
-        && key
-            .to_unicode()
-            .is_some_and(|ch| ch.eq_ignore_ascii_case(&'z'))
+        && let Some(ch) = key.to_unicode()
     {
-        state.annotator.undo();
-        return true;
+        // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo, the two conventions users
+        // arrive with from other editors.
+        if ch.eq_ignore_ascii_case(&'z') {
+            if modifiers.contains(ModifierType::SHIFT_MASK) {
+                state.annotator.redo();
+            } else {
+                state.annotator.undo();
+            }
+            return true;
+        }
+        if ch.eq_ignore_ascii_case(&'y') {
+            state.annotator.redo();
+            return true;
+        }
     }
     if let Some(ch) = key.to_unicode() {
         let pressed = ch.to_lowercase().to_string();
@@ -691,7 +701,12 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
             if rect.valid() {
                 state.annotating = true;
                 state.hover = None;
-                state.annotator.begin_canvas(rect);
+                // The screenshot is handed over so mosaic and blur can read the
+                // original pixels rather than the annotated composite. Cloned
+                // because `state` is behind a RefMut, so its fields cannot be
+                // borrowed separately; a cairo surface handle is a refcount bump.
+                let bg = state.bg.clone();
+                state.annotator.begin_canvas(rect, &bg);
             }
             return;
         }
@@ -723,6 +738,10 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
         }
         "anno.undo" => {
             state.borrow_mut().annotator.undo();
+            return;
+        }
+        "anno.redo" => {
+            state.borrow_mut().annotator.redo();
             return;
         }
         "anno.color" => {
@@ -1511,7 +1530,8 @@ mod tests {
             state.popup = annotating.then_some(Popup::Color);
             state.annotator = Annotator::new();
             if annotating {
-                state.annotator.begin_canvas(state.selector.rect);
+                let bg = state.bg.clone();
+                state.annotator.begin_canvas(state.selector.rect, &bg);
             }
             state.hover = Some(if annotating { "tool.arrow" } else { "ocr" }.to_string());
 
@@ -1656,7 +1676,8 @@ mod tests {
             let mut state = overlay_state(true);
             state.annotating = annotating;
             if annotating {
-                state.annotator.begin_canvas(state.selector.rect);
+                let bg = state.bg.clone();
+                state.annotator.begin_canvas(state.selector.rect, &bg);
             }
             let surface =
                 ImageSurface::create(cairo::Format::ARgb32, 400, 300).expect("target surface");

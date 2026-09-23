@@ -95,6 +95,10 @@ struct Spacing {
 }
 
 /// Floor for the button padding before the badges are dropped.
+///
+/// Below this the spacing stops being worth defending and the bar wraps to a
+/// second row instead: a cramped strip is worse than a taller one, and the labels
+/// themselves are never shrunk either way.
 const MIN_PAD_X: f64 = 6.0;
 
 impl Spacing {
@@ -205,7 +209,12 @@ pub const ANNOTATE_BUTTONS: &[ButtonSpec] = &[
     spec("tool.pen", "画笔", "b", "B"),
     spec("tool.arrow", "箭头", "a", "A"),
     spec("tool.rect", "矩形", "r", "R"),
+    spec("tool.ellipse", "椭圆", "e", "E"),
     spec("tool.text", "文字", "x", "X"),
+    // Redaction, not decoration: these two destroy the pixels they cover, which is
+    // why they are their own tools rather than a style of the rectangle.
+    spec("tool.mosaic", "马赛克", "m", "M"),
+    spec("tool.blur", "模糊", "g", "G"),
     spec("anno.color", "颜色", "c", "C"),
     // "大小" and not "粗细": this control carries the size of whatever tool is
     // active, which is a font size for the text tool and a line weight for the
@@ -214,12 +223,81 @@ pub const ANNOTATE_BUTTONS: &[ButtonSpec] = &[
     // remain part of the frozen interaction contract.
     spec("anno.width", "大小", "w", "W"),
     spec("anno.undo", "撤销", "u", "U"),
+    spec("anno.redo", "重做", "y", "Y"),
     spec("anno.done", "完成", "Return", "⏎"),
 ];
 
 /// Separators land before these ids, which groups the bar as
 /// "finish / tools / cancel" instead of one undifferentiated strip.
-const GROUP_BREAK_BEFORE: &[&str] = &["annotate", "cancel", "anno.color", "anno.done"];
+const GROUP_BREAK_BEFORE: &[&str] = &[
+    "annotate",
+    "cancel",
+    "anno.color",
+    // Undo and redo are history, not settings, so they get their own group
+    // instead of sitting with the colour and size they do not affect.
+    "anno.undo",
+    "anno.done",
+];
+
+/// Vertical gap between wrapped rows of buttons.
+const ROW_GAP: f64 = 6.0;
+
+/// Splits the buttons into rows that each fit `avail`, keeping their order.
+///
+/// A row always takes at least one button, so a single button wider than the whole
+/// output is still placed rather than looping forever.
+fn pack_rows(
+    widths: &[f64],
+    specs: &[ButtonSpec],
+    spacing: &Spacing,
+    avail: f64,
+) -> Vec<(usize, usize)> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < widths.len() {
+        let mut used = 0.0;
+        let mut count = 0;
+        for index in start..widths.len() {
+            let mut extra = widths[index];
+            if index > start {
+                extra += spacing.btn_gap;
+                if GROUP_BREAK_BEFORE.contains(&specs[index].id) {
+                    extra += spacing.group_gap;
+                }
+            }
+            if index > start && used + extra > avail {
+                break;
+            }
+            used += extra;
+            count += 1;
+        }
+        let count = count.max(1);
+        rows.push((start, count));
+        start += count;
+    }
+    rows
+}
+
+/// Content width of one packed row, without the bar's own inner padding.
+fn row_width(
+    widths: &[f64],
+    specs: &[ButtonSpec],
+    spacing: &Spacing,
+    start: usize,
+    count: usize,
+) -> f64 {
+    let mut total = 0.0;
+    for index in start..start + count {
+        if index > start {
+            total += spacing.btn_gap;
+            if GROUP_BREAK_BEFORE.contains(&specs[index].id) {
+                total += spacing.group_gap;
+            }
+        }
+        total += widths[index];
+    }
+    total
+}
 
 /// A laid-out button: spec plus its resolved screen rectangle.
 #[derive(Debug, Clone, Copy)]
@@ -291,6 +369,13 @@ impl Toolbar {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn bar(&self) -> Bounds {
         self.bar
+    }
+
+    /// Whether the last layout had room for the keycap badges. The tests need it
+    /// to know whether a hint has to fit inside its button at all.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn shows_keycaps(&self) -> bool {
+        self.keycaps
     }
 
     pub fn hit(&self, px: f64, py: f64) -> Option<&Button> {
@@ -368,7 +453,6 @@ impl Toolbar {
             (measured.len(), button_h, label_total, cap_total)
         };
 
-        let bar_h = button_h + BAR_INNER_PAD * 2.0;
         let screen_w = f64::from(screen_w);
         let screen_h = f64::from(screen_h);
 
@@ -399,7 +483,28 @@ impl Toolbar {
                 None => break,
             }
         }
-        let bar_w = spacing.bar_width(label_total, cap_total, measured_len, breaks);
+        // Pack the buttons into rows. One row is the norm; a second appears only
+        // when even the tightest spacing cannot fit the output.
+        //
+        // Wrapping is the last resort, and it exists because the guarantee above is
+        // absolute: an off-screen button cannot be reached by pointer *or* by key,
+        // since the overlay holds an exclusive keyboard grab. A second row costs
+        // vertical space over the selection, which is recoverable; a lost tool is
+        // not. It is also what keeps the promise true as buttons are added, rather
+        // than letting the bar quietly exceed the output one tool at a time.
+        let widths: Vec<f64> = {
+            let measured = self.measured.as_deref().unwrap_or_default();
+            measured.iter().map(|m| spacing.button_width(m)).collect()
+        };
+        let avail = (target - spacing.inner_pad * 2.0).max(1.0);
+        let rows = pack_rows(&widths, &self.specs, &spacing, avail);
+        let bar_w = rows
+            .iter()
+            .map(|&(start, count)| row_width(&widths, &self.specs, &spacing, start, count))
+            .fold(0.0f64, f64::max)
+            + spacing.inner_pad * 2.0;
+        let row_count = rows.len().max(1) as f64;
+        let bar_h = row_count * button_h + (row_count - 1.0) * ROW_GAP + BAR_INNER_PAD * 2.0;
 
         let center = f64::from(sel.x) + f64::from(sel.w) / 2.0;
         let bx = (center - bar_w / 2.0).clamp(
@@ -425,25 +530,29 @@ impl Toolbar {
         self.keycaps = spacing.keycaps;
         self.buttons.clear();
         self.separators.clear();
-        // Re-borrow the measurement table for the placement loop below.
-        let measured = self.measured.as_deref().unwrap_or_default();
-        let mut x = bx + spacing.inner_pad;
-        for (index, (spec, m)) in self.specs.iter().zip(measured.iter()).enumerate() {
-            if index > 0 {
-                x += spacing.btn_gap;
-                if GROUP_BREAK_BEFORE.contains(&spec.id) {
-                    self.separators.push(x + spacing.group_gap / 2.0);
-                    x += spacing.group_gap;
+        for (row, &(start, count)) in rows.iter().enumerate() {
+            let row_y = by + BAR_INNER_PAD + row as f64 * (button_h + ROW_GAP);
+            let mut x = bx + spacing.inner_pad;
+            for (offset, (spec, &width)) in self.specs[start..start + count]
+                .iter()
+                .zip(&widths[start..start + count])
+                .enumerate()
+            {
+                if offset > 0 {
+                    x += spacing.btn_gap;
+                    if GROUP_BREAK_BEFORE.contains(&spec.id) {
+                        // Separators only sit inside a row: a break at the start of
+                        // one has nothing to separate it from.
+                        self.separators.push(x + spacing.group_gap / 2.0);
+                        x += spacing.group_gap;
+                    }
                 }
+                self.buttons.push(Button {
+                    spec: *spec,
+                    bounds: Bounds::new(x, row_y, width, button_h),
+                });
+                x += width;
             }
-            // Recomputed from the measured text, so a tighter spacing or a
-            // dropped badge changes the width without re-measuring anything.
-            let width = spacing.button_width(m);
-            self.buttons.push(Button {
-                spec: *spec,
-                bounds: Bounds::new(x, by + BAR_INNER_PAD, width, button_h),
-            });
-            x += width;
         }
     }
 
@@ -695,10 +804,14 @@ mod tests {
             ("b", "tool.pen"),
             ("a", "tool.arrow"),
             ("r", "tool.rect"),
+            ("e", "tool.ellipse"),
             ("x", "tool.text"),
+            ("m", "tool.mosaic"),
+            ("g", "tool.blur"),
             ("c", "anno.color"),
             ("w", "anno.width"),
             ("u", "anno.undo"),
+            ("y", "anno.redo"),
             ("return", "anno.done"),
         ];
         for (key, id) in expected {
@@ -707,6 +820,48 @@ mod tests {
                 .unwrap_or_else(|| panic!("hotkey {key:?} does not resolve"));
             assert_eq!(found.id(), *id, "hotkey {key:?} moved to the wrong button");
         }
+    }
+
+    /// At a width one row cannot serve, the bar wraps onto a second row instead of
+    /// letting a button leave the output.
+    ///
+    /// An off-screen button is unreachable by pointer *and* by key, because the
+    /// overlay holds an exclusive keyboard grab, so wrapping is what keeps the
+    /// on-screen guarantee true as buttons are added.
+    #[test]
+    fn a_narrow_output_wraps_the_bar_onto_a_second_row() {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        let mut toolbar = Toolbar::new(ANNOTATE_BUTTONS);
+        toolbar.layout(&cr, Rect::new(10, 10, 40, 40), 480, 1080);
+
+        let mut rows: Vec<f64> = Vec::new();
+        for button in toolbar.buttons() {
+            if !rows.iter().any(|y| (y - button.bounds.y).abs() < 0.5) {
+                rows.push(button.bounds.y);
+            }
+        }
+        assert!(
+            rows.len() >= 2,
+            "the bar did not wrap at 480 px, so the buttons were squeezed instead: {rows:?}"
+        );
+
+        // Rows must not overlap, or a press would land on the wrong one.
+        rows.sort_by(f64::total_cmp);
+        let height = toolbar.buttons()[0].bounds.h;
+        for pair in rows.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= height,
+                "wrapped rows overlap: {pair:?} with a button height of {height}"
+            );
+        }
+
+        // And the taller bar still has to fit the output vertically.
+        assert!(
+            toolbar.bar().y + toolbar.bar().h <= 1080.0,
+            "the wrapped bar runs off the bottom: {:?}",
+            toolbar.bar()
+        );
     }
 
     /// Buttons must appear left-to-right in the documented order and never
@@ -952,17 +1107,21 @@ mod tests {
         // An absurdly narrow output forces the tightest spacing.
         toolbar.layout(&cr, Rect::new(10, 10, 40, 40), 200, 1080);
 
+        // The label must always fit. The badge only has to fit while it is drawn:
+        // dropping the badges is the layout's second degradation step, so at this
+        // width they are gone and nothing reserves room for them.
+        let keycaps = toolbar.shows_keycaps();
         for (button, spec) in toolbar.buttons().iter().zip(ANNOTATE_BUTTONS.iter()) {
             let (label_w, _) = paint::text_size(&cr, LABEL_FONT, spec.label);
-            let (hint_w, _) = if spec.hint.is_empty() {
-                (0.0, 0.0)
-            } else {
-                paint::text_size(&cr, HINT_FONT, spec.hint)
-            };
-            let content = label_w + hint_w;
+            let mut content = label_w;
+            if keycaps && !spec.hint.is_empty() {
+                let (hint_w, _) = paint::text_size(&cr, HINT_FONT, spec.hint);
+                content += hint_w;
+            }
             assert!(
                 button.bounds.w >= content,
-                "{} was squeezed to {:.1} but its content needs {:.1}",
+                "{} was squeezed to {:.1} but its content needs {:.1} (keycaps drawn: \
+                 {keycaps})",
                 spec.id,
                 button.bounds.w,
                 content
