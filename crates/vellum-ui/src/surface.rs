@@ -37,7 +37,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::geom::Rect;
 use vellum_core::image::Rgb8;
 
-use crate::annotate::{Annotator, PALETTE, Tool, WIDTHS};
+use crate::annotate::{Annotator, PALETTE, TEXT_SIZES, Tool, WIDTHS};
 use crate::imaging;
 use crate::paint::{self, Bounds};
 use crate::recorder::{SelectionPanelNotice, selection_panel_notice};
@@ -101,6 +101,11 @@ pub type ResultHandler = Rc<dyn Fn(Outcome)>;
 enum Popup {
     Color,
     Width,
+    /// Label font sizes, shown by the same 粗细 button while the text tool is
+    /// active. A separate variant rather than a polymorphic `Width`, so what the
+    /// popup contains is decided in one place instead of being implied by the
+    /// active tool at every site that reads it.
+    TextSize,
 }
 
 struct State {
@@ -416,6 +421,7 @@ fn annotate_press(state: &mut State, button: u32, x: f64, y: f64) -> Option<Stri
             match popup {
                 Popup::Color => state.annotator.set_color_index(index),
                 Popup::Width => state.annotator.set_width_index(index),
+                Popup::TextSize => state.annotator.set_text_size(TEXT_SIZES[index]),
             }
             state.popup = None;
             return None;
@@ -690,7 +696,8 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
         }
         "anno.width" => {
             let mut state = state.borrow_mut();
-            state.popup = (state.popup != Some(Popup::Width)).then_some(Popup::Width);
+            let wanted = width_popup_for(state.annotator.tool());
+            state.popup = (state.popup != Some(wanted)).then_some(wanted);
             return;
         }
         _ => {}
@@ -1161,7 +1168,9 @@ struct PopupLayout {
 fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
     let id = match popup {
         Popup::Color => "anno.color",
-        Popup::Width => "anno.width",
+        // Same button as the stroke widths: the size lives with the other
+        // annotation settings rather than in a control of its own.
+        Popup::Width | Popup::TextSize => "anno.width",
     };
     let anchor = state
         .anno_toolbar
@@ -1173,6 +1182,7 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
     let (item_w, item_h, count) = match popup {
         Popup::Color => (34.0, 34.0, PALETTE.len()),
         Popup::Width => (64.0, 42.0, WIDTHS.len()),
+        Popup::TextSize => (40.0, 34.0, TEXT_SIZES.len()),
     };
     let (pad_x, pad_y, gap) = (10.0, 9.0, 7.0);
     let popup_w = pad_x * 2.0 + item_w * count as f64 + gap * (count as f64 - 1.0);
@@ -1203,6 +1213,21 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
     })
 }
 
+/// Which ladder the 粗细 button shows for the active tool.
+///
+/// One button, two ladders: for text the useful "thickness" is the label size,
+/// for a drawing tool it is the line weight. The button id and hotkey are the
+/// same either way, so nothing about the interaction contract moves — the size
+/// simply lives with the other annotation settings instead of in a control of
+/// its own.
+fn width_popup_for(tool: Tool) -> Popup {
+    if tool == Tool::Text {
+        Popup::TextSize
+    } else {
+        Popup::Width
+    }
+}
+
 fn popup_hit(state: &State, popup: Popup, x: f64, y: f64) -> Option<usize> {
     let layout = popup_layout(state, popup)?;
     layout.items.iter().position(|bounds| bounds.contains(x, y))
@@ -1217,6 +1242,7 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
     let selected = match popup {
         Popup::Color => state.annotator.color_index(),
         Popup::Width => state.annotator.width_index(),
+        Popup::TextSize => state.annotator.text_size_index(),
     };
 
     for (index, bounds) in layout.items.iter().enumerate() {
@@ -1234,6 +1260,22 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
                     cr.line_to(bounds.x + bounds.w - 9.0, bounds.y + 10.0);
                     let _ = cr.stroke();
                 }
+            }
+            Popup::TextSize => {
+                paint::fill_rounded(cr, *bounds, 8.0, (1.0, 1.0, 1.0, 0.06));
+                // The number is the control. A bar of proportional height would
+                // read as a second thickness setting, which is exactly the
+                // confusion the two-in-one 粗细 button already caused.
+                let label = format!("{}", TEXT_SIZES[index] as i32);
+                let (tw, th) = paint::text_size(cr, "Sans Bold 11", &label);
+                paint::draw_text(
+                    cr,
+                    "Sans Bold 11",
+                    &label,
+                    bounds.x + (bounds.w - tw) / 2.0,
+                    bounds.y + (bounds.h - th) / 2.0,
+                    (0.90, 0.93, 1.0, 0.88),
+                );
             }
             Popup::Width => {
                 paint::fill_rounded(cr, *bounds, 8.0, (1.0, 1.0, 1.0, 0.06));
@@ -1767,6 +1809,61 @@ mod tests {
              silently fell back to GtkIMContextSimple and composed input (Chinese, \
              Japanese, dead keys) cannot work"
         );
+    }
+
+    /// The 粗细 button shows the size ladder for text and the line-weight ladder
+    /// for every drawing tool.
+    #[test]
+    fn the_width_button_shows_the_label_size_only_for_text() {
+        assert!(matches!(width_popup_for(Tool::Text), Popup::TextSize));
+        for tool in [Tool::Pen, Tool::Arrow, Tool::Rect] {
+            assert!(
+                matches!(width_popup_for(tool), Popup::Width),
+                "{tool:?} must keep showing the line weights"
+            );
+        }
+    }
+
+    /// Every step the size popup offers must be one the annotator accepts, and
+    /// must highlight itself, or the popup would show a step it cannot apply.
+    #[test]
+    fn every_advertised_label_size_round_trips() {
+        let mut annotator = Annotator::new();
+        for (index, size) in TEXT_SIZES.iter().enumerate() {
+            annotator.set_text_size(*size);
+            assert_eq!(annotator.text_size(), *size, "size {size} was not applied");
+            assert_eq!(
+                annotator.text_size_index(),
+                index,
+                "size {size} did not highlight its own entry"
+            );
+        }
+    }
+
+    /// The size popup must stay on screen at every output width, or its last
+    /// steps are unreachable in exactly the way the toolbar used to be.
+    #[test]
+    fn the_size_popup_fits_a_narrow_output() {
+        for width in [1920, 1280, 1024, 800, 640, 480] {
+            let mut state = overlay_state(true);
+            state.screen_w = width;
+            let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+            let cr = Context::new(&surface).expect("cairo context");
+            let rect = state.selector.rect;
+            state.anno_toolbar.layout(&cr, rect, width, state.screen_h);
+
+            let layout = popup_layout(&state, Popup::TextSize).expect("popup layout");
+            assert!(
+                layout.bar.x >= 0.0 && layout.bar.x + layout.bar.w <= f64::from(width),
+                "the size popup leaves a {width} px output: {:?}",
+                layout.bar
+            );
+            assert_eq!(
+                layout.items.len(),
+                TEXT_SIZES.len(),
+                "a step went missing at {width} px"
+            );
+        }
     }
 
     /// The input method must be attached to the key controller ONLY while a

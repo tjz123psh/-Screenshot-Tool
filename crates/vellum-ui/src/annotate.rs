@@ -26,6 +26,13 @@ pub const PALETTE: [(f64, f64, f64); 6] = [
 
 pub const WIDTHS: [f64; 4] = [2.0, 4.0, 7.0, 11.0];
 
+/// Label font sizes offered by the 粗细 popup while the text tool is active.
+///
+/// Discrete steps because that is what the popup can express, and it keeps the
+/// size in the same place as every other annotation setting. The wheel stays for
+/// continuous adjustment.
+pub const TEXT_SIZES: [f64; 6] = [12.0, 16.0, 24.0, 32.0, 48.0, 64.0];
+
 /// Minimum squared pointer movement before a pen point is recorded. GTK reports
 /// motion faster than the compositor repaints, and every extra point costs
 /// memory plus one more segment in the cache replay after an undo.
@@ -189,6 +196,17 @@ impl Annotator {
     /// canvas while the text tool is active.
     pub fn nudge_text_size(&mut self, delta: f64) {
         self.set_text_size(self.text_size() + delta);
+    }
+
+    /// The entry in `TEXT_SIZES` closest to the current size, so the popup can
+    /// show which step is in effect even after the wheel moved off a step.
+    pub fn text_size_index(&self) -> usize {
+        let current = self.text_size();
+        TEXT_SIZES
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| (*a - current).abs().total_cmp(&(*b - current).abs()))
+            .map_or(0, |(index, _)| index)
     }
 
     pub fn set_color_index(&mut self, index: usize) {
@@ -825,6 +843,23 @@ mod tests {
     /// This is why the size is stored per stroke: deriving it from the annotator
     /// at draw time would resize every past label the moment the setting changed,
     /// including on each cache replay after an undo.
+    /// The popup highlights the nearest step, so a wheel detour between steps
+    /// still shows which entry is in effect.
+    #[test]
+    fn the_size_index_snaps_to_the_nearest_step() {
+        let mut a = annotator();
+        a.set_text_size(24.0);
+        assert_eq!(a.text_size_index(), 2);
+
+        a.nudge_text_size(3.0);
+        assert_eq!(a.text_size(), 27.0);
+        assert_eq!(a.text_size_index(), 2, "27 is nearest to 24");
+
+        a.nudge_text_size(6.0);
+        assert_eq!(a.text_size(), 33.0);
+        assert_eq!(a.text_size_index(), 3, "33 is nearest to 32");
+    }
+
     #[test]
     fn an_already_placed_label_keeps_its_size() {
         let mut a = annotator();
