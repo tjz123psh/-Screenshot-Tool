@@ -63,6 +63,12 @@ pub enum Tool {
     /// Softens what it covers, for the cases where blocks would be uglier than
     /// the content merely being unreadable.
     Blur,
+    /// Samples the screenshot's colour under the pointer.
+    ///
+    /// Not a drawing tool. A pick produces a colour, never a `Stroke`, so it
+    /// stays out of the undo history by construction: there is nothing to undo,
+    /// and a pick must not discard the redo branch either.
+    Pick,
 }
 
 impl Tool {
@@ -76,6 +82,7 @@ impl Tool {
             "tool.text" => Some(Tool::Text),
             "tool.mosaic" => Some(Tool::Mosaic),
             "tool.blur" => Some(Tool::Blur),
+            "tool.pick" => Some(Tool::Pick),
             _ => None,
         }
     }
@@ -89,6 +96,7 @@ impl Tool {
             Tool::Text => "tool.text",
             Tool::Mosaic => "tool.mosaic",
             Tool::Blur => "tool.blur",
+            Tool::Pick => "tool.pick",
         }
     }
 }
@@ -126,6 +134,13 @@ struct TextEdit {
 pub struct Annotator {
     tool: Tool,
     color_idx: usize,
+    /// A colour lifted off the screenshot, which overrides the palette entry
+    /// until a swatch is chosen again.
+    ///
+    /// One setting, not two: the 颜色 button and every new stroke read
+    /// `color()`, so a pick has to land there rather than in a field of its
+    /// own, or the toolbar would keep showing a colour the pen no longer uses.
+    custom_color: Option<(f64, f64, f64)>,
     /// Stroke width in pixels. Continuous: the size slider sets it directly, so
     /// there is no index to step through any more.
     width: f64,
@@ -165,6 +180,7 @@ impl Annotator {
         Self {
             tool: Tool::Pen,
             color_idx: 0,
+            custom_color: None,
             width: DEFAULT_WIDTH,
             text_size: None,
             strokes: Vec::new(),
@@ -189,12 +205,23 @@ impl Annotator {
         self.tool = tool;
     }
 
-    pub fn color_index(&self) -> usize {
-        self.color_idx
+    /// The palette entry in use, or `None` while a picked colour is.
+    ///
+    /// The colour popup ticks whatever this returns, so a pick must not leave a
+    /// tick on a swatch that is no longer the colour in use.
+    pub fn color_index(&self) -> Option<usize> {
+        self.custom_color.is_none().then_some(self.color_idx)
     }
 
+    /// The colour new strokes are drawn in, and the one the toolbar's swatch
+    /// shows.
+    ///
+    /// A picked colour wins over the palette until a swatch is chosen again:
+    /// the two are one setting, which is what makes the picker's feedback the
+    /// swatch changing rather than a readout of its own.
     pub fn color(&self) -> (f64, f64, f64) {
-        PALETTE[self.color_idx.min(PALETTE.len() - 1)]
+        self.custom_color
+            .unwrap_or_else(|| PALETTE[self.color_idx.min(PALETTE.len() - 1)])
     }
 
     pub fn width(&self) -> f64 {
@@ -278,6 +305,9 @@ impl Annotator {
     pub fn set_color_index(&mut self, index: usize) {
         if index < PALETTE.len() {
             self.color_idx = index;
+            // Choosing a swatch supersedes a picked colour. Keeping both would
+            // leave the popup ticking a swatch that is not the colour in use.
+            self.custom_color = None;
         }
     }
 
@@ -288,6 +318,15 @@ impl Annotator {
     /// True when there is anything worth baking or undoing.
     pub fn has_content(&self) -> bool {
         !self.strokes.is_empty() || self.editing.is_some()
+    }
+
+    /// How many strokes have been committed.
+    ///
+    /// The overlay's tests use it to check that a pick draws nothing;
+    /// `has_content` is the question the runtime asks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn stroke_count(&self) -> usize {
+        self.strokes.len()
     }
 
     /// Allocates the cache surface for a selection and records the screenshot
@@ -302,6 +341,46 @@ impl Annotator {
         };
         self.base = Some(base.clone());
         self.rebuild_cache();
+    }
+
+    /// Reads the screenshot's colour at a screen coordinate, makes it the
+    /// annotator's colour, and returns it as `#RRGGBB`.
+    ///
+    /// The sample comes from `base`, the same surface mosaic and blur read, so
+    /// the picker reports what the screen showed rather than whatever the
+    /// annotations have since painted over it.
+    ///
+    /// `with_data` rather than `data`: `base` is a refcounted handle shared
+    /// with the caller that began the canvas, and `data()` refuses a surface it
+    /// does not hold exclusively (`BorrowError::NonExclusive`) — which is every
+    /// surface this annotator ever sees. Reading inside the closure also means
+    /// no `Context` is created for the screenshot at all.
+    pub fn pick(&mut self, px: f64, py: f64) -> Option<String> {
+        let base = self.base.as_ref()?;
+        let (x, y) = (px.floor(), py.floor());
+        if x < 0.0 || y < 0.0 || x >= f64::from(base.width()) || y >= f64::from(base.height()) {
+            return None;
+        }
+        // The stride is cairo's, which pads rows: assuming `width * 4` reads the
+        // wrong pixel on any surface whose rows are aligned.
+        let offset = y as usize * base.stride() as usize + x as usize * 4;
+        let mut pixel = None;
+        base.with_data(|data| {
+            if let Some(bytes) = data.get(offset..offset + 4) {
+                // ARGB32 is B, G, R, A in memory order on little-endian. The
+                // screenshot is opaque, so premultiplication is a no-op and the
+                // bytes are the colour itself.
+                pixel = Some((bytes[2], bytes[1], bytes[0]));
+            }
+        })
+        .ok()?;
+        let (r, g, b) = pixel?;
+        self.custom_color = Some((
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0,
+        ));
+        Some(format!("#{r:02X}{g:02X}{b:02X}"))
     }
 
     pub fn press(&mut self, px: f64, py: f64) {
@@ -323,6 +402,12 @@ impl Annotator {
                 });
             }
             Tool::Pen => self.active = Some(stroke),
+            // A pick is not the start of a stroke: `pick` is what samples the
+            // screenshot, and discarding the stroke here is what keeps a pick
+            // out of `strokes` and out of the undo history. There is
+            // deliberately no early return above it, so this arm is the single
+            // place that decision is made.
+            Tool::Pick => {}
             Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur => {
                 // Two points so far: motion updates the second, so the shape
                 // follows the pointer from the first pixel of the drag.
@@ -352,7 +437,7 @@ impl Annotator {
                     active.points[1] = (px, py);
                 }
             }
-            Tool::Text => {}
+            Tool::Text | Tool::Pick => {}
         }
     }
 
@@ -375,7 +460,7 @@ impl Annotator {
                     self.record(active);
                 }
             }
-            Tool::Text => {}
+            Tool::Text | Tool::Pick => {}
         }
     }
 
@@ -642,6 +727,9 @@ fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str, source
         }
         Tool::Mosaic | Tool::Blur => draw_redaction(cr, stroke, source),
         Tool::Text => draw_text_stroke(cr, stroke, caret, preedit),
+        // A pick never becomes a stroke, so there is nothing to draw. The arm
+        // exists only because the tool is part of the same enum.
+        Tool::Pick => {}
     }
 }
 
@@ -1478,5 +1566,185 @@ mod tests {
         let mut a = annotator();
         a.redo();
         assert!(a.strokes.is_empty());
+    }
+
+    /// A screenshot stand-in whose bytes are known exactly, row padding
+    /// included.
+    ///
+    /// Every pixel encodes its own coordinates, so a read from the wrong place
+    /// cannot coincidentally produce the value a test expects the right place
+    /// to hold.
+    fn byte_surface(width: i32, height: i32, stride: i32) -> ImageSurface {
+        let mut data = vec![0u8; stride as usize * height as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = y as usize * stride as usize + x as usize * 4;
+                data[offset] = (x * 3) as u8; // B
+                data[offset + 1] = (y * 5) as u8; // G
+                data[offset + 2] = (x + y) as u8; // R
+                data[offset + 3] = 0xff; // opaque, so premultiplication is a no-op
+            }
+        }
+        ImageSurface::create_for_data(data, Format::ARgb32, width, height, stride)
+            .expect("byte surface")
+    }
+
+    /// Every tool is reachable from its own button id, which is what both the
+    /// button press and the hotkey resolve through.
+    #[test]
+    fn every_tool_maps_from_and_to_its_button_id() {
+        for tool in [
+            Tool::Pen,
+            Tool::Arrow,
+            Tool::Rect,
+            Tool::Ellipse,
+            Tool::Text,
+            Tool::Mosaic,
+            Tool::Blur,
+            Tool::Pick,
+        ] {
+            assert_eq!(
+                Tool::from_button(tool.button_id()),
+                Some(tool),
+                "{tool:?} is not reachable from its button id"
+            );
+        }
+        assert_eq!(Tool::from_button("tool.none"), None);
+    }
+
+    /// The picker reads the colour of the pixel under the pointer: the right
+    /// channel order, cairo's stride, and screen coordinates rather than the
+    /// crop's.
+    #[test]
+    fn a_pick_reads_the_pointed_at_pixels_colour() {
+        let (w, h) = (40, 30);
+        // Deliberately padded: a read that assumes `width * 4` addresses the
+        // wrong row here, which is the whole reason the stride is used.
+        let base = byte_surface(w, h, w * 4 + 8);
+        let mut a = Annotator::new();
+        // A canvas whose origin is not the screenshot's, so adding the crop
+        // offset would read a different pixel.
+        a.begin_canvas(Rect::new(10, 20, 20, 10), &base);
+        a.set_tool(Tool::Pick);
+
+        // B = 3x = 21, G = 5y = 25, R = x + y = 12.
+        let hex = a.pick(7.0, 5.0).expect("a pick inside the screenshot");
+        assert_eq!(hex, "#0C1915");
+        assert_eq!(
+            a.color(),
+            (12.0 / 255.0, 25.0 / 255.0, 21.0 / 255.0),
+            "the sampled pixel is not the colour the pen would use"
+        );
+        // A pointer between pixels belongs to the pixel it is over.
+        assert_eq!(a.pick(7.9, 5.9).as_deref(), Some("#0C1915"));
+
+        // The control: the pixel one column over is a different colour, so the
+        // assertion above is about reading the pointed-at pixel rather than
+        // about a screenshot that is uniform everywhere.
+        assert_eq!(a.pick(8.0, 5.0).as_deref(), Some("#0D1918"));
+    }
+
+    /// The picker samples the screenshot, not the annotated composite: a colour
+    /// that has been painted over is still the colour the screen showed.
+    #[test]
+    fn a_pick_reads_the_screenshot_under_the_annotation() {
+        let base = byte_surface(40, 30, 40 * 4);
+        let mut a = Annotator::new();
+        a.begin_canvas(Rect::new(0, 0, 40, 30), &base);
+        // Paint over the pixel that gets sampled, in a palette colour the
+        // screenshot does not contain anywhere.
+        a.set_color_index(3);
+        a.set_width(12.0);
+        a.press(9.0, 8.0);
+        a.motion(20.0, 8.0);
+        a.release(20.0, 8.0);
+        assert_eq!(a.strokes.len(), 1, "the pen stroke was not recorded");
+
+        // B = 27, G = 40, R = 17.
+        assert_eq!(
+            a.pick(9.0, 8.0).as_deref(),
+            Some("#11281B"),
+            "the picker read the composite instead of the screenshot"
+        );
+    }
+
+    /// A pick is not an edit: it draws nothing and enters no history.
+    #[test]
+    fn a_pick_draws_nothing_and_enters_no_history() {
+        let mut a = annotator();
+        a.set_tool(Tool::Pick);
+        a.press(30.0, 40.0);
+        a.motion(90.0, 100.0);
+        a.release(90.0, 100.0);
+        assert!(a.strokes.is_empty(), "a pick created a stroke");
+        assert!(!a.has_content(), "a pick counted as content to bake");
+        a.undo();
+        assert!(!a.can_redo(), "a pick entered the undo history");
+    }
+
+    /// The control for the history half: a pick sitting between an undo and a
+    /// redo leaves the branch intact, because it is not an edit.
+    #[test]
+    fn a_pick_between_undo_and_redo_keeps_the_branch() {
+        let mut a = annotator();
+        a.press(20.0, 30.0);
+        a.motion(60.0, 70.0);
+        a.release(60.0, 70.0);
+        a.undo();
+        assert!(
+            a.can_redo(),
+            "nothing was undone, so the premise does not hold"
+        );
+
+        a.set_tool(Tool::Pick);
+        assert!(a.pick(30.0, 40.0).is_some());
+        assert!(a.can_redo(), "a pick discarded the undone stroke");
+
+        a.set_tool(Tool::Pen);
+        a.redo();
+        assert_eq!(a.strokes.len(), 1, "redo did not restore the stroke");
+    }
+
+    /// A pick outside the screenshot is a miss: no colour change, and nothing
+    /// that could be pasted.
+    #[test]
+    fn a_pick_outside_the_screenshot_changes_nothing() {
+        let mut a = annotator();
+        let before = a.color();
+        assert_eq!(a.pick(-1.0, 5.0), None, "a negative x read some pixel");
+        assert_eq!(a.pick(5.0, -2.0), None, "a negative y read some pixel");
+        assert_eq!(
+            a.pick(400.0, 5.0),
+            None,
+            "x = width is past the last column"
+        );
+        assert_eq!(a.pick(5.0, 300.0), None, "y = height is past the last row");
+        assert_eq!(a.color(), before, "a miss recoloured the pen");
+    }
+
+    /// A picked colour replaces the palette selection, and choosing a swatch
+    /// replaces the picked colour: one setting, not two.
+    #[test]
+    fn a_picked_colour_supersedes_the_palette_until_a_swatch_is_chosen() {
+        let mut a = annotator();
+        a.set_color_index(3);
+        assert_eq!(a.color(), PALETTE[3]);
+        assert_eq!(a.color_index(), Some(3));
+
+        assert_eq!(a.pick(30.0, 40.0).as_deref(), Some("#E6E6E6"));
+        assert_eq!(
+            a.color_index(),
+            None,
+            "the colour popup would tick a swatch that is not the colour in use"
+        );
+        assert_eq!(a.color(), (230.0 / 255.0, 230.0 / 255.0, 230.0 / 255.0));
+
+        a.set_color_index(1);
+        assert_eq!(
+            a.color(),
+            PALETTE[1],
+            "a swatch did not clear the picked colour"
+        );
+        assert_eq!(a.color_index(), Some(1), "the popup lost its tick");
     }
 }

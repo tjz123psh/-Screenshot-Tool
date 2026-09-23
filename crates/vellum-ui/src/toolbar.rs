@@ -215,6 +215,11 @@ pub const ANNOTATE_BUTTONS: &[ButtonSpec] = &[
     // why they are their own tools rather than a style of the rectangle.
     spec("tool.mosaic", "马赛克", "m", "M"),
     spec("tool.blur", "模糊", "g", "G"),
+    // A tool, so it sits with the tools: the bar groups as finish / tools /
+    // settings / history, and appending this after 完成 would put a tool on the
+    // far side of the primary action. `i` for 吸管, the one letter the tool
+    // hotkeys had left.
+    spec("tool.pick", "取色", "i", "I"),
     spec("anno.color", "颜色", "c", "C"),
     // "大小" and not "粗细": this control carries the size of whatever tool is
     // active, which is a font size for the text tool and a line weight for the
@@ -796,6 +801,41 @@ mod tests {
         assert_eq!(button.hotkey, "w", "the hotkey is part of the contract");
     }
 
+    /// The picker is a tool, so it sits with the tools rather than after 完成,
+    /// and it is labelled and keyed as designed.
+    ///
+    /// Pinned as literals rather than read back from the table: a test that
+    /// asserts `table[i].id == table[i].id` passes with every label and hotkey
+    /// replaced by nonsense.
+    #[test]
+    fn the_pick_button_is_a_tool_labelled_and_keyed_for_an_eyedropper() {
+        let index = ANNOTATE_BUTTONS
+            .iter()
+            .position(|button| button.id == "tool.pick")
+            .expect("the picker button exists");
+        let button = ANNOTATE_BUTTONS[index];
+        assert_eq!(button.label, "取色");
+        assert_eq!(button.hotkey, "i", "i for 吸管");
+        assert_eq!(
+            ANNOTATE_BUTTONS.len(),
+            13,
+            "the annotation bar now carries thirteen buttons"
+        );
+
+        let done = ANNOTATE_BUTTONS
+            .iter()
+            .position(|button| button.id == "anno.done")
+            .expect("the done button exists");
+        assert!(
+            index < done,
+            "the picker landed after 完成, which is the bar's primary action"
+        );
+        assert!(
+            ANNOTATE_BUTTONS[index - 1].id == "tool.blur",
+            "the picker is not with the other tools"
+        );
+    }
+
     /// The annotate bar's hotkeys are pinned the same way.
     #[test]
     fn the_annotate_hotkeys_are_the_documented_ones() {
@@ -808,6 +848,7 @@ mod tests {
             ("x", "tool.text"),
             ("m", "tool.mosaic"),
             ("g", "tool.blur"),
+            ("i", "tool.pick"),
             ("c", "anno.color"),
             ("w", "anno.width"),
             ("u", "anno.undo"),

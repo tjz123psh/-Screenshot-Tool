@@ -36,6 +36,7 @@ use gtk4::{
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::geom::Rect;
 use vellum_core::image::Rgb8;
+use vellum_core::io::ClipboardError;
 
 use crate::annotate::{Annotator, PALETTE, Tool};
 use crate::imaging;
@@ -355,7 +356,7 @@ fn connect_pointer(
             let mut state = press_state.borrow_mut();
             state.mark_activity();
             if state.annotating {
-                action = annotate_press(&mut state, button, x, y);
+                action = annotate_press(&mut state, button, x, y, &vellum_core::io::copy_text);
             } else if button == 3 {
                 state.selector.clear();
                 state.annotator = Annotator::new();
@@ -439,7 +440,17 @@ fn connect_pointer(
 
 /// Pointer press while annotating. Popup first, then the annotate toolbar, then
 /// the canvas, and only inside the selection.
-fn annotate_press(state: &mut State, button: u32, x: f64, y: f64) -> Option<String> {
+///
+/// `copy` is the clipboard write the picker needs, injected so a test can see
+/// the exact text that reaches it; the overlay passes
+/// `vellum_core::io::copy_text`.
+fn annotate_press(
+    state: &mut State,
+    button: u32,
+    x: f64,
+    y: f64,
+    copy: &dyn Fn(&str) -> Result<(), ClipboardError>,
+) -> Option<String> {
     if let Some(popup) = state.popup {
         // No re-layout here: hit testing reuses the bounds the draw handler
         // computed. A popup only exists because the user already clicked a
@@ -473,9 +484,35 @@ fn annotate_press(state: &mut State, button: u32, x: f64, y: f64) -> Option<Stri
         return Some(button.id().to_string());
     }
     if button == 1 && state.selector.rect.contains(x, y) {
-        state.annotator.press(x, y);
+        if state.annotator.tool() == Tool::Pick {
+            pick_color(state, x, y, copy);
+        } else {
+            state.annotator.press(x, y);
+        }
     }
     None
+}
+
+/// Samples the screenshot under the pointer, makes it the annotation colour,
+/// and puts its `#RRGGBB` on the clipboard.
+///
+/// Both halves are the point of the tool: the colour is what the pen will use
+/// next, and the text is what the user pastes into an editor. A clipboard that
+/// refuses the copy — no `wl-clipboard`, no compositor — still leaves the
+/// colour taken, which is the half the overlay can show. Nothing is reported on
+/// failure either: the overlay is on the compositor's Overlay layer with an
+/// exclusive grab, so a desktop notification would land underneath it and be
+/// invisible, and the design deliberately has no readout of its own.
+fn pick_color(
+    state: &mut State,
+    x: f64,
+    y: f64,
+    copy: &dyn Fn(&str) -> Result<(), ClipboardError>,
+) {
+    let Some(hex) = state.annotator.pick(x, y) else {
+        return;
+    };
+    let _ = copy(&hex);
 }
 
 /// The overlay's input-method bridge.
@@ -1357,7 +1394,9 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
             for (index, bounds) in layout.items.iter().enumerate() {
                 let (r, g, b) = PALETTE[index];
                 paint::fill_rounded(cr, *bounds, 8.0, (r, g, b, 1.0));
-                if index == selected {
+                // No tick at all while a picked colour is in use: ticking a
+                // swatch would claim a colour the pen is not drawing in.
+                if selected == Some(index) {
                     // Tick in white: readable on every palette entry including
                     // the near-black one.
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
@@ -2174,5 +2213,250 @@ mod tests {
                 "the input method stayed attached after the label was committed"
             );
         });
+    }
+
+    /// The screenshot the picker tests sample: one flat colour, plus a single
+    /// pixel of another colour at the point a pick lands on.
+    ///
+    /// Two colours rather than a flat fill, so a pick that returned a constant
+    /// or read the wrong pixel cannot produce the value the test expects.
+    const BG_FILL: (f64, f64, f64) = (0.0, 0.6, 1.0); // -> #0099FF
+    const BG_MARK: (f64, f64, f64) = (1.0, 0.6, 0.0); // -> #FF9900
+
+    fn paint_screenshot(state: &State, mark: (f64, f64)) {
+        let cr = Context::new(&state.bg).expect("cairo context");
+        cr.set_source_rgb(BG_FILL.0, BG_FILL.1, BG_FILL.2);
+        let _ = cr.paint();
+        cr.set_source_rgb(BG_MARK.0, BG_MARK.1, BG_MARK.2);
+        cr.rectangle(mark.0, mark.1, 1.0, 1.0);
+        let _ = cr.fill();
+    }
+
+    /// A press with the picker does both halves of the job at once: the colour
+    /// reaches the clipboard as `#RRGGBB` and becomes the annotation colour,
+    /// while the canvas stays untouched.
+    #[test]
+    fn a_pick_press_copies_the_hex_and_recolours_the_pen() {
+        let mut state = overlay_state(true);
+        state.annotating = true;
+        let rect = state.selector.rect;
+        let point = (f64::from(rect.x) + 7.0, f64::from(rect.y) + 5.0);
+        paint_screenshot(&state, point);
+        let bg = state.bg.clone();
+        state.annotator.begin_canvas(rect, &bg);
+        state.annotator.set_tool(Tool::Pick);
+
+        let copied = RefCell::new(Vec::new());
+        let copy = |text: &str| -> Result<(), ClipboardError> {
+            copied.borrow_mut().push(text.to_string());
+            Ok(())
+        };
+        assert!(
+            annotate_press(&mut state, 1, point.0, point.1, &copy).is_none(),
+            "a pick is not a toolbar action, so it must not leave the overlay"
+        );
+        assert_eq!(
+            copied.borrow().clone(),
+            vec!["#FF9900".to_string()],
+            "the picked colour did not reach the clipboard as #RRGGBB"
+        );
+        assert_eq!(
+            state.annotator.color(),
+            BG_MARK,
+            "the picked colour is not the colour the pen will use"
+        );
+        assert!(
+            state.annotating,
+            "a pick left annotate mode instead of staying in the overlay"
+        );
+        assert_eq!(
+            state.annotator.tool(),
+            Tool::Pick,
+            "the picker did not stay active, so a second pick needs the tool chosen again"
+        );
+        assert_eq!(
+            state.annotator.stroke_count(),
+            0,
+            "a pick drew something on the canvas"
+        );
+        assert!(!state.annotator.has_content(), "a pick counted as content");
+
+        // The control: one pixel over, the screenshot is the flat fill, so the
+        // exact colour above is about reading the pointed-at pixel and not
+        // about a background that is one colour everywhere.
+        assert_eq!(
+            state.annotator.pick(point.0 + 1.0, point.1).as_deref(),
+            Some("#0099FF"),
+            "the two pixels are not different colours, so the assertion above              proves nothing"
+        );
+    }
+
+    /// The control for the pick branch: the same press with a drawing tool
+    /// copies nothing and starts a stroke, so the branch is not simply
+    /// discarding every press on the canvas.
+    #[test]
+    fn a_drawing_press_neither_copies_nor_picks() {
+        let mut state = overlay_state(true);
+        state.annotating = true;
+        let rect = state.selector.rect;
+        let point = (f64::from(rect.x) + 7.0, f64::from(rect.y) + 5.0);
+        paint_screenshot(&state, point);
+        let bg = state.bg.clone();
+        state.annotator.begin_canvas(rect, &bg);
+        assert_eq!(
+            state.annotator.tool(),
+            Tool::Pen,
+            "the premise: no tool was chosen, so the pen is active"
+        );
+
+        let copied = RefCell::new(Vec::new());
+        let copy = |text: &str| -> Result<(), ClipboardError> {
+            copied.borrow_mut().push(text.to_string());
+            Ok(())
+        };
+        assert!(annotate_press(&mut state, 1, point.0, point.1, &copy).is_none());
+        assert!(
+            copied.borrow().is_empty(),
+            "a drawing press wrote to the clipboard"
+        );
+
+        state.annotator.motion(point.0 + 40.0, point.1);
+        state.annotator.release(point.0 + 40.0, point.1);
+        assert_eq!(
+            state.annotator.stroke_count(),
+            1,
+            "the pen press did not start a stroke"
+        );
+    }
+
+    /// The boundary of the pick: a press inside the selection but past the edge
+    /// of the screenshot copies nothing.
+    ///
+    /// The control is the first press in the same test: the same selection and
+    /// the same clipboard closure do copy when the point is over a pixel, so
+    /// the miss below is a real edge rather than a closure that never runs.
+    #[test]
+    fn a_pick_past_the_screenshot_copies_nothing() {
+        let mut state = overlay_state(true);
+        state.annotating = true;
+        // A screenshot smaller than the selection, so part of the canvas is
+        // outside it.
+        state.bg = ImageSurface::create(cairo::Format::ARgb32, 100, 80).expect("small screenshot");
+        let rect = state.selector.rect;
+        let bg = state.bg.clone();
+        state.annotator.begin_canvas(rect, &bg);
+        state.annotator.set_tool(Tool::Pick);
+
+        let copied = RefCell::new(Vec::new());
+        let copy = |text: &str| -> Result<(), ClipboardError> {
+            copied.borrow_mut().push(text.to_string());
+            Ok(())
+        };
+
+        let hit = (f64::from(rect.x) + 7.0, f64::from(rect.y) + 5.0);
+        annotate_press(&mut state, 1, hit.0, hit.1, &copy);
+        assert_eq!(
+            copied.borrow().len(),
+            1,
+            "the control press did not copy, so the miss below proves nothing"
+        );
+
+        // Inside the selection, past the screenshot's last row and column.
+        annotate_press(&mut state, 1, hit.0 + 60.0, hit.1, &copy);
+        annotate_press(&mut state, 1, hit.0, hit.1 + 40.0, &copy);
+        assert_eq!(
+            copied.borrow().len(),
+            1,
+            "a pick past the screenshot still copied {:?}",
+            copied.borrow()
+        );
+    }
+
+    /// `i` selects the picker while annotating, and the key is swallowed so it
+    /// cannot reach the compositor under the exclusive grab.
+    #[test]
+    fn the_eyedropper_hotkey_selects_the_picker() {
+        let mut state = overlay_state(true);
+        state.annotating = true;
+        // The buttons only exist once the bar has been laid out, which is what
+        // `by_hotkey` searches.
+        let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        let rect = state.selector.rect;
+        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+
+        let mut action = None;
+        assert!(
+            annotate_key(&mut state, Key::i, ModifierType::empty(), &mut action),
+            "the hotkey was not swallowed"
+        );
+        assert_eq!(action.as_deref(), Some("tool.pick"));
+    }
+
+    /// Near-white pixels inside a swatch, which is what the selected mark is
+    /// drawn in: the tick is white so it reads on every palette entry.
+    fn tick_pixels(swatch: Bounds, surface: &mut ImageSurface) -> usize {
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface pixels");
+        let mut count = 0;
+        // Inset, so the swatch's rounded corners blending into the slab behind
+        // it cannot be mistaken for ink.
+        for y in (swatch.y as usize + 4)..(swatch.y as usize + swatch.h as usize - 4) {
+            for x in (swatch.x as usize + 4)..(swatch.x as usize + swatch.w as usize - 4) {
+                let offset = y * stride + x * 4;
+                let (b, g, r) = (data[offset], data[offset + 1], data[offset + 2]);
+                if r > 200 && g > 200 && b > 200 {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// The colour popup marks the palette entry in use, and marks nothing at all
+    /// while a picked colour is: a tick on a swatch is a claim about the colour
+    /// the pen draws in, and after a pick no swatch is that colour.
+    #[test]
+    fn the_colour_popup_ticks_a_swatch_only_while_the_palette_is_in_use() {
+        fn ticks(state: &State, swatch: Bounds) -> usize {
+            let mut surface =
+                ImageSurface::create(cairo::Format::ARgb32, 400, 300).expect("surface");
+            {
+                let cr = Context::new(&surface).expect("cairo context");
+                draw_popup(state, &cr, Popup::Color);
+            }
+            tick_pixels(swatch, &mut surface)
+        }
+
+        let mut state = overlay_state(true);
+        let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        let rect = state.selector.rect;
+        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        // The near-black entry: a white tick on it cannot be missed.
+        let swatch = popup_layout(&state, Popup::Color).expect("layout").items[4];
+
+        // The control: while the palette is in use the mark is there, so the
+        // measurement below can see one at all.
+        state.annotator.set_color_index(4);
+        assert!(
+            ticks(&state, swatch) > 0,
+            "the selected swatch carries no mark, so this measurement proves nothing"
+        );
+
+        let bg = state.bg.clone();
+        state.annotator.begin_canvas(rect, &bg);
+        assert!(state.annotator.pick(70.0, 60.0).is_some());
+        assert_eq!(
+            state.annotator.color_index(),
+            None,
+            "the premise: no palette entry is in use after a pick"
+        );
+        assert_eq!(
+            ticks(&state, swatch),
+            0,
+            "a swatch is ticked while the pen draws in a picked colour"
+        );
     }
 }
