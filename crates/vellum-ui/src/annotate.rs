@@ -24,14 +24,15 @@ pub const PALETTE: [(f64, f64, f64); 6] = [
     (0.98, 0.98, 0.99),
 ];
 
-pub const WIDTHS: [f64; 4] = [2.0, 4.0, 7.0, 11.0];
-
-/// Label font sizes offered by the 大小 popup while the text tool is active.
+/// Range the size slider covers for the drawing tools, in stroke pixels.
 ///
-/// Discrete steps because that is what the popup can express, and it keeps the
-/// size in the same place as every other annotation setting. The wheel stays for
-/// continuous adjustment.
-pub const TEXT_SIZES: [f64; 6] = [12.0, 16.0, 24.0, 32.0, 48.0, 64.0];
+/// A range rather than the four presets this used to offer: the control is a
+/// slider now, so there is nothing left for presets to do.
+pub const WIDTH_RANGE: (f64, f64) = (1.0, 24.0);
+/// The stroke width a fresh session starts at, matching the old middle preset.
+pub const DEFAULT_WIDTH: f64 = 4.0;
+/// Range the size slider covers for the text tool, in type pixels.
+pub const TEXT_SIZE_RANGE: (f64, f64) = (10.0, 120.0);
 
 /// Minimum squared pointer movement before a pen point is recorded. GTK reports
 /// motion faster than the compositor repaints, and every extra point costs
@@ -45,9 +46,6 @@ const MIN_DRAG: f64 = 2.0;
 /// set explicitly. This is the original behaviour: a thin pen gave 12 px text and
 /// the widest gave 44 px.
 const TEXT_SIZE_PER_WIDTH: f64 = 4.0;
-/// Legibility floor and a ceiling that still fits inside a selection.
-const MIN_TEXT_SIZE: f64 = 12.0;
-const MAX_TEXT_SIZE: f64 = 200.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -112,7 +110,9 @@ struct TextEdit {
 pub struct Annotator {
     tool: Tool,
     color_idx: usize,
-    width_idx: usize,
+    /// Stroke width in pixels. Continuous: the size slider sets it directly, so
+    /// there is no index to step through any more.
+    width: f64,
     /// Font size for the next label, or `None` to follow the stroke width.
     ///
     /// `None` is the historical behaviour and stays the default, so nothing
@@ -137,7 +137,7 @@ impl Annotator {
         Self {
             tool: Tool::Pen,
             color_idx: 0,
-            width_idx: 1,
+            width: DEFAULT_WIDTH,
             text_size: None,
             strokes: Vec::new(),
             active: None,
@@ -163,27 +163,80 @@ impl Annotator {
         self.color_idx
     }
 
-    pub fn width_index(&self) -> usize {
-        self.width_idx
-    }
-
     pub fn color(&self) -> (f64, f64, f64) {
         PALETTE[self.color_idx.min(PALETTE.len() - 1)]
     }
 
     pub fn width(&self) -> f64 {
-        WIDTHS[self.width_idx.min(WIDTHS.len() - 1)]
+        self.width
+    }
+
+    /// Sets the stroke width, continuously.
+    pub fn set_width(&mut self, px: f64) {
+        self.width = px.clamp(WIDTH_RANGE.0, WIDTH_RANGE.1);
+    }
+
+    /// The range the size slider covers for the active tool.
+    ///
+    /// One control, two quantities: the same slider is the line weight for a
+    /// drawing tool and the type size for text. Keeping the range in one place
+    /// means the popup never has to know which tool is active.
+    pub fn size_range(&self) -> (f64, f64) {
+        if self.tool == Tool::Text {
+            TEXT_SIZE_RANGE
+        } else {
+            WIDTH_RANGE
+        }
+    }
+
+    /// The active tool's size, which is what the slider shows.
+    pub fn size(&self) -> f64 {
+        if self.tool == Tool::Text {
+            self.text_size()
+        } else {
+            self.width()
+        }
+    }
+
+    /// Sets the active tool's size.
+    pub fn set_size(&mut self, value: f64) {
+        if self.tool == Tool::Text {
+            self.set_text_size(value);
+        } else {
+            self.set_width(value);
+        }
+    }
+
+    /// Where the slider sits: 0.0 at the low end of the range, 1.0 at the high.
+    pub fn size_fraction(&self) -> f64 {
+        let (lo, hi) = self.size_range();
+        if hi <= lo {
+            return 0.0;
+        }
+        ((self.size() - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+
+    /// Moves the slider to a fraction of its range.
+    pub fn set_size_fraction(&mut self, fraction: f64) {
+        let (lo, hi) = self.size_range();
+        self.set_size(lo + (hi - lo) * fraction.clamp(0.0, 1.0));
+    }
+
+    /// Moves the slider by a fraction of its range. This is what the wheel does.
+    pub fn nudge_size(&mut self, delta: f64) {
+        self.set_size_fraction(self.size_fraction() + delta);
     }
 
     /// The font size a new label will use.
     pub fn text_size(&self) -> f64 {
-        self.text_size
-            .unwrap_or_else(|| (self.width() * TEXT_SIZE_PER_WIDTH).max(MIN_TEXT_SIZE))
+        self.text_size.unwrap_or_else(|| {
+            (self.width * TEXT_SIZE_PER_WIDTH).clamp(TEXT_SIZE_RANGE.0, TEXT_SIZE_RANGE.1)
+        })
     }
 
     /// Sets the label font size, decoupling it from the stroke width.
     pub fn set_text_size(&mut self, px: f64) {
-        let size = px.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+        let size = px.clamp(TEXT_SIZE_RANGE.0, TEXT_SIZE_RANGE.1);
         self.text_size = Some(size);
         // Resize the label being typed as well, so an adjustment is visible while
         // the user is looking at the text rather than only on the next label.
@@ -192,32 +245,9 @@ impl Annotator {
         }
     }
 
-    /// Grows or shrinks the label font size. This is what the wheel does over the
-    /// canvas while the text tool is active.
-    pub fn nudge_text_size(&mut self, delta: f64) {
-        self.set_text_size(self.text_size() + delta);
-    }
-
-    /// The entry in `TEXT_SIZES` closest to the current size, so the popup can
-    /// show which step is in effect even after the wheel moved off a step.
-    pub fn text_size_index(&self) -> usize {
-        let current = self.text_size();
-        TEXT_SIZES
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| (*a - current).abs().total_cmp(&(*b - current).abs()))
-            .map_or(0, |(index, _)| index)
-    }
-
     pub fn set_color_index(&mut self, index: usize) {
         if index < PALETTE.len() {
             self.color_idx = index;
-        }
-    }
-
-    pub fn set_width_index(&mut self, index: usize) {
-        if index < WIDTHS.len() {
-            self.width_idx = index;
         }
     }
 
@@ -785,25 +815,109 @@ mod tests {
         assert_eq!(a.caret_anchor(), None, "a finished label has no caret");
     }
 
+    /// The slider's range depends on the tool, and the size it reports is that
+    /// tool's own quantity: a line weight for a drawing tool, type size for text.
+    #[test]
+    fn the_size_slider_covers_the_active_tools_own_quantity() {
+        let mut a = annotator();
+        a.set_tool(Tool::Pen);
+        assert_eq!(a.size_range(), WIDTH_RANGE);
+        a.set_size(9.0);
+        assert_eq!(a.width(), 9.0, "the pen width is what the slider set");
+        assert_eq!(a.size(), 9.0);
+
+        a.set_tool(Tool::Text);
+        assert_eq!(a.size_range(), TEXT_SIZE_RANGE);
+        assert_eq!(a.text_size(), 36.0, "a 9 px pen defaults to 36 px type");
+        a.set_size(50.0);
+        assert_eq!(a.text_size(), 50.0);
+        assert_eq!(
+            a.width(),
+            9.0,
+            "setting the type size must not move the pen"
+        );
+    }
+
+    /// A fraction maps to the ends and the middle of the range, and back again.
+    #[test]
+    fn the_slider_fraction_round_trips() {
+        let mut a = annotator();
+        a.set_tool(Tool::Pen);
+        let (lo, hi) = a.size_range();
+
+        a.set_size_fraction(0.0);
+        assert_eq!(a.width(), lo);
+        a.set_size_fraction(1.0);
+        assert_eq!(a.width(), hi);
+        a.set_size_fraction(0.5);
+        assert_eq!(a.width(), (lo + hi) / 2.0);
+        assert!((a.size_fraction() - 0.5).abs() < 1e-9);
+    }
+
+    /// Out-of-range input clamps rather than escaping the slider.
+    #[test]
+    fn the_slider_clamps_at_both_ends() {
+        let mut a = annotator();
+        a.set_tool(Tool::Pen);
+        let (lo, hi) = a.size_range();
+        a.set_size_fraction(-3.0);
+        assert_eq!(a.width(), lo);
+        assert_eq!(a.size_fraction(), 0.0);
+        a.set_size_fraction(4.0);
+        assert_eq!(a.width(), hi);
+        assert_eq!(a.size_fraction(), 1.0);
+    }
+
+    /// The wheel steers the same slider, so it is no longer text-only.
+    #[test]
+    fn the_wheel_moves_the_slider_for_any_tool() {
+        let mut a = annotator();
+        a.set_tool(Tool::Rect);
+        let before = a.width();
+        a.nudge_size(0.1);
+        assert!(
+            a.width() > before,
+            "the wheel did not widen the rectangle pen"
+        );
+
+        a.set_tool(Tool::Text);
+        let before = a.text_size();
+        a.nudge_size(0.1);
+        assert!(a.text_size() > before, "the wheel did not grow the label");
+    }
+
+    /// The stroke width is continuous now, not one of four presets.
+    #[test]
+    fn the_stroke_width_is_continuous() {
+        let mut a = annotator();
+        a.set_size(6.3);
+        assert_eq!(a.width(), 6.3);
+        assert!(
+            WIDTH_RANGE.0 < 6.3 && 6.3 < WIDTH_RANGE.1,
+            "the value must be inside the slider range"
+        );
+    }
+
     /// Until the size is set explicitly, a label is sized from the stroke width
     /// exactly as before, so the default look does not change.
     #[test]
     fn a_label_follows_the_stroke_width_until_the_size_is_set() {
         let mut a = annotator();
-        a.set_width_index(1);
+        a.set_width(4.0);
         assert_eq!(a.text_size(), 16.0, "a 4 px pen used to give 16 px text");
-        a.set_width_index(3);
+        a.set_width(11.0);
         assert_eq!(a.text_size(), 44.0, "an 11 px pen used to give 44 px text");
     }
 
-    /// The size is now adjustable on its own, so a thin pen can carry large text.
+    /// The type size stays adjustable on its own, so a thin pen can carry large
+    /// text once the slider has been moved while the text tool was active.
     #[test]
     fn the_label_size_is_independent_of_the_pen_width() {
         let mut a = annotator();
-        a.set_width_index(0);
+        a.set_width(2.0);
         a.set_text_size(64.0);
         assert_eq!(a.text_size(), 64.0);
-        a.set_width_index(3);
+        a.set_width(11.0);
         assert_eq!(
             a.text_size(),
             64.0,
@@ -812,21 +926,21 @@ mod tests {
     }
 
     #[test]
-    fn the_label_size_is_clamped_to_a_legible_range() {
+    fn the_label_size_is_clamped_to_the_slider_range() {
         let mut a = annotator();
         a.set_text_size(1.0);
-        assert_eq!(a.text_size(), MIN_TEXT_SIZE);
+        assert_eq!(a.text_size(), TEXT_SIZE_RANGE.0);
         a.set_text_size(10_000.0);
-        assert_eq!(a.text_size(), MAX_TEXT_SIZE);
+        assert_eq!(a.text_size(), TEXT_SIZE_RANGE.1);
     }
 
-    /// The wheel resizes what the user is looking at, not only the next label.
+    /// The slider resizes what the user is looking at, not only the next label.
     #[test]
     fn adjusting_the_size_resizes_the_label_being_typed() {
         let mut a = annotator();
         a.set_tool(Tool::Text);
         a.press(40.0, 60.0);
-        a.set_text_size(MIN_TEXT_SIZE);
+        a.set_text_size(TEXT_SIZE_RANGE.0);
         a.type_str("MMMM");
         let small = rightmost_ink(&a);
 
@@ -836,28 +950,6 @@ mod tests {
             large > small,
             "growing the size did not widen the label being typed ({small} -> {large})"
         );
-    }
-
-    /// Resizing for the next label must not redraw one already placed.
-    ///
-    /// This is why the size is stored per stroke: deriving it from the annotator
-    /// at draw time would resize every past label the moment the setting changed,
-    /// including on each cache replay after an undo.
-    /// The popup highlights the nearest step, so a wheel detour between steps
-    /// still shows which entry is in effect.
-    #[test]
-    fn the_size_index_snaps_to_the_nearest_step() {
-        let mut a = annotator();
-        a.set_text_size(24.0);
-        assert_eq!(a.text_size_index(), 2);
-
-        a.nudge_text_size(3.0);
-        assert_eq!(a.text_size(), 27.0);
-        assert_eq!(a.text_size_index(), 2, "27 is nearest to 24");
-
-        a.nudge_text_size(6.0);
-        assert_eq!(a.text_size(), 33.0);
-        assert_eq!(a.text_size_index(), 3, "33 is nearest to 32");
     }
 
     #[test]

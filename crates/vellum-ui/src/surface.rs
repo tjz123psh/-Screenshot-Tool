@@ -37,7 +37,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::geom::Rect;
 use vellum_core::image::Rgb8;
 
-use crate::annotate::{Annotator, PALETTE, TEXT_SIZES, Tool, WIDTHS};
+use crate::annotate::{Annotator, PALETTE, Tool};
 use crate::imaging;
 use crate::paint::{self, Bounds};
 use crate::recorder::{SelectionPanelNotice, selection_panel_notice};
@@ -55,8 +55,11 @@ const IDLE_POLL_S: u32 = 5;
 /// Grace period after a focus loss before cancelling, in case focus comes back.
 const FOCUS_GRACE_MS: u32 = 10_000;
 
-/// Font-size change per wheel notch for an annotation label, in pixels.
-const TEXT_SIZE_WHEEL_STEP: f64 = 2.0;
+/// Size change per wheel notch, as a fraction of the active tool's range.
+///
+/// A fraction rather than pixels so one constant suits both ranges: a notch is
+/// about half a pixel of stroke or two and a half of type.
+const SIZE_WHEEL_STEP: f64 = 0.02;
 
 const DIM: (f64, f64, f64, f64) = (0.025, 0.03, 0.045, 0.56);
 /// Selection accent: indigo #4F46E5, the token the design system names.
@@ -100,12 +103,18 @@ pub type ResultHandler = Rc<dyn Fn(Outcome)>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Popup {
     Color,
-    Width,
-    /// Label font sizes, shown by the same 大小 button while the text tool is
-    /// active. A separate variant rather than a polymorphic `Width`, so what the
-    /// popup contains is decided in one place instead of being implied by the
-    /// active tool at every site that reads it.
-    TextSize,
+    /// The size slider. One control for the active tool: it is the line weight
+    /// for a drawing tool and the type size for text, and the annotator owns the
+    /// range, so nothing here has to know which tool is selected.
+    Size,
+}
+
+/// What a press inside a popup landed on.
+enum PopupHit {
+    /// One of the colour swatches.
+    Color(usize),
+    /// A position along the size slider, as a fraction of its range.
+    Size(f64),
 }
 
 struct State {
@@ -118,6 +127,9 @@ struct State {
     annotator: Annotator,
     annotating: bool,
     popup: Option<Popup>,
+    /// True while the size slider is being dragged, so motion keeps steering it
+    /// after the press that started the drag.
+    slider: bool,
     hover: Option<String>,
     long_shot: bool,
     daemon_managed: bool,
@@ -160,6 +172,7 @@ pub fn present(
         annotator: Annotator::new(),
         annotating: false,
         popup: None,
+        slider: false,
         hover: None,
         long_shot,
         daemon_managed,
@@ -304,11 +317,13 @@ fn connect_scroll(canvas: &DrawingArea, state: &Rc<RefCell<State>>, emitter: &Rc
         {
             let mut state = scroll_state.borrow_mut();
             state.mark_activity();
-            if !state.annotating || state.annotator.tool() != Tool::Text {
+            if !state.annotating {
                 return glib::Propagation::Proceed;
             }
-            // Scrolling up enlarges, which is the convention everywhere else.
-            state.annotator.nudge_text_size(-dy * TEXT_SIZE_WHEEL_STEP);
+            // Scrolling up enlarges, which is the convention everywhere else, and
+            // it steers the same slider the 大小 popup shows for whichever tool is
+            // active.
+            state.annotator.nudge_size(-dy * SIZE_WHEEL_STEP);
         }
         scroll_emitter.queue_draw();
         glib::Propagation::Stop
@@ -371,7 +386,12 @@ fn connect_pointer(
         {
             let mut state = release_state.borrow_mut();
             state.mark_activity();
-            if state.annotating {
+            let was_slider = state.slider;
+            state.slider = false;
+            if was_slider {
+                // The press belonged to the size slider, so this release ends a
+                // drag rather than a stroke.
+            } else if state.annotating {
                 state.annotator.release(x, y);
             } else {
                 let was_selecting = state.selector.mode == Mode::Selecting;
@@ -396,7 +416,15 @@ fn connect_pointer(
         {
             let mut state = motion_state.borrow_mut();
             state.mark_activity();
-            if state.annotating {
+            if state.slider {
+                // Dragging the size slider: steer it from the pointer's x, and do
+                // not let the same motion also draw a stroke or move the selection.
+                let rail = popup_layout(&state, Popup::Size).map(|layout| layout.rail);
+                if let Some(rail) = rail {
+                    let fraction = ((x - rail.x) / rail.w).clamp(0.0, 1.0);
+                    state.annotator.set_size_fraction(fraction);
+                }
+            } else if state.annotating {
                 state.hover = state.anno_toolbar.hit(x, y).map(|b| b.id().to_string());
                 state.annotator.motion(x, y);
             } else {
@@ -417,13 +445,21 @@ fn annotate_press(state: &mut State, button: u32, x: f64, y: f64) -> Option<Stri
         // computed. A popup only exists because the user already clicked a
         // button on the drawn bar, so those bounds are current by construction,
         // and a press handler has no cairo context to measure text with anyway.
-        if let Some(index) = popup_hit(state, popup, x, y) {
-            match popup {
-                Popup::Color => state.annotator.set_color_index(index),
-                Popup::Width => state.annotator.set_width_index(index),
-                Popup::TextSize => state.annotator.set_text_size(TEXT_SIZES[index]),
+        if let Some(hit) = popup_hit(state, popup, x, y) {
+            match hit {
+                PopupHit::Color(index) => {
+                    state.annotator.set_color_index(index);
+                    // A colour is a one-shot choice, so the popup closes.
+                    state.popup = None;
+                }
+                PopupHit::Size(fraction) => {
+                    // The slider stays open: the drag has to be able to continue
+                    // past the press, and the value is worth comparing against the
+                    // canvas before committing to it.
+                    state.annotator.set_size_fraction(fraction);
+                    state.slider = true;
+                }
             }
-            state.popup = None;
             return None;
         }
         if let Some(button) = state.anno_toolbar.hit(x, y) {
@@ -696,8 +732,7 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
         }
         "anno.width" => {
             let mut state = state.borrow_mut();
-            let wanted = width_popup_for(state.annotator.tool());
-            state.popup = (state.popup != Some(wanted)).then_some(wanted);
+            state.popup = (state.popup != Some(Popup::Size)).then_some(Popup::Size);
             return;
         }
         _ => {}
@@ -827,11 +862,7 @@ fn draw(state: &mut State, cr: &Context) {
 
     draw_selection_frame(cr, rect);
 
-    // The font size is only meaningful for the text tool, so it appears with the
-    // tool rather than as permanent clutter.
-    let label_size = (state.annotating && state.annotator.tool() == Tool::Text)
-        .then(|| state.annotator.text_size());
-    draw_size_hint(cr, rect, label_size);
+    draw_size_hint(cr, rect);
     if state.long_shot {
         let notice = selection_panel_notice(rect, (state.screen_w, state.screen_h));
         draw_longshot_handoff_hint(cr, notice, state.daemon_managed, sw, sh);
@@ -982,14 +1013,11 @@ fn draw_selection_handles(cr: &Context, rect: Rect) {
 /// Same material as the toolbar slab (crystal gradient plus specular edge) so
 /// the overlay reads as one design rather than a bar with a floating sticker.
 ///
-/// `label_size` is the current annotation font size, shown only while the text
-/// tool is active. The wheel adjusts it and there is no toolbar button for it, so
-/// without this readout the control would be invisible.
-fn draw_size_hint(cr: &Context, rect: Rect, label_size: Option<f64>) {
-    let text = match label_size {
-        Some(size) => format!("{} × {} · 字号 {size:.0}", rect.w, rect.h),
-        None => format!("{} × {}", rect.w, rect.h),
-    };
+/// Deliberately only the selection dimensions: the size slider's position is the
+/// indicator for line weight and type size, and a second readout naming the
+/// quantity would be the kind of floating label this design avoids.
+fn draw_size_hint(cr: &Context, rect: Rect) {
+    let text = format!("{} × {}", rect.w, rect.h);
     let (tw, th) = paint::text_size(cr, SIZE_HINT_FONT, &text);
     let bw = tw + 16.0;
     let bh = th + 9.0;
@@ -1135,12 +1163,11 @@ fn draw_swatches(state: &State, cr: &Context) {
                 );
             }
             "anno.width" => {
-                // Scaled, not clamped: WIDTHS is [2, 4, 7, 11], so a plain
-                // `.min(4.0)` rendered 4, 4 and 4 for the three thickest
-                // settings and the indicator silently stopped reporting the
-                // current stroke width.
-                let width = state.annotator.width();
-                let shown = (width * 0.45).clamp(1.0, 5.0);
+                // The indicator mirrors the slider's position, so it reports the
+                // active tool's size — a line weight or a type size — rather than
+                // only the stroke width. It used to be scaled from the width
+                // alone and saturated, so the top settings all looked identical.
+                let shown = 1.0 + state.annotator.size_fraction() * 5.0;
                 paint::fill_rounded(
                     cr,
                     Bounds::new(
@@ -1160,42 +1187,36 @@ fn draw_swatches(state: &State, cr: &Context) {
 
 struct PopupLayout {
     bar: Bounds,
+    /// The slider's rail: the line the handle slides along. Zero-sized for the
+    /// colour popup.
+    rail: Bounds,
+    /// The slider's hit area.
+    ///
+    /// Wider than the rail by the handle radius at each end, because the handle
+    /// overhangs the rail at 0.0 and 1.0 and its centre — the exact point a user
+    /// aims at — would otherwise land on the rail's half-open edge and miss. That
+    /// made the top of the range unreachable by dragging.
+    grab: Bounds,
+    /// The colour swatches. Empty for the size popup.
     items: Vec<Bounds>,
 }
 
 /// Popup padding: horizontal, vertical, and the gap between entries.
 const POPUP_PAD: (f64, f64, f64) = (10.0, 9.0, 7.0);
-/// Height of the popup's heading row, and the font it is drawn in.
-///
-/// Constants rather than measurements: `popup_hit` has no cairo context and must
-/// produce exactly the geometry `draw_popup` paints, so the heading cannot be
-/// measured at draw time only.
-const POPUP_TITLE_H: f64 = 15.0;
-const POPUP_TITLE_FONT: &str = "Sans Bold 9";
-/// Space between the heading and the row of entries.
-const POPUP_TITLE_GAP: f64 = 5.0;
+/// Slider geometry. The track is thin, so the whole row is the hit target and the
+/// handle is what the eye aims at.
+const SLIDER_LEN: f64 = 190.0;
+const SLIDER_TRACK_H: f64 = 4.0;
+const SLIDER_HANDLE_R: f64 = 7.0;
 
-/// What a popup controls, as shown in its heading.
-///
-/// The 大小 button carries a different ladder per tool, so the heading is what
-/// makes the current meaning visible: a bare row of numbers reads the same
-/// whether it means px of stroke or px of type.
-fn popup_title(popup: Popup) -> &'static str {
-    match popup {
-        Popup::Color => "颜色",
-        Popup::Width => "线宽",
-        Popup::TextSize => "字号",
-    }
-}
-
-/// Popup geometry. Anchored to its own toolbar button, above when there is
-/// room, and clamped so it never leaves the output.
+/// Popup geometry. Anchored to its own toolbar button, above when there is room,
+/// and clamped so it never leaves the output.
 fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
     let id = match popup {
         Popup::Color => "anno.color",
-        // Same button as the stroke widths: the size lives with the other
-        // annotation settings rather than in a control of its own.
-        Popup::Width | Popup::TextSize => "anno.width",
+        // The size lives with the other annotation settings rather than in a
+        // control of its own.
+        Popup::Size => "anno.width",
     };
     let anchor = state
         .anno_toolbar
@@ -1204,15 +1225,22 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
         .find(|button| button.id() == id)?
         .bounds;
 
-    let (item_w, item_h, count) = match popup {
-        Popup::Color => (34.0, 34.0, PALETTE.len()),
-        Popup::Width => (64.0, 42.0, WIDTHS.len()),
-        Popup::TextSize => (40.0, 34.0, TEXT_SIZES.len()),
-    };
     let (pad_x, pad_y, gap) = POPUP_PAD;
-    let title_block = POPUP_TITLE_H + POPUP_TITLE_GAP;
-    let popup_w = pad_x * 2.0 + item_w * count as f64 + gap * (count as f64 - 1.0);
-    let popup_h = pad_y * 2.0 + title_block + item_h;
+    let (popup_w, popup_h) = match popup {
+        Popup::Color => {
+            let (item_w, item_h) = (34.0, 34.0);
+            let count = PALETTE.len();
+            (
+                pad_x * 2.0 + item_w * count as f64 + gap * (count as f64 - 1.0),
+                pad_y * 2.0 + item_h,
+            )
+        }
+        // Tall enough for the handle to sit inside the slab.
+        Popup::Size => (
+            pad_x * 2.0 + SLIDER_LEN,
+            pad_y * 2.0 + SLIDER_HANDLE_R * 2.0,
+        ),
+    };
 
     let mut bx = anchor.x + (anchor.w - popup_w) / 2.0;
     bx = bx.clamp(8.0, (f64::from(state.screen_w) - popup_w - 8.0).max(8.0));
@@ -1223,41 +1251,61 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
         anchor.y + anchor.h + 8.0
     };
 
-    let items = (0..count)
-        .map(|index| {
-            // Offset past the heading, which is painted from the bar's top edge.
-            Bounds::new(
-                bx + pad_x + (item_w + gap) * index as f64,
-                by + pad_y + title_block,
-                item_w,
-                item_h,
-            )
-        })
-        .collect();
+    let bar = Bounds::new(bx, by, popup_w, popup_h);
+    let (rail, grab) = if popup == Popup::Size {
+        let rail = Bounds::new(bx + pad_x, by + popup_h / 2.0, SLIDER_LEN, SLIDER_TRACK_H);
+        let grab = Bounds::new(
+            rail.x - SLIDER_HANDLE_R,
+            rail.y - SLIDER_HANDLE_R,
+            rail.w + SLIDER_HANDLE_R * 2.0,
+            SLIDER_HANDLE_R * 2.0,
+        );
+        (rail, grab)
+    } else {
+        (Bounds::default(), Bounds::default())
+    };
+    let items = if popup == Popup::Color {
+        (0..PALETTE.len())
+            .map(|index| {
+                Bounds::new(
+                    bx + pad_x + (34.0 + gap) * index as f64,
+                    by + pad_y,
+                    34.0,
+                    34.0,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Some(PopupLayout {
-        bar: Bounds::new(bx, by, popup_w, popup_h),
+        bar,
+        rail,
+        grab,
         items,
     })
 }
 
-/// Which ladder the 大小 button shows for the active tool.
-///
-/// One button, two ladders: for text the useful "thickness" is the label size,
-/// for a drawing tool it is the line weight. The button id and hotkey are the
-/// same either way, so nothing about the interaction contract moves — the size
-/// simply lives with the other annotation settings instead of in a control of
-/// its own.
-fn width_popup_for(tool: Tool) -> Popup {
-    if tool == Tool::Text {
-        Popup::TextSize
-    } else {
-        Popup::Width
-    }
-}
-
-fn popup_hit(state: &State, popup: Popup, x: f64, y: f64) -> Option<usize> {
+/// What a press inside a popup landed on.
+fn popup_hit(state: &State, popup: Popup, x: f64, y: f64) -> Option<PopupHit> {
     let layout = popup_layout(state, popup)?;
-    layout.items.iter().position(|bounds| bounds.contains(x, y))
+    match popup {
+        Popup::Color => layout
+            .items
+            .iter()
+            .position(|bounds| bounds.contains(x, y))
+            .map(PopupHit::Color),
+        // `grab` (the handle's full travel plus its radius), not the 4 px rail: a
+        // slider has to be easy to grab, and the fraction is measured against the
+        // rail so the ends of the range land exactly on 0.0 and 1.0.
+        Popup::Size => {
+            let rail = layout.rail;
+            layout
+                .grab
+                .contains(x, y)
+                .then(|| PopupHit::Size(((x - rail.x) / rail.w).clamp(0.0, 1.0)))
+        }
+    }
 }
 
 fn draw_popup(state: &State, cr: &Context, popup: Popup) {
@@ -1266,28 +1314,10 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
     };
     paint::crystal_slab(cr, layout.bar, 11.0);
 
-    // Heading first: it names which ladder this is, which is what stops the
-    // shared 大小 button from being ambiguous.
-    let title = popup_title(popup);
-    let (tw, _) = paint::text_size(cr, POPUP_TITLE_FONT, title);
-    paint::draw_text(
-        cr,
-        POPUP_TITLE_FONT,
-        title,
-        layout.bar.x + (layout.bar.w - tw) / 2.0,
-        layout.bar.y + POPUP_PAD.1,
-        (0.86, 0.90, 1.0, 0.62),
-    );
-
-    let selected = match popup {
-        Popup::Color => state.annotator.color_index(),
-        Popup::Width => state.annotator.width_index(),
-        Popup::TextSize => state.annotator.text_size_index(),
-    };
-
-    for (index, bounds) in layout.items.iter().enumerate() {
-        match popup {
-            Popup::Color => {
+    match popup {
+        Popup::Color => {
+            let selected = state.annotator.color_index();
+            for (index, bounds) in layout.items.iter().enumerate() {
                 let (r, g, b) = PALETTE[index];
                 paint::fill_rounded(cr, *bounds, 8.0, (r, g, b, 1.0));
                 if index == selected {
@@ -1299,51 +1329,54 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
                     cr.line_to(bounds.x + 14.0, bounds.y + bounds.h - 11.0);
                     cr.line_to(bounds.x + bounds.w - 9.0, bounds.y + 10.0);
                     let _ = cr.stroke();
+                    cr.new_path();
                 }
             }
-            Popup::TextSize => {
-                paint::fill_rounded(cr, *bounds, 8.0, (1.0, 1.0, 1.0, 0.06));
-                // Drawn at a size proportional to its value, so the entry shows
-                // what it means rather than only naming it. A bar of proportional
-                // height — how the stroke widths are drawn — would read as a
-                // second thickness ladder.
-                let size = TEXT_SIZES[index];
-                let font = format!("Sans Bold {}", (size * 0.30).clamp(9.0, 21.0) as i32);
-                let label = format!("{}", size as i32);
-                let (tw, th) = paint::text_size(cr, &font, &label);
-                paint::draw_text(
-                    cr,
-                    &font,
-                    &label,
-                    bounds.x + (bounds.w - tw) / 2.0,
-                    bounds.y + (bounds.h - th) / 2.0,
-                    (0.90, 0.93, 1.0, 0.88),
-                );
-            }
-            Popup::Width => {
-                paint::fill_rounded(cr, *bounds, 8.0, (1.0, 1.0, 1.0, 0.06));
-                let width = WIDTHS[index];
-                cr.set_source_rgba(0.90, 0.93, 1.0, 0.9);
-                cr.set_line_width(width);
-                cr.move_to(bounds.x + 10.0, bounds.y + 15.0);
-                cr.line_to(bounds.x + bounds.w - 10.0, bounds.y + 15.0);
-                let _ = cr.stroke();
-                let label = format!("{} px", width as i32);
-                let (tw, _) = paint::text_size(cr, "Sans 8", &label);
-                paint::draw_text(
-                    cr,
-                    "Sans 8",
-                    &label,
-                    bounds.x + (bounds.w - tw) / 2.0,
-                    bounds.y + bounds.h - 16.0,
-                    (0.86, 0.90, 1.0, 0.72),
-                );
-            }
         }
-        if index == selected {
-            paint::stroke_rounded(cr, *bounds, 8.0, 2.0, (0.48, 0.62, 1.0, 0.85));
-        }
+        Popup::Size => draw_size_slider(cr, layout.rail, state.annotator.size_fraction()),
     }
+}
+
+/// The size slider: an unfilled track, the filled part, then the handle.
+///
+/// The handle reuses the selection handles' treatment — white core, accent ring,
+/// dark seat — so the overlay keeps reading as one material.
+fn draw_size_slider(cr: &Context, track: Bounds, fraction: f64) {
+    let cy = track.y + track.h / 2.0;
+    let x0 = track.x;
+    let handle_x = x0 + track.w * fraction.clamp(0.0, 1.0);
+    let track_y = cy - SLIDER_TRACK_H / 2.0;
+
+    paint::fill_rounded(
+        cr,
+        Bounds::new(x0, track_y, track.w, SLIDER_TRACK_H),
+        SLIDER_TRACK_H / 2.0,
+        (1.0, 1.0, 1.0, 0.14),
+    );
+    if handle_x > x0 {
+        paint::fill_rounded(
+            cr,
+            Bounds::new(x0, track_y, handle_x - x0, SLIDER_TRACK_H),
+            SLIDER_TRACK_H / 2.0,
+            (0.48, 0.62, 1.0, 0.85),
+        );
+    }
+    paint::fill_circle(
+        cr,
+        handle_x,
+        cy,
+        SLIDER_HANDLE_R + 1.0,
+        (0.02, 0.03, 0.06, 0.45),
+    );
+    paint::fill_circle(cr, handle_x, cy, SLIDER_HANDLE_R, (1.0, 1.0, 1.0, 1.0));
+    paint::stroke_circle(
+        cr,
+        handle_x,
+        cy,
+        SLIDER_HANDLE_R,
+        1.5,
+        (0.48, 0.62, 1.0, 0.9),
+    );
 }
 
 #[cfg(test)]
@@ -1562,6 +1595,7 @@ mod tests {
             annotator: Annotator::new(),
             annotating: false,
             popup: None,
+            slider: false,
             hover: None,
             long_shot: false,
             daemon_managed: false,
@@ -1854,77 +1888,88 @@ mod tests {
         );
     }
 
-    /// Every popup names what it controls.
-    ///
-    /// This is not decoration on the size popup: the same button carries a
-    /// different ladder per tool, so the heading is the only thing distinguishing
-    /// "px of stroke" from "px of type".
+    /// The whole slider row is grabbable, and a press maps to a position along
+    /// the range rather than to an index into a list.
     #[test]
-    fn each_popup_says_what_it_controls() {
-        assert_eq!(popup_title(Popup::Color), "颜色");
-        assert_eq!(popup_title(Popup::Width), "线宽");
-        assert_eq!(popup_title(Popup::TextSize), "字号");
-    }
-
-    /// The heading row must not overlap the entries it captions, nor push them
-    /// out of the slab.
-    #[test]
-    fn the_heading_sits_above_the_entries() {
+    fn a_press_on_the_size_popup_maps_to_a_slider_position() {
         let mut state = overlay_state(true);
         let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
         let cr = Context::new(&surface).expect("cairo context");
         let rect = state.selector.rect;
         state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
 
-        for popup in [Popup::Color, Popup::Width, Popup::TextSize] {
-            let layout = popup_layout(&state, popup).expect("popup layout");
-            let name = popup_title(popup);
-            let first = layout.items.first().expect("at least one entry");
-            assert!(
-                first.y >= layout.bar.y + POPUP_TITLE_H,
-                "{name}: the entries start at {:.1}, inside the heading row",
-                first.y
-            );
-            for item in &layout.items {
-                assert!(
-                    item.y + item.h <= layout.bar.y + layout.bar.h,
-                    "{name}: an entry overflows the slab"
-                );
+        let layout = popup_layout(&state, Popup::Size).expect("popup layout");
+        let rail = layout.rail;
+        let cy = rail.y + rail.h / 2.0;
+
+        // Both extremes must be grabbable, including the right edge: the handle's
+        // centre sits exactly there at the top of the range.
+        for (offset, want, label) in [
+            (0.0, 0.0, "left end"),
+            (rail.w / 2.0, 0.5, "middle"),
+            (rail.w, 1.0, "right end"),
+        ] {
+            match popup_hit(&state, Popup::Size, rail.x + offset, cy) {
+                Some(PopupHit::Size(fraction)) => assert!(
+                    (fraction - want).abs() < 1e-9,
+                    "the {label} gave {fraction}, expected {want}"
+                ),
+                _ => panic!("the {label} of the slider is not grabbable"),
             }
         }
+        // Inside the handle's overhang past the rail end still clamps to the top
+        // of the range, which is what makes the handle grabbable at its centre.
+        match popup_hit(
+            &state,
+            Popup::Size,
+            rail.x + rail.w + SLIDER_HANDLE_R / 2.0,
+            cy,
+        ) {
+            Some(PopupHit::Size(fraction)) => assert!((fraction - 1.0).abs() < 1e-9),
+            _ => panic!("the overhang past the rail end is not grabbable"),
+        }
+        // Beyond the handle there is nothing to grab.
+        assert!(
+            popup_hit(
+                &state,
+                Popup::Size,
+                rail.x + rail.w + SLIDER_HANDLE_R * 2.0,
+                cy
+            )
+            .is_none(),
+            "a press well past the handle should not move the slider"
+        );
+        // Outside the row entirely is not a hit.
+        assert!(popup_hit(&state, Popup::Size, rail.x, rail.y - 40.0).is_none());
     }
 
-    /// The 大小 button shows the size ladder for text and the line-weight ladder
-    /// for every drawing tool.
+    /// Dragging the slider then reading it back must agree, which is what makes
+    /// the handle land where the pointer was released.
     #[test]
-    fn the_width_button_shows_the_label_size_only_for_text() {
-        assert!(matches!(width_popup_for(Tool::Text), Popup::TextSize));
-        for tool in [Tool::Pen, Tool::Arrow, Tool::Rect] {
+    fn the_slider_position_survives_a_drag() {
+        let mut state = overlay_state(true);
+        let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        let rect = state.selector.rect;
+        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        let rail = popup_layout(&state, Popup::Size).expect("layout").rail;
+
+        for want in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let x = rail.x + rail.w * want;
+            let Some(PopupHit::Size(fraction)) = popup_hit(&state, Popup::Size, x, rail.y) else {
+                panic!("no hit at {want}");
+            };
+            state.annotator.set_size_fraction(fraction);
             assert!(
-                matches!(width_popup_for(tool), Popup::Width),
-                "{tool:?} must keep showing the line weights"
+                (state.annotator.size_fraction() - want).abs() < 1e-6,
+                "dragging to {want} landed at {}",
+                state.annotator.size_fraction()
             );
         }
     }
 
-    /// Every step the size popup offers must be one the annotator accepts, and
-    /// must highlight itself, or the popup would show a step it cannot apply.
-    #[test]
-    fn every_advertised_label_size_round_trips() {
-        let mut annotator = Annotator::new();
-        for (index, size) in TEXT_SIZES.iter().enumerate() {
-            annotator.set_text_size(*size);
-            assert_eq!(annotator.text_size(), *size, "size {size} was not applied");
-            assert_eq!(
-                annotator.text_size_index(),
-                index,
-                "size {size} did not highlight its own entry"
-            );
-        }
-    }
-
-    /// The size popup must stay on screen at every output width, or its last
-    /// steps are unreachable in exactly the way the toolbar used to be.
+    /// The slider must stay on screen at every output width, or part of its range
+    /// is unreachable in exactly the way the toolbar used to be.
     #[test]
     fn the_size_popup_fits_a_narrow_output() {
         for width in [1920, 1280, 1024, 800, 640, 480] {
@@ -1935,17 +1980,50 @@ mod tests {
             let rect = state.selector.rect;
             state.anno_toolbar.layout(&cr, rect, width, state.screen_h);
 
-            let layout = popup_layout(&state, Popup::TextSize).expect("popup layout");
+            let layout = popup_layout(&state, Popup::Size).expect("popup layout");
             assert!(
                 layout.bar.x >= 0.0 && layout.bar.x + layout.bar.w <= f64::from(width),
                 "the size popup leaves a {width} px output: {:?}",
                 layout.bar
             );
-            assert_eq!(
-                layout.items.len(),
-                TEXT_SIZES.len(),
-                "a step went missing at {width} px"
+            // The rail, the handle's overhang and the hit area all have to stay
+            // inside the slab, or part of the range is not grabbable.
+            assert!(
+                layout.rail.x - SLIDER_HANDLE_R >= layout.bar.x
+                    && layout.rail.x + layout.rail.w + SLIDER_HANDLE_R
+                        <= layout.bar.x + layout.bar.w,
+                "the slider leaves its slab at {width} px"
             );
+            assert!(
+                layout.grab.y >= layout.bar.y
+                    && layout.grab.y + layout.grab.h <= layout.bar.y + layout.bar.h,
+                "the slider row leaves its slab at {width} px"
+            );
+        }
+    }
+
+    /// The colour popup is unchanged: every palette entry, and no slider.
+    #[test]
+    fn the_colour_popup_still_offers_the_whole_palette() {
+        let mut state = overlay_state(true);
+        let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+        let rect = state.selector.rect;
+        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+
+        let layout = popup_layout(&state, Popup::Color).expect("popup layout");
+        assert_eq!(layout.items.len(), PALETTE.len());
+        assert!(layout.rail.w <= 0.0, "the colour popup has no slider");
+        for (index, bounds) in layout.items.iter().enumerate() {
+            match popup_hit(
+                &state,
+                Popup::Color,
+                bounds.x + bounds.w / 2.0,
+                bounds.y + bounds.h / 2.0,
+            ) {
+                Some(PopupHit::Color(found)) => assert_eq!(found, index),
+                _ => panic!("palette entry {index} is not hittable"),
+            }
         }
     }
 
