@@ -158,15 +158,23 @@ pub fn present(
     background: &Rgb8,
     long_shot: bool,
     daemon_managed: bool,
+    full_screen: bool,
     on_result: ResultHandler,
 ) -> anyhow::Result<ApplicationWindow> {
     let screen_w = background.width as i32;
     let screen_h = background.height as i32;
+    // Full screen is the same overlay with the selection already made, so every
+    // existing path — moving it, pulling an edge in, annotating, confirming —
+    // applies to it without a second code path to keep in step.
+    let mut selector = Selector::new(screen_w, screen_h);
+    if full_screen {
+        selector.select_all();
+    }
     let state = Rc::new(RefCell::new(State {
         bg: imaging::to_surface(background)?,
         screen_w,
         screen_h,
-        selector: Selector::new(screen_w, screen_h),
+        selector,
         toolbar: Toolbar::new(BUTTONS),
         anno_toolbar: Toolbar::new(ANNOTATE_BUTTONS),
         annotator: Annotator::new(),

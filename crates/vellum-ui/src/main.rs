@@ -184,11 +184,15 @@ fn dispatch(args: &[String]) -> anyhow::Result<i32> {
     let daemon_managed = std::env::var(vellum_core::DAEMON_MANAGED_ENV).as_deref() == Ok("1");
 
     match action {
-        "region" => run_region(flags, false, false, LongshotTrace::default()),
+        "region" => run_region(flags, false, false, false, LongshotTrace::default()),
+        // The same overlay, with the whole output already selected: the toolbar,
+        // the annotations and the ability to pull an edge in all still apply.
+        "full" => run_region(flags, false, false, true, LongshotTrace::default()),
         "long" => run_region(
             flags,
             true,
             daemon_managed,
+            false,
             LongshotTrace::from_args("ui", &args[1..]),
         ),
         "debug-capture" => debug_capture(flags),
@@ -290,6 +294,7 @@ fn run_region(
     flags: OutputFlags,
     long_shot: bool,
     daemon_managed: bool,
+    full_screen: bool,
     longshot_trace: LongshotTrace,
 ) -> anyhow::Result<i32> {
     longshot_trace.emit("ui_started", &[("long_shot", TraceField::Bool(long_shot))]);
@@ -330,6 +335,7 @@ fn run_region(
         flags,
         long_shot,
         daemon_managed,
+        full_screen,
         longshot_trace,
     ));
     let activate = session.clone();
@@ -417,6 +423,9 @@ struct Session {
     flags: OutputFlags,
     long_shot: bool,
     daemon_managed: bool,
+    /// Start with the whole output selected, which is what the full-screen
+    /// command asks for.
+    full_screen: bool,
     trace: LongshotTrace,
     exit_code: Cell<i32>,
     recorder: RefCell<Option<Rc<Recorder>>>,
@@ -431,6 +440,7 @@ impl Session {
         flags: OutputFlags,
         long_shot: bool,
         daemon_managed: bool,
+        full_screen: bool,
         trace: LongshotTrace,
     ) -> Self {
         Self {
@@ -440,6 +450,7 @@ impl Session {
             flags,
             long_shot,
             daemon_managed,
+            full_screen,
             trace,
             exit_code: Cell::new(0),
             recorder: RefCell::new(None),
@@ -494,6 +505,7 @@ impl Session {
             &background,
             self.long_shot,
             self.daemon_managed,
+            self.full_screen,
             handler,
         ) {
             self.trace.emit("overlay_present_failed", &[]);
