@@ -79,6 +79,11 @@ struct Stroke {
 #[derive(Debug, Clone)]
 struct TextEdit {
     stroke: Stroke,
+    /// The input method's composition buffer, shown but not yet committed.
+    ///
+    /// Held apart from `stroke.text` so a cancelled or re-composed preedit never
+    /// leaves fragments in the label: only a commit appends to the text.
+    preedit: String,
 }
 
 pub struct Annotator {
@@ -185,7 +190,10 @@ impl Annotator {
             Tool::Text => {
                 // A press elsewhere finishes the previous label first.
                 self.commit_text();
-                self.editing = Some(TextEdit { stroke });
+                self.editing = Some(TextEdit {
+                    stroke,
+                    preedit: String::new(),
+                });
             }
             Tool::Pen => self.active = Some(stroke),
             Tool::Arrow | Tool::Rect => {
@@ -242,15 +250,57 @@ impl Annotator {
         }
     }
 
-    pub fn type_char(&mut self, ch: char) {
+    /// Appends committed text to the label being typed.
+    ///
+    /// Takes a whole string rather than a `char` because an input method commits
+    /// a word at once: fcitx5 hands over "你好", not "你" followed by "好".
+    pub fn type_str(&mut self, text: &str) {
         if let Some(edit) = self.editing.as_mut() {
-            edit.stroke.text.push(ch);
+            edit.stroke.text.push_str(text);
+            // A commit ends whatever composition produced it.
+            edit.preedit.clear();
         }
+    }
+
+    pub fn type_char(&mut self, ch: char) {
+        let mut buf = [0u8; 4];
+        self.type_str(ch.encode_utf8(&mut buf));
+    }
+
+    /// Replaces the composition the input method is showing but has not committed.
+    pub fn set_preedit(&mut self, text: &str) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.preedit.clear();
+            edit.preedit.push_str(text);
+        }
+    }
+
+    /// The composition currently on screen, empty when there is none.
+    ///
+    /// The draw path reads the field directly, so this exists for the tests that
+    /// pin the commit/preedit split; `bar` on the toolbar sets the precedent.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn preedit(&self) -> &str {
+        self.editing.as_ref().map_or("", |e| e.preedit.as_str())
+    }
+
+    /// The label's anchor, used to place the input method's candidate window.
+    pub fn caret_anchor(&self) -> Option<(f64, f64)> {
+        let edit = self.editing.as_ref()?;
+        edit.stroke.points.first().copied()
     }
 
     pub fn backspace(&mut self) {
         if let Some(edit) = self.editing.as_mut() {
-            edit.stroke.text.pop();
+            // While a composition is showing the input method normally consumes
+            // backspace itself to edit its buffer. If one still arrives the user
+            // is backing out of the composition, which must not delete a
+            // character that was already committed to the label.
+            if !edit.preedit.is_empty() {
+                edit.preedit.clear();
+            } else {
+                edit.stroke.text.pop();
+            }
         }
     }
 
@@ -279,7 +329,9 @@ impl Annotator {
             && let Ok(cr) = Context::new(cache)
         {
             cr.translate(-self.cache_origin.0, -self.cache_origin.1);
-            draw_stroke(&cr, &stroke, false);
+            // Only committed strokes reach the cache; a composition is never
+            // baked, so there is no preedit to pass.
+            draw_stroke(&cr, &stroke, false, "");
         }
         self.strokes.push(stroke);
     }
@@ -296,7 +348,7 @@ impl Annotator {
         cr.set_operator(cairo::Operator::Over);
         cr.translate(-self.cache_origin.0, -self.cache_origin.1);
         for stroke in &self.strokes {
-            draw_stroke(&cr, stroke, false);
+            draw_stroke(&cr, stroke, false, "");
         }
     }
 
@@ -309,14 +361,14 @@ impl Annotator {
             cr.set_source_rgb(0.0, 0.0, 0.0);
         } else {
             for stroke in &self.strokes {
-                draw_stroke(cr, stroke, false);
+                draw_stroke(cr, stroke, false, "");
             }
         }
         if let Some(active) = self.active.as_ref() {
-            draw_stroke(cr, active, false);
+            draw_stroke(cr, active, false, "");
         }
         if let Some(edit) = self.editing.as_ref() {
-            draw_stroke(cr, &edit.stroke, true);
+            draw_stroke(cr, &edit.stroke, true, &edit.preedit);
         }
     }
 
@@ -337,14 +389,16 @@ impl Annotator {
         } else {
             cr.translate(-f64::from(rect.x), -f64::from(rect.y));
             for stroke in &self.strokes {
-                draw_stroke(&cr, stroke, false);
+                draw_stroke(&cr, stroke, false, "");
             }
         }
         Some(surface)
     }
 }
 
-fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool) {
+/// `preedit` is the input method's uncommitted composition, drawn after the
+/// text and underlined; pass `""` for anything that is not being typed.
+fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str) {
     let (r, g, b) = stroke.color;
     cr.set_source_rgb(r, g, b);
     cr.set_line_width(stroke.width);
@@ -371,7 +425,7 @@ fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool) {
                 let _ = cr.stroke();
             }
         }
-        Tool::Text => draw_text_stroke(cr, stroke, caret),
+        Tool::Text => draw_text_stroke(cr, stroke, caret, preedit),
     }
 }
 
@@ -393,16 +447,20 @@ fn draw_arrow(cr: &Context, stroke: &Stroke) {
     let _ = cr.stroke();
 }
 
-fn draw_text_stroke(cr: &Context, stroke: &Stroke, caret: bool) {
+fn draw_text_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str) {
     let (x, y) = match stroke.points.first() {
         Some(&point) => point,
         None => return,
     };
-    let shown = if caret {
-        format!("{}|", stroke.text)
-    } else {
-        stroke.text.clone()
-    };
+    // The composition is rendered where it will land, underlined, so typing
+    // pinyin shows something before the IME commits. It is deliberately not
+    // part of `stroke.text`: a cancelled composition must leave no trace.
+    let preedit_start = stroke.text.len();
+    let mut shown = stroke.text.clone();
+    shown.push_str(preedit);
+    if caret {
+        shown.push('|');
+    }
     if shown.is_empty() {
         return;
     }
@@ -412,6 +470,16 @@ fn draw_text_stroke(cr: &Context, stroke: &Stroke, caret: bool) {
     font.set_absolute_size((stroke.width * 4.0).max(12.0) * f64::from(pango::SCALE));
     layout.set_font_description(Some(&font));
     layout.set_text(&shown);
+    if !preedit.is_empty() {
+        // Pango attribute indices are byte offsets into the layout text, so
+        // they are only correct for the string actually set above.
+        let mut underline = pango::AttrInt::new_underline(pango::Underline::Single);
+        underline.set_start_index(preedit_start as u32);
+        underline.set_end_index((preedit_start + preedit.len()) as u32);
+        let attrs = pango::AttrList::new();
+        attrs.insert(underline);
+        layout.set_attributes(Some(&attrs));
+    }
 
     // Screenshots are arbitrary content, so a plain coloured glyph can vanish
     // against it. A one-pixel dark offset keeps the label readable everywhere.
@@ -517,5 +585,136 @@ mod tests {
         let baked = a.bake(&base, rect).expect("baked");
         assert_eq!(baked.width(), 200);
         assert_eq!(baked.height(), 150);
+    }
+
+    /// Renders the annotator the way the overlay does and reports the rightmost
+    /// column carrying ink, which is how far the label reaches.
+    ///
+    /// Comparing whole images instead passed for the wrong reason: the caret
+    /// moves with the drawn text, so removing the composition still shifted
+    /// pixels and the comparison stayed unequal.
+    fn rightmost_ink(a: &Annotator) -> usize {
+        let mut surface = ImageSurface::create(Format::ARgb32, 300, 300).expect("surface");
+        {
+            let cr = Context::new(&surface).expect("context");
+            a.draw(&cr);
+        }
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("pixels");
+        let mut rightmost = 0;
+        for y in 0..300usize {
+            for x in 0..300usize {
+                if data[y * stride + x * 4 + 3] > 0 {
+                    rightmost = rightmost.max(x);
+                }
+            }
+        }
+        rightmost
+    }
+
+    /// An input method commits a whole word, not one character at a time.
+    #[test]
+    fn a_commit_inserts_the_entire_word() {
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(60.0, 60.0);
+        a.type_str("你好");
+        a.commit_text();
+        assert_eq!(a.strokes.len(), 1);
+        assert_eq!(a.strokes[0].text, "你好");
+    }
+
+    /// The composition is visible while it is being typed, and is not part of
+    /// the label until the input method commits it.
+    #[test]
+    fn a_composition_is_shown_but_not_committed() {
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(60.0, 60.0);
+        a.type_str("A");
+
+        let without = rightmost_ink(&a);
+        assert!(without > 0, "the committed character was not drawn at all");
+
+        a.set_preedit("nnnn");
+        assert_eq!(a.preedit(), "nnnn");
+        let with = rightmost_ink(&a);
+        assert!(
+            with > without,
+            "the composition was not drawn (ink still ends at {with}, unchanged from \
+             {without}), so typing pinyin would show nothing"
+        );
+
+        // A longer composition must reach further, so it is genuinely redrawn
+        // rather than frozen.
+        a.set_preedit("nnnnnnnn");
+        assert!(
+            rightmost_ink(&a) > with,
+            "a longer composition did not extend the label"
+        );
+
+        a.commit_text();
+        assert_eq!(
+            a.strokes[0].text, "A",
+            "the composition leaked into the label"
+        );
+    }
+
+    /// A commit ends the composition it came from.
+    #[test]
+    fn committing_text_clears_the_composition() {
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(60.0, 60.0);
+        a.set_preedit("ni");
+        a.type_str("你");
+        assert_eq!(a.preedit(), "", "a stale composition would draw twice");
+    }
+
+    /// Backspace inside a composition must not delete committed text.
+    #[test]
+    fn backspace_edits_the_composition_before_the_label() {
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(60.0, 60.0);
+        a.type_str("你");
+        a.set_preedit("hao");
+
+        a.backspace();
+        assert_eq!(a.preedit(), "", "the composition should be dropped first");
+        assert_eq!(a.strokes.len(), 0);
+
+        // Only once no composition is showing does it reach the label.
+        a.backspace();
+        a.commit_text();
+        assert!(a.strokes.is_empty(), "the committed character was deleted");
+    }
+
+    /// The composition is never baked into the captured image.
+    #[test]
+    fn a_composition_is_never_baked() {
+        let base = ImageSurface::create(Format::ARgb32, 400, 300).expect("base");
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(60.0, 60.0);
+        a.set_preedit("ni");
+        let _ = a.bake(&base, Rect::new(10, 20, 200, 150)).expect("baked");
+        assert!(
+            !a.has_content(),
+            "an uncommitted composition must not survive into the result"
+        );
+    }
+
+    /// The candidate window is anchored where the label starts.
+    #[test]
+    fn the_caret_anchor_is_the_label_origin() {
+        let mut a = annotator();
+        assert_eq!(a.caret_anchor(), None, "no label, no anchor");
+        a.set_tool(Tool::Text);
+        a.press(60.0, 70.0);
+        assert_eq!(a.caret_anchor(), Some((60.0, 70.0)));
+        a.commit_text();
+        assert_eq!(a.caret_anchor(), None, "a finished label has no caret");
     }
 }

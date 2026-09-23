@@ -94,6 +94,9 @@ cairo 的 toy font API 无法 shape CJK。工具栏、尺寸提示、标注文�
 - **`new_sub_path()` 不等于 `new_path()`**：前者只重置当前点，**不清除已有子路径**。所以 `fill_rounded` 这类"画自己的圆角矩形再 fill"的辅助函数必须在描路径之前 `new_path()`，否则会把上一个绘制者残留的子路径一起画出来——已实测：残留矩形以满 alpha 被填、区域颜色错的。同理 `cr.rectangle()` 是**追加**子路径而非替换，`draw_selection_frame` 因此曾把标注层残留的图形按选区框颜色描了出来。
 - **描边和填充的像素对齐规则相反**：cairo 把描边居中在路径上，所以奇数线宽要落在 `.5`、偶数线宽要落在整数；而**填充**矩形必须落在整数格，`.5` 会把 1px 列劈成两列各 50%（实测 `0,0,128,128,0,0`，看着就是 2px 模糊）。分隔线用的是填充，所以是 `x.floor()`。
 - **控制条必须适配屏幕宽度**：浮层持有独占键盘抓取，被挤出屏幕的按钮连键盘也够不到（Esc 除外）。`layout` 先量后布，按"用户损失最小"降级：先收紧间距，再去掉装饰性的键帽。标签宽度全程不变，宁可不显示也不挤压或省略文字。
+- **标注输入必须走输入法上下文**：浮层是 layer-shell 上的 DrawingArea，不是 `GtkEntry`，GTK 不会自己建 IM context。用 `EventControllerKey` 拿 `key.to_unicode()` 读裸 keyval 的做法**在原理上就不可能**支持输入法——组字过程中的按键序列并不是用户最终要的字符。必须显式建 `IMMulticontext`、`set_client_widget`，再把 context 挂到 key controller 上：GTK 会先把每个键喂给它，被它消费的键直接 return TRUE，应用层的 handler 根本不会触发（见 `gtk_event_controller_key_handle_event`）。实测：`GTK_IM_MODULE=fcitx` 下建好并 focus 之后，`/usr/lib/gtk-4.0/4.0.0/immodules/libim-fcitx5.so` 会被真正 dlopen 进进程。
+- **IM context 只在输入文字时挂载**：GTK 会在 controller 所在 widget 取得焦点时自动 `focus_in` 已挂载的 context（见 `gtk_event_controller_key_handle_crossing`），而被 focus 的 context 正是 fcitx5 开始组字的条件。常挂会让中文输入法在纯框选状态下吞掉单字母快捷键（`d` 标注、`o` OCR 等）。所以进入文字标注才 attach、提交或退出就 detach——这是硬保证，不是整洁问题。
+- **组字串与正文分离**：输入法的 preedit 单独存放并画下划线，只有 commit 才追加进正文。于是取消组字不留残字、组字中按退格不会删掉已提交的字、也不会被 bake 进截图。commit 一次可能给多个字符（"你好"），不是一次一个。
 - **可评审**：`cargo test -p vellum-ui -- --ignored render_the_overlay` 会走真实的 `draw()` 入口把整块浮层渲染成 PNG，视觉改动可以看图而不是只读 diff。
 
 ### 托盘：`ksni` 0.3.6

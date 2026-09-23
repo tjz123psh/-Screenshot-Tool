@@ -22,15 +22,15 @@
 //!   before any capture happens, but the long-shot handoff still waits for the
 //!   surface to disappear before grabbing frames.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use cairo::{Context, ImageSurface};
-use gtk4::gdk::{Key, ModifierType};
+use gtk4::gdk::{Key, ModifierType, Rectangle};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, DrawingArea, EventControllerFocus, EventControllerKey,
-    EventControllerMotion, GestureClick,
+    EventControllerMotion, GestureClick, IMMulticontext,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::geom::Rect;
@@ -186,8 +186,15 @@ pub fn present(
 
     let emitter = Emitter::new(window.clone(), state.clone(), on_result);
 
-    connect_pointer(&canvas, &state, &emitter);
-    connect_keys(&window, &canvas, &state, &emitter);
+    // One input-method bridge for the whole overlay: the pointer controller
+    // opens and closes labels while the key controller owns the context. See
+    // `Im` for why a layer-shell surface needs one at all.
+    let keys = EventControllerKey::new();
+    let im = Rc::new(Im::new(keys.clone()));
+    im.context.set_client_widget(Some(&canvas));
+
+    connect_pointer(&canvas, &state, &emitter, &im);
+    connect_keys(&window, &canvas, &state, &emitter, &keys, &im);
     connect_focus(&window, &state, &emitter);
     install_draw(&canvas, &state);
     install_watchdog(&state, &emitter);
@@ -271,10 +278,20 @@ impl Emitter {
     }
 }
 
-fn connect_pointer(canvas: &DrawingArea, state: &Rc<RefCell<State>>, emitter: &Rc<Emitter>) {
+fn connect_pointer(
+    canvas: &DrawingArea,
+    state: &Rc<RefCell<State>>,
+    emitter: &Rc<Emitter>,
+    im: &Rc<Im>,
+) {
     let click = GestureClick::new();
     // Button 0 means "any button": the overlay needs right-click to clear.
     click.set_button(0);
+
+    // A press with the text tool opens a label, which is what gives the input
+    // method something to type into. Shared with the key controller, which owns
+    // the context, so the two agree on whether it currently has focus.
+    let press_im = im.clone();
 
     let press_state = state.clone();
     let press_emitter = emitter.clone();
@@ -302,6 +319,7 @@ fn connect_pointer(canvas: &DrawingArea, state: &Rc<RefCell<State>>, emitter: &R
         if let Some(action) = action {
             dispatch(&press_emitter, &press_state, &action);
         }
+        press_im.sync(&press_state);
         press_emitter.queue_draw();
     });
 
@@ -385,13 +403,101 @@ fn annotate_press(state: &mut State, button: u32, x: f64, y: f64) -> Option<Stri
     None
 }
 
+/// The overlay's input-method bridge.
+///
+/// The context, the key controller it is attached to, and whether it currently
+/// has focus have to move together, and both the pointer and the key controllers
+/// drive them, so they live in one place.
+///
+/// Why an IM context at all: the annotation "text field" is a drawing area, not
+/// a GtkEntry, so GTK never creates one and fcitx5 is never consulted. The label
+/// editor used to read raw keyvals straight out of the key controller, which
+/// cannot work with an input method by construction — a composition is not a key.
+///
+/// Why it is attached only while typing: GTK focuses an attached context by
+/// itself whenever the controller's widget takes focus (see
+/// `gtk_event_controller_key_handle_crossing`), and a focused context is exactly
+/// what makes fcitx5 start composing. Left attached, it would swallow the
+/// single-letter tool hotkeys — `d` for 标注 and friends — during plain
+/// selection, when the user is not typing text at all. Detaching it outside text
+/// entry is a hard guarantee that no hotkey can be intercepted.
+struct Im {
+    context: IMMulticontext,
+    keys: EventControllerKey,
+    focused: Cell<bool>,
+}
+
+impl Im {
+    fn new(keys: EventControllerKey) -> Self {
+        Self {
+            context: IMMulticontext::new(),
+            keys,
+            focused: Cell::new(false),
+        }
+    }
+
+    /// Starts or stops input-method text entry to match the annotation state.
+    /// Called after anything that can open or close a label.
+    fn sync(&self, state: &Rc<RefCell<State>>) {
+        let (editing, anchor) = {
+            let state = state.borrow();
+            (
+                state.annotator.is_editing_text(),
+                state.annotator.caret_anchor(),
+            )
+        };
+        if editing == self.focused.get() {
+            return;
+        }
+        if editing {
+            // Without a cursor location fcitx5 pops its candidate list in the
+            // corner of the output rather than next to the caret.
+            if let Some((x, y)) = anchor {
+                self.context
+                    .set_cursor_location(&Rectangle::new(x as i32, y as i32, 1, 24));
+            }
+            // Attach before focusing: GTK only routes keys to a context that is
+            // on the controller, and focusing it is what enables fcitx5.
+            self.keys.set_im_context(Some(&self.context));
+            self.context.focus_in();
+        } else {
+            self.context.focus_out();
+            // Detaching also discards the composition, so an abandoned preedit
+            // cannot reappear on the next label.
+            self.keys.set_im_context(None::<&IMMulticontext>);
+        }
+        self.focused.set(editing);
+    }
+}
+
 fn connect_keys(
     window: &ApplicationWindow,
     canvas: &DrawingArea,
     state: &Rc<RefCell<State>>,
     emitter: &Rc<Emitter>,
+    keys: &EventControllerKey,
+    im: &Rc<Im>,
 ) {
-    let keys = EventControllerKey::new();
+    // The composition is drawn in the label while it is being typed, so pinyin
+    // is visible before it is committed.
+    let preedit_state = state.clone();
+    let preedit_emitter = emitter.clone();
+    let preedit_im = im.clone();
+    im.context.connect_preedit_changed(move |_| {
+        let (text, _, _) = preedit_im.context.preedit_string();
+        preedit_state.borrow_mut().annotator.set_preedit(&text);
+        preedit_emitter.queue_draw();
+    });
+
+    // A commit is the finished text and may be several characters at once.
+    let commit_state = state.clone();
+    let commit_emitter = emitter.clone();
+    im.context.connect_commit(move |_, text| {
+        commit_state.borrow_mut().annotator.type_str(text);
+        commit_emitter.queue_draw();
+    });
+
+    let key_im = im.clone();
     let key_state = state.clone();
     let key_emitter = emitter.clone();
     let key_canvas = canvas.clone();
@@ -410,6 +516,10 @@ fn connect_keys(
         if let Some(action) = action {
             dispatch(&key_emitter, &key_state, &action);
         }
+        // Committing a label or leaving annotate mode ends text entry, and the
+        // input method has to be told or it stays attached and composes into
+        // nothing.
+        key_im.sync(&key_state);
         key_canvas.queue_draw();
         if handled {
             glib::Propagation::Stop
@@ -417,7 +527,7 @@ fn connect_keys(
             glib::Propagation::Proceed
         }
     });
-    window.add_controller(keys);
+    window.add_controller(keys.clone());
 }
 
 fn plain_key(state: &mut State, key: Key, action: &mut Option<String>) -> bool {
@@ -1565,5 +1675,104 @@ mod tests {
         assert!(direct_hidden.contains("缩小选区"));
         assert!(!direct_hidden.contains("同一快捷键"));
         assert!(direct_hidden_warning);
+    }
+
+    /// Verifies that the configured input method backend really loads.
+    ///
+    /// This is the piece that was silently missing: the overlay had no IM context
+    /// at all, so no immodule was ever loaded and only ASCII could be typed. A
+    /// regression here is invisible to every other test -- the app still runs,
+    /// typing still works for ASCII -- so it is worth pinning.
+    ///
+    /// Ignored by default because it needs a live display and dlopens the real
+    /// immodule:
+    ///     cargo test -p vellum-ui -- --ignored the_input_method_backend_loads
+    #[test]
+    #[ignore = "requires a live display and the configured immodule"]
+    fn the_input_method_backend_loads() {
+        let configured = std::env::var("GTK_IM_MODULE").unwrap_or_default();
+        println!("GTK_IM_MODULE={configured:?}");
+        if configured.is_empty() || configured == "gtk-im-context-simple" {
+            println!("no input method configured; nothing to verify");
+            return;
+        }
+
+        // GTK is used on the test-support worker, and the immodule is dlopened
+        // there when the context is created and focused.
+        let ran = crate::test_support::with_gtk(|| {
+            let im = IMMulticontext::new();
+            im.focus_in();
+            let _ = im.preedit_string();
+        });
+        if !ran {
+            println!("GTK could not initialise (no display); skipping");
+            return;
+        }
+
+        // /proc/self/maps is process-wide, so the module the worker loaded is
+        // visible here.
+        let maps = std::fs::read_to_string("/proc/self/maps").expect("own maps");
+        let loaded: Vec<&str> = maps
+            .lines()
+            .filter(|l| l.contains("immodules") || l.contains("im-fcitx") || l.contains("im-ibus"))
+            .collect();
+        println!("immodules mapped: {loaded:#?}");
+        assert!(
+            !loaded.is_empty(),
+            "GTK_IM_MODULE={configured:?} but no immodule was loaded, so the session \
+             silently fell back to GtkIMContextSimple and composed input (Chinese, \
+             Japanese, dead keys) cannot work"
+        );
+    }
+
+    /// The input method must be attached to the key controller ONLY while a
+    /// label is being typed.
+    ///
+    /// This is the guard on the tool hotkeys. A focused IM context is what makes
+    /// fcitx5 compose, and GTK focuses an attached context by itself as soon as
+    /// the controller's widget has focus, so leaving it attached during plain
+    /// selection would swallow `d` (标注), `o` (OCR) and the rest. GTK's own
+    /// `gtk_event_controller_key_handle_event` returns early when the context
+    /// filters a key, so the key handlers would simply never run.
+    ///
+    /// Ignored because it needs a live session for the controller. Everything
+    /// lives inside the `with_gtk` closure: `Rc` is not `Send`, so the state
+    /// cannot be built on the test thread and moved onto the GTK worker.
+    ///     cargo test -p vellum-ui -- --ignored the_input_method_is_attached_only_while_typing
+    #[test]
+    #[ignore = "requires a live session for a GtkEventControllerKey"]
+    fn the_input_method_is_attached_only_while_typing() {
+        crate::test_support::with_gtk(|| {
+            let state = Rc::new(RefCell::new(overlay_state(true)));
+            let keys = EventControllerKey::new();
+            let im = Im::new(keys.clone());
+            im.context.set_client_widget(Some(&DrawingArea::new()));
+
+            im.sync(&state);
+            assert!(
+                keys.im_context().is_none(),
+                "the input method is attached with no label open, so fcitx5 would \
+                 swallow the tool hotkeys"
+            );
+
+            {
+                let mut state = state.borrow_mut();
+                state.annotating = true;
+                state.annotator.set_tool(Tool::Text);
+                state.annotator.press(80.0, 90.0);
+            }
+            im.sync(&state);
+            assert!(
+                keys.im_context().is_some(),
+                "the input method was not attached, so a label cannot be typed"
+            );
+
+            state.borrow_mut().annotator.commit_text();
+            im.sync(&state);
+            assert!(
+                keys.im_context().is_none(),
+                "the input method stayed attached after the label was committed"
+            );
+        });
     }
 }
