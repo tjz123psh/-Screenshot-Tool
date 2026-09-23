@@ -33,11 +33,18 @@ pub const MANAGED_END: &str = "// <<< vellum managed shortcuts";
 static BIND_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*([^\s{]+)(?:\s+[^{}]+)?\s*\{(.*)\}\s*$").unwrap());
 static SPAWN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bspawn\s+"(?:[^"]*/)?vellum(?:ctl)?"\s+"(region|long|pin-last)""#).unwrap()
+    Regex::new(&format!(
+        r#"\bspawn\s+"(?:[^"]*/)?vellum(?:ctl)?"\s+"({})""#,
+        super::action_alternation()
+    ))
+    .unwrap()
 });
 static SPAWN_SH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bspawn-sh\s+"[^"]*(?:^|/)vellum(?:ctl)?\s+(region|long|pin-last)(?:\s|;|")"#)
-        .unwrap()
+    Regex::new(&format!(
+        r#"\bspawn-sh\s+"[^"]*(?:^|/)vellum(?:ctl)?\s+({})(?:\s|;|")"#,
+        super::action_alternation()
+    ))
+    .unwrap()
 });
 static INCLUDE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?m)^\s*include\s+"([^"]+)""#).unwrap());
@@ -537,7 +544,11 @@ mod tests {
         let dir = workspace(PLAIN);
         let result = install(Some(dir.path()));
         assert_eq!(result.status, Status::Installed);
-        assert_eq!(result.added.len(), 3);
+        // Derived, not a magic number. A hardcoded count here has to be bumped
+        // every time a default is added, and a stale one is exactly how the `full`
+        // addition first showed up — as a failing count rather than as a statement
+        // about what install is supposed to do.
+        assert_eq!(result.added.len(), DEFAULT_SHORTCUTS.len());
         let text = std::fs::read_to_string(dir.path().join("dms/keybinds.kdl")).unwrap();
         assert!(text.contains(MANAGED_BEGIN));
         assert!(text.contains("vellumctl region"));
@@ -623,7 +634,13 @@ mod tests {
         );
         let result = install(Some(dir.path()));
         assert_eq!(result.status, Status::Installed);
-        assert_eq!(result.added, ["Mod+Shift+Print", "Mod+Ctrl+Print"]);
+        // Every default except the chord the file already binds.
+        let expected: Vec<&str> = DEFAULT_SHORTCUTS
+            .iter()
+            .map(|(chord, _, _)| *chord)
+            .filter(|chord| *chord != "Mod+Print")
+            .collect();
+        assert_eq!(result.added, expected);
     }
 
     #[test]

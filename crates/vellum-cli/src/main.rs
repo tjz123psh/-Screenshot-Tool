@@ -326,6 +326,7 @@ fn status(json: bool) -> anyhow::Result<u8> {
         Some(State::Busy) => match response.action.as_deref() {
             Some("region") => "正在区域截图",
             Some("long") => "正在长截图",
+            Some("full") => "正在全屏截图",
             _ => "忙",
         },
         _ => "空闲",

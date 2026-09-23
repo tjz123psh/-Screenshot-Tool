@@ -42,7 +42,11 @@ pub const MANAGED_END: &str = "# <<< vellum managed shortcuts";
 /// Accepts both `vellum` and `vellumctl`, with or without a leading path, so a
 /// hand-written binding counts as "already present" and is not duplicated.
 static SPAWN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:^|[\s/\x22'])vellum(?:ctl)?\s+(region|long|pin-last)\b").unwrap()
+    Regex::new(&format!(
+        r"(?:^|[\s/\x22'])vellum(?:ctl)?\s+({})\b",
+        super::action_alternation()
+    ))
+    .unwrap()
 });
 
 /// `bind = MODS, KEY, dispatcher, args`. Captures the mods+key half so a chord

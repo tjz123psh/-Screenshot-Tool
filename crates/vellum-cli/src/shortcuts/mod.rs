@@ -29,12 +29,28 @@ mod niri;
 use std::path::{Path, PathBuf};
 
 use vellum_core::compositor::{self, Compositor};
+use vellum_ipc::Action;
+
+/// The actions a vellum binding can name, as a regex alternation.
+///
+/// Built from the protocol's own list rather than written out again. An action
+/// added to the protocol but missed in a pattern here is silently invisible to
+/// conflict detection, and the installer then refuses to write because it believes
+/// a chord it wrote itself is already taken — which is exactly what happened when
+/// `full` was added: the binding was written, the next run could not see it, and
+/// it reported a conflict against itself.
+pub(crate) fn action_alternation() -> String {
+    [Action::Region, Action::Long, Action::Full, Action::PinLast]
+        .map(Action::as_str)
+        .join("|")
+}
 
 /// The chords vellum installs by default, as `(chord, action, title)`.
 ///
 /// Written in niri's syntax because that is the one vellum actually writes;
 /// `hyprland::chord` translates it. Deliberately conservative: these leave the
-/// compositors' own `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone.
+/// compositors' own `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone,
+/// and `Mod+Ctrl+Shift+Print` is distinct from all of them.
 ///
 /// The spawned command is `vellumctl`, not `vellum`: this runs on every
 /// keypress and the thin client avoids the argument parser and the GUI stack.
@@ -42,6 +58,7 @@ pub const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Mod+Print", "region", "vellum 框选"),
     ("Mod+Shift+Print", "long", "vellum 长截图"),
     ("Mod+Ctrl+Print", "pin-last", "vellum 钉图"),
+    ("Mod+Ctrl+Shift+Print", "full", "vellum 全屏"),
 ];
 
 /// One discovered binding, with enough provenance to print it back to a user.
@@ -146,6 +163,7 @@ pub fn action_label(action: &str) -> &str {
     match action {
         "region" => "区域截图",
         "long" => "长截图",
+        "full" => "全屏截图",
         "pin-last" => "钉住剪贴板",
         other => other,
     }
