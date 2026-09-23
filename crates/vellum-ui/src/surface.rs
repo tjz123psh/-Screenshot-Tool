@@ -1197,6 +1197,9 @@ struct PopupLayout {
     /// aims at — would otherwise land on the rail's half-open edge and miss. That
     /// made the top of the range unreachable by dragging.
     grab: Bounds,
+    /// The fixed-width slot the value is right-aligned in. Zero-sized for the
+    /// colour popup.
+    value: Bounds,
     /// The colour swatches. Empty for the size popup.
     items: Vec<Bounds>,
 }
@@ -1208,6 +1211,13 @@ const POPUP_PAD: (f64, f64, f64) = (10.0, 9.0, 7.0);
 const SLIDER_LEN: f64 = 190.0;
 const SLIDER_TRACK_H: f64 = 4.0;
 const SLIDER_HANDLE_R: f64 = 7.0;
+/// The value readout beside the slider, and the width reserved for it.
+///
+/// A fixed slot, right-aligned, so the number does not jitter sideways as it
+/// gains and loses a digit while the slider is being dragged.
+const SLIDER_VALUE_W: f64 = 32.0;
+const SLIDER_VALUE_GAP: f64 = 8.0;
+const SLIDER_VALUE_FONT: &str = "Sans Bold 10";
 
 /// Popup geometry. Anchored to its own toolbar button, above when there is room,
 /// and clamped so it never leaves the output.
@@ -1235,9 +1245,10 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
                 pad_y * 2.0 + item_h,
             )
         }
-        // Tall enough for the handle to sit inside the slab.
+        // Tall enough for the handle to sit inside the slab, and wide enough for
+        // the rail plus the value slot beside it.
         Popup::Size => (
-            pad_x * 2.0 + SLIDER_LEN,
+            pad_x * 2.0 + SLIDER_LEN + SLIDER_VALUE_GAP + SLIDER_VALUE_W,
             pad_y * 2.0 + SLIDER_HANDLE_R * 2.0,
         ),
     };
@@ -1252,7 +1263,7 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
     };
 
     let bar = Bounds::new(bx, by, popup_w, popup_h);
-    let (rail, grab) = if popup == Popup::Size {
+    let (rail, grab, value) = if popup == Popup::Size {
         let rail = Bounds::new(bx + pad_x, by + popup_h / 2.0, SLIDER_LEN, SLIDER_TRACK_H);
         let grab = Bounds::new(
             rail.x - SLIDER_HANDLE_R,
@@ -1260,9 +1271,15 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
             rail.w + SLIDER_HANDLE_R * 2.0,
             SLIDER_HANDLE_R * 2.0,
         );
-        (rail, grab)
+        let value = Bounds::new(
+            rail.x + rail.w + SLIDER_VALUE_GAP,
+            by + pad_y,
+            SLIDER_VALUE_W,
+            popup_h - pad_y * 2.0,
+        );
+        (rail, grab, value)
     } else {
-        (Bounds::default(), Bounds::default())
+        (Bounds::default(), Bounds::default(), Bounds::default())
     };
     let items = if popup == Popup::Color {
         (0..PALETTE.len())
@@ -1282,6 +1299,7 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
         bar,
         rail,
         grab,
+        value,
         items,
     })
 }
@@ -1333,8 +1351,31 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
                 }
             }
         }
-        Popup::Size => draw_size_slider(cr, layout.rail, state.annotator.size_fraction()),
+        Popup::Size => {
+            draw_size_slider(cr, layout.rail, state.annotator.size_fraction());
+            // The value, right-aligned in its reserved slot so the digits grow
+            // leftwards instead of shifting the rail.
+            let readout = size_readout(state.annotator.size());
+            let (tw, th) = paint::text_size(cr, SLIDER_VALUE_FONT, &readout);
+            paint::draw_text(
+                cr,
+                SLIDER_VALUE_FONT,
+                &readout,
+                layout.value.x + layout.value.w - tw,
+                layout.value.y + (layout.value.h - th) / 2.0,
+                (0.90, 0.93, 1.0, 0.9),
+            );
+        }
     }
+}
+
+/// The number shown beside the slider.
+///
+/// Rounded to whole pixels: the slider is continuous, but a sub-pixel stroke width
+/// or glyph size is not a thing the user can act on, and a decimal would churn
+/// while dragging.
+fn size_readout(size: f64) -> String {
+    format!("{:.0}", size)
 }
 
 /// The size slider: an unfilled track, the filled part, then the handle.
@@ -1998,6 +2039,42 @@ mod tests {
                 layout.grab.y >= layout.bar.y
                     && layout.grab.y + layout.grab.h <= layout.bar.y + layout.bar.h,
                 "the slider row leaves its slab at {width} px"
+            );
+            assert!(
+                layout.value.x >= layout.bar.x
+                    && layout.value.x + layout.value.w <= layout.bar.x + layout.bar.w,
+                "the value slot leaves its slab at {width} px"
+            );
+        }
+    }
+
+    /// The readout is a whole number, so it does not churn while dragging.
+    #[test]
+    fn the_readout_is_rounded_to_whole_pixels() {
+        assert_eq!(size_readout(24.0), "24");
+        assert_eq!(size_readout(24.4), "24");
+        assert_eq!(size_readout(119.6), "120");
+        assert_eq!(size_readout(10.0), "10");
+    }
+
+    /// The value slot must fit the widest number either range can produce, or the
+    /// readout would spill out of the slab at the top of the range.
+    #[test]
+    fn the_value_slot_fits_the_widest_readout() {
+        let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
+        let cr = Context::new(&surface).expect("cairo context");
+
+        // The wider range produces the wider number; check both so a future range
+        // change cannot quietly overflow the slot.
+        for tool in [Tool::Pen, Tool::Text] {
+            let mut annotator = Annotator::new();
+            annotator.set_tool(tool);
+            let widest = size_readout(annotator.size_range().1);
+            let (tw, _) = paint::text_size(&cr, SLIDER_VALUE_FONT, &widest);
+            assert!(
+                tw <= SLIDER_VALUE_W,
+                "{tool:?}: the readout {widest:?} needs {tw:.1} px but the slot is \
+                 {SLIDER_VALUE_W} px"
             );
         }
     }
