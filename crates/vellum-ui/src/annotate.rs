@@ -34,6 +34,14 @@ const PEN_MIN_STEP_SQ: f64 = 1.0;
 /// Drag distance below which an arrow or rectangle is treated as a stray click.
 const MIN_DRAG: f64 = 2.0;
 
+/// How a label's font size is derived from the stroke width when it has not been
+/// set explicitly. This is the original behaviour: a thin pen gave 12 px text and
+/// the widest gave 44 px.
+const TEXT_SIZE_PER_WIDTH: f64 = 4.0;
+/// Legibility floor and a ceiling that still fits inside a selection.
+const MIN_TEXT_SIZE: f64 = 12.0;
+const MAX_TEXT_SIZE: f64 = 200.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Pen,
@@ -72,6 +80,14 @@ struct Stroke {
     /// Pen: every sampled point. Arrow/rect: start and end. Text: the anchor.
     points: Vec<(f64, f64)>,
     text: String,
+    /// Text only: the label's font size, in pixels, captured when the label was
+    /// started.
+    ///
+    /// Stored per stroke rather than read from the annotator when drawing, so
+    /// changing the size afterwards does not silently resize labels that are
+    /// already placed — which would otherwise also happen on every cache replay
+    /// after an undo.
+    size: f64,
 }
 
 /// In-progress text entry. Kept separate from `strokes` so undo can discard the
@@ -90,6 +106,12 @@ pub struct Annotator {
     tool: Tool,
     color_idx: usize,
     width_idx: usize,
+    /// Font size for the next label, or `None` to follow the stroke width.
+    ///
+    /// `None` is the historical behaviour and stays the default, so nothing
+    /// changes until the size is actually adjusted; setting it decouples the two
+    /// and lets a thin pen carry large text.
+    text_size: Option<f64>,
     strokes: Vec<Stroke>,
     active: Option<Stroke>,
     editing: Option<TextEdit>,
@@ -109,6 +131,7 @@ impl Annotator {
             tool: Tool::Pen,
             color_idx: 0,
             width_idx: 1,
+            text_size: None,
             strokes: Vec::new(),
             active: None,
             editing: None,
@@ -143,6 +166,29 @@ impl Annotator {
 
     pub fn width(&self) -> f64 {
         WIDTHS[self.width_idx.min(WIDTHS.len() - 1)]
+    }
+
+    /// The font size a new label will use.
+    pub fn text_size(&self) -> f64 {
+        self.text_size
+            .unwrap_or_else(|| (self.width() * TEXT_SIZE_PER_WIDTH).max(MIN_TEXT_SIZE))
+    }
+
+    /// Sets the label font size, decoupling it from the stroke width.
+    pub fn set_text_size(&mut self, px: f64) {
+        let size = px.clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE);
+        self.text_size = Some(size);
+        // Resize the label being typed as well, so an adjustment is visible while
+        // the user is looking at the text rather than only on the next label.
+        if let Some(edit) = self.editing.as_mut() {
+            edit.stroke.size = size;
+        }
+    }
+
+    /// Grows or shrinks the label font size. This is what the wheel does over the
+    /// canvas while the text tool is active.
+    pub fn nudge_text_size(&mut self, delta: f64) {
+        self.set_text_size(self.text_size() + delta);
     }
 
     pub fn set_color_index(&mut self, index: usize) {
@@ -185,6 +231,7 @@ impl Annotator {
             width: self.width(),
             points: vec![(px, py)],
             text: String::new(),
+            size: self.text_size(),
         };
         match self.tool {
             Tool::Text => {
@@ -467,7 +514,9 @@ fn draw_text_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str) {
 
     let layout = pangocairo::functions::create_layout(cr);
     let mut font = FontDescription::from_string("Sans Bold");
-    font.set_absolute_size((stroke.width * 4.0).max(12.0) * f64::from(pango::SCALE));
+    // Per-stroke, not derived from the width here: the two were coupled until
+    // the size became adjustable, and re-deriving would resize placed labels.
+    font.set_absolute_size(stroke.size * f64::from(pango::SCALE));
     layout.set_font_description(Some(&font));
     layout.set_text(&shown);
     if !preedit.is_empty() {
@@ -716,5 +765,82 @@ mod tests {
         assert_eq!(a.caret_anchor(), Some((60.0, 70.0)));
         a.commit_text();
         assert_eq!(a.caret_anchor(), None, "a finished label has no caret");
+    }
+
+    /// Until the size is set explicitly, a label is sized from the stroke width
+    /// exactly as before, so the default look does not change.
+    #[test]
+    fn a_label_follows_the_stroke_width_until_the_size_is_set() {
+        let mut a = annotator();
+        a.set_width_index(1);
+        assert_eq!(a.text_size(), 16.0, "a 4 px pen used to give 16 px text");
+        a.set_width_index(3);
+        assert_eq!(a.text_size(), 44.0, "an 11 px pen used to give 44 px text");
+    }
+
+    /// The size is now adjustable on its own, so a thin pen can carry large text.
+    #[test]
+    fn the_label_size_is_independent_of_the_pen_width() {
+        let mut a = annotator();
+        a.set_width_index(0);
+        a.set_text_size(64.0);
+        assert_eq!(a.text_size(), 64.0);
+        a.set_width_index(3);
+        assert_eq!(
+            a.text_size(),
+            64.0,
+            "changing the pen width overrode the chosen label size"
+        );
+    }
+
+    #[test]
+    fn the_label_size_is_clamped_to_a_legible_range() {
+        let mut a = annotator();
+        a.set_text_size(1.0);
+        assert_eq!(a.text_size(), MIN_TEXT_SIZE);
+        a.set_text_size(10_000.0);
+        assert_eq!(a.text_size(), MAX_TEXT_SIZE);
+    }
+
+    /// The wheel resizes what the user is looking at, not only the next label.
+    #[test]
+    fn adjusting_the_size_resizes_the_label_being_typed() {
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(40.0, 60.0);
+        a.set_text_size(MIN_TEXT_SIZE);
+        a.type_str("MMMM");
+        let small = rightmost_ink(&a);
+
+        a.set_text_size(64.0);
+        let large = rightmost_ink(&a);
+        assert!(
+            large > small,
+            "growing the size did not widen the label being typed ({small} -> {large})"
+        );
+    }
+
+    /// Resizing for the next label must not redraw one already placed.
+    ///
+    /// This is why the size is stored per stroke: deriving it from the annotator
+    /// at draw time would resize every past label the moment the setting changed,
+    /// including on each cache replay after an undo.
+    #[test]
+    fn an_already_placed_label_keeps_its_size() {
+        let mut a = annotator();
+        a.set_tool(Tool::Text);
+        a.press(40.0, 60.0);
+        a.set_text_size(20.0);
+        a.type_str("MMMM");
+        a.commit_text();
+        let placed = rightmost_ink(&a);
+        assert!(placed > 0, "the placed label was not drawn at all");
+
+        a.set_text_size(80.0);
+        assert_eq!(
+            rightmost_ink(&a),
+            placed,
+            "changing the size redrew a label that was already placed"
+        );
     }
 }

@@ -30,7 +30,8 @@ use gtk4::gdk::{Key, ModifierType, Rectangle};
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, DrawingArea, EventControllerFocus, EventControllerKey,
-    EventControllerMotion, GestureClick, IMMulticontext,
+    EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, GestureClick,
+    IMMulticontext,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::geom::Rect;
@@ -53,6 +54,9 @@ const IDLE_TIMEOUT_US: i64 = 45 * 1_000_000;
 const IDLE_POLL_S: u32 = 5;
 /// Grace period after a focus loss before cancelling, in case focus comes back.
 const FOCUS_GRACE_MS: u32 = 10_000;
+
+/// Font-size change per wheel notch for an annotation label, in pixels.
+const TEXT_SIZE_WHEEL_STEP: f64 = 2.0;
 
 const DIM: (f64, f64, f64, f64) = (0.025, 0.03, 0.045, 0.56);
 /// Selection accent: indigo #4F46E5, the token the design system names.
@@ -194,6 +198,7 @@ pub fn present(
     im.context.set_client_widget(Some(&canvas));
 
     connect_pointer(&canvas, &state, &emitter, &im);
+    connect_scroll(&canvas, &state, &emitter);
     connect_keys(&window, &canvas, &state, &emitter, &keys, &im);
     connect_focus(&window, &state, &emitter);
     install_draw(&canvas, &state);
@@ -276,6 +281,34 @@ impl Emitter {
             child.queue_draw();
         }
     }
+}
+
+/// Wheel over the canvas adjusts the label's font size while the text tool is
+/// active.
+///
+/// This is the label font-size control, and it is deliberately not a toolbar
+/// button: the toolbar's ids and hotkeys are the pinned interaction contract, and
+/// a wheel is a free, continuous adjustment rather than another fixed set of
+/// steps. It only acts for the text tool, so the wheel stays available for
+/// anything that wants it later.
+fn connect_scroll(canvas: &DrawingArea, state: &Rc<RefCell<State>>, emitter: &Rc<Emitter>) {
+    let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
+    let scroll_state = state.clone();
+    let scroll_emitter = emitter.clone();
+    scroll.connect_scroll(move |_, _, dy| {
+        {
+            let mut state = scroll_state.borrow_mut();
+            state.mark_activity();
+            if !state.annotating || state.annotator.tool() != Tool::Text {
+                return glib::Propagation::Proceed;
+            }
+            // Scrolling up enlarges, which is the convention everywhere else.
+            state.annotator.nudge_text_size(-dy * TEXT_SIZE_WHEEL_STEP);
+        }
+        scroll_emitter.queue_draw();
+        glib::Propagation::Stop
+    });
+    canvas.add_controller(scroll);
 }
 
 fn connect_pointer(
@@ -787,7 +820,11 @@ fn draw(state: &mut State, cr: &Context) {
 
     draw_selection_frame(cr, rect);
 
-    draw_size_hint(cr, rect);
+    // The font size is only meaningful for the text tool, so it appears with the
+    // tool rather than as permanent clutter.
+    let label_size = (state.annotating && state.annotator.tool() == Tool::Text)
+        .then(|| state.annotator.text_size());
+    draw_size_hint(cr, rect, label_size);
     if state.long_shot {
         let notice = selection_panel_notice(rect, (state.screen_w, state.screen_h));
         draw_longshot_handoff_hint(cr, notice, state.daemon_managed, sw, sh);
@@ -937,8 +974,15 @@ fn draw_selection_handles(cr: &Context, rect: Rect) {
 ///
 /// Same material as the toolbar slab (crystal gradient plus specular edge) so
 /// the overlay reads as one design rather than a bar with a floating sticker.
-fn draw_size_hint(cr: &Context, rect: Rect) {
-    let text = format!("{} × {}", rect.w, rect.h);
+///
+/// `label_size` is the current annotation font size, shown only while the text
+/// tool is active. The wheel adjusts it and there is no toolbar button for it, so
+/// without this readout the control would be invisible.
+fn draw_size_hint(cr: &Context, rect: Rect, label_size: Option<f64>) {
+    let text = match label_size {
+        Some(size) => format!("{} × {} · 字号 {size:.0}", rect.w, rect.h),
+        None => format!("{} × {}", rect.w, rect.h),
+    };
     let (tw, th) = paint::text_size(cr, SIZE_HINT_FONT, &text);
     let bw = tw + 16.0;
     let bh = th + 9.0;
