@@ -24,13 +24,6 @@ pub const BYPASS_ENV: &str = "VELLUM_BYPASS_SERVICE";
 pub enum Action {
     Region,
     Long,
-    /// The whole output, preselected.
-    ///
-    /// The region overlay with the selection already made, rather than a separate
-    /// capture path: the user still gets the toolbar, the annotations and the
-    /// ability to pull an edge in, which is what makes a full-screen capture worth
-    /// having as its own command.
-    Full,
     PinLast,
 }
 
@@ -39,7 +32,6 @@ impl Action {
         match self {
             Action::Region => "region",
             Action::Long => "long",
-            Action::Full => "full",
             Action::PinLast => "pin-last",
         }
     }
@@ -47,14 +39,13 @@ impl Action {
     /// `region`/`long` may not overlap: only one selector can own the screen.
     /// `pin-last` is not exclusive and is not tracked as the active child.
     pub fn is_exclusive(self) -> bool {
-        matches!(self, Action::Region | Action::Long | Action::Full)
+        matches!(self, Action::Region | Action::Long)
     }
 
     pub fn display_name(self) -> &'static str {
         match self {
             Action::Region => "区域截图",
             Action::Long => "长截图",
-            Action::Full => "全屏截图",
             Action::PinLast => "钉图",
         }
     }
@@ -63,7 +54,6 @@ impl Action {
         match value {
             "region" => Some(Action::Region),
             "long" => Some(Action::Long),
-            "full" => Some(Action::Full),
             "pin-last" => Some(Action::PinLast),
             _ => None,
         }
@@ -216,23 +206,6 @@ mod tests {
             serde_json::from_str::<Action>("\"pin-last\"").unwrap(),
             Action::PinLast
         );
-    }
-
-    /// Full screen travels the daemon boundary as "full", which is also the
-    /// argument the control service passes to the UI binary.
-    #[test]
-    fn full_screen_round_trips_and_names_itself() {
-        assert_eq!(Action::Full.as_str(), "full");
-        assert_eq!(Action::parse("full"), Some(Action::Full));
-        let json = serde_json::to_string(&Action::Full).unwrap();
-        assert_eq!(json, "\"full\"");
-        assert_eq!(
-            serde_json::from_str::<Action>("\"full\"").unwrap(),
-            Action::Full
-        );
-        // It owns the screen like the region selector does, so it has to be
-        // exclusive or two selectors could be mapped at once.
-        assert!(Action::Full.is_exclusive());
     }
 
     #[test]

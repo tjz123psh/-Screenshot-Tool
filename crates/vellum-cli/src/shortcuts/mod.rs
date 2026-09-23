@@ -40,7 +40,7 @@ use vellum_ipc::Action;
 /// `full` was added: the binding was written, the next run could not see it, and
 /// it reported a conflict against itself.
 pub(crate) fn action_alternation() -> String {
-    [Action::Region, Action::Long, Action::Full, Action::PinLast]
+    [Action::Region, Action::Long, Action::PinLast]
         .map(Action::as_str)
         .join("|")
 }
@@ -49,8 +49,7 @@ pub(crate) fn action_alternation() -> String {
 ///
 /// Written in niri's syntax because that is the one vellum actually writes;
 /// `hyprland::chord` translates it. Deliberately conservative: these leave the
-/// compositors' own `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone,
-/// and `Mod+Ctrl+Shift+Print` is distinct from all of them.
+/// compositors' own `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone.
 ///
 /// The spawned command is `vellumctl`, not `vellum`: this runs on every
 /// keypress and the thin client avoids the argument parser and the GUI stack.
@@ -58,7 +57,6 @@ pub const DEFAULT_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("Mod+Print", "region", "vellum 框选"),
     ("Mod+Shift+Print", "long", "vellum 长截图"),
     ("Mod+Ctrl+Print", "pin-last", "vellum 钉图"),
-    ("Mod+Ctrl+Shift+Print", "full", "vellum 全屏"),
 ];
 
 /// One discovered binding, with enough provenance to print it back to a user.
@@ -163,7 +161,6 @@ pub fn action_label(action: &str) -> &str {
     match action {
         "region" => "区域截图",
         "long" => "长截图",
-        "full" => "全屏截图",
         "pin-last" => "钉住剪贴板",
         other => other,
     }

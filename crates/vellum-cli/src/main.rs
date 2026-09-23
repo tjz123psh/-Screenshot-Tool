@@ -36,11 +36,6 @@ enum Command {
         #[command(flatten)]
         output: OutputFlags,
     },
-    /// 全屏截图（整块输出预选好，仍可调整和标注）
-    Full {
-        #[command(flatten)]
-        output: OutputFlags,
-    },
     /// 长截图（滚动拼接）
     Long {
         #[command(flatten)]
@@ -187,7 +182,6 @@ fn run() -> anyhow::Result<u8> {
     let cli = Cli::parse();
     match cli.command {
         Command::Region { output } => capture(Action::Region, &output, &[]),
-        Command::Full { output } => capture(Action::Full, &output, &[]),
         Command::Long {
             output,
             longshot_trace,
@@ -288,7 +282,7 @@ fn service_fallback_notice(action: Action) -> (&'static str, &'static str) {
             "Vellum 服务未启动",
             "已直接打开长截图；再次按快捷键无法完成，请使用控制面板的“完成”按钮",
         ),
-        Action::Region | Action::Full | Action::PinLast => (
+        Action::Region | Action::PinLast => (
             "Vellum 服务未启动",
             "控制服务启动失败，已直接打开本次截图；建议稍后运行 vellum doctor",
         ),
@@ -326,7 +320,6 @@ fn status(json: bool) -> anyhow::Result<u8> {
         Some(State::Busy) => match response.action.as_deref() {
             Some("region") => "正在区域截图",
             Some("long") => "正在长截图",
-            Some("full") => "正在全屏截图",
             _ => "忙",
         },
         _ => "空闲",

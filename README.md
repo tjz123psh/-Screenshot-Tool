@@ -111,7 +111,6 @@ VELLUM_BIN_DIR="$HOME/bin" ./install.sh
 
 ```sh
 vellum region             # 区域截图
-vellum full               # 全屏截图（整块输出预选好，仍可调整和标注）
 vellum long               # 开始/完成长截图
 vellum pin-last           # 钉住剪贴板中的图片
 vellum panel              # 打开设置面板（模型接口、翻译、OCR）

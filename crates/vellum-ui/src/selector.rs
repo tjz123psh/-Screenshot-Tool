@@ -69,17 +69,6 @@ impl Selector {
         Hit::Outside
     }
 
-    /// Selects the whole output, as the full-screen entry point starts out.
-    ///
-    /// Leaves the selector in `HasSelection` rather than a special mode, so every
-    /// existing path — moving, resizing, the toolbar, the annotations — works on it
-    /// unchanged.
-    pub fn select_all(&mut self) {
-        self.rect = Rect::new(0, 0, self.screen_w, self.screen_h);
-        self.mode = Mode::HasSelection;
-        self.active_handle = None;
-    }
-
     pub fn press(&mut self, px: f64, py: f64) {
         self.drag_anchor = (px, py);
         self.orig_rect = self.rect;
@@ -198,22 +187,6 @@ mod tests {
 
     fn selector() -> Selector {
         Selector::new(1000, 800)
-    }
-
-    /// Full screen starts as a finished selection covering the output, and then
-    /// behaves like any other: the edges can still be pulled in.
-    #[test]
-    fn select_all_covers_the_output_and_stays_editable() {
-        let mut s = selector();
-        s.select_all();
-        assert_eq!(s.rect, Rect::new(0, 0, 1000, 800));
-        assert_eq!(s.mode, Mode::HasSelection);
-        assert_eq!(s.hit_test(500.0, 400.0), Hit::Inside);
-
-        // A press inside moves it rather than starting a new selection, which is
-        // what makes the full-screen entry point the same overlay as region.
-        s.press(500.0, 400.0);
-        assert_eq!(s.mode, Mode::Moving);
     }
 
     #[test]
