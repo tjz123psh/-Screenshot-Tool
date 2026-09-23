@@ -101,7 +101,7 @@ pub type ResultHandler = Rc<dyn Fn(Outcome)>;
 enum Popup {
     Color,
     Width,
-    /// Label font sizes, shown by the same 粗细 button while the text tool is
+    /// Label font sizes, shown by the same 大小 button while the text tool is
     /// active. A separate variant rather than a polymorphic `Width`, so what the
     /// popup contains is decided in one place instead of being implied by the
     /// active tool at every site that reads it.
@@ -1213,7 +1213,7 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
     })
 }
 
-/// Which ladder the 粗细 button shows for the active tool.
+/// Which ladder the 大小 button shows for the active tool.
 ///
 /// One button, two ladders: for text the useful "thickness" is the label size,
 /// for a drawing tool it is the line weight. The button id and hotkey are the
@@ -1263,14 +1263,17 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
             }
             Popup::TextSize => {
                 paint::fill_rounded(cr, *bounds, 8.0, (1.0, 1.0, 1.0, 0.06));
-                // The number is the control. A bar of proportional height would
-                // read as a second thickness setting, which is exactly the
-                // confusion the two-in-one 粗细 button already caused.
-                let label = format!("{}", TEXT_SIZES[index] as i32);
-                let (tw, th) = paint::text_size(cr, "Sans Bold 11", &label);
+                // Drawn at a size proportional to its value, so the entry shows
+                // what it means rather than only naming it. A bar of proportional
+                // height — how the stroke widths are drawn — would read as a
+                // second thickness ladder.
+                let size = TEXT_SIZES[index];
+                let font = format!("Sans Bold {}", (size * 0.30).clamp(9.0, 21.0) as i32);
+                let label = format!("{}", size as i32);
+                let (tw, th) = paint::text_size(cr, &font, &label);
                 paint::draw_text(
                     cr,
-                    "Sans Bold 11",
+                    &font,
                     &label,
                     bounds.x + (bounds.w - tw) / 2.0,
                     bounds.y + (bounds.h - th) / 2.0,
@@ -1811,7 +1814,7 @@ mod tests {
         );
     }
 
-    /// The 粗细 button shows the size ladder for text and the line-weight ladder
+    /// The 大小 button shows the size ladder for text and the line-weight ladder
     /// for every drawing tool.
     #[test]
     fn the_width_button_shows_the_label_size_only_for_text() {

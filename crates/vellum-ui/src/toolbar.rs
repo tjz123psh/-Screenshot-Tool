@@ -207,7 +207,12 @@ pub const ANNOTATE_BUTTONS: &[ButtonSpec] = &[
     spec("tool.rect", "矩形", "r", "R"),
     spec("tool.text", "文字", "x", "X"),
     spec("anno.color", "颜色", "c", "C"),
-    spec("anno.width", "粗细", "w", "W"),
+    // "大小" and not "粗细": this control carries the size of whatever tool is
+    // active, which is a font size for the text tool and a line weight for the
+    // drawing tools. A line-specific name would be lying half the time, which is
+    // exactly what made the split feel wrong. Id and hotkey are unchanged and
+    // remain part of the frozen interaction contract.
+    spec("anno.width", "大小", "w", "W"),
     spec("anno.undo", "撤销", "u", "U"),
     spec("anno.done", "完成", "Return", "⏎"),
 ];
@@ -664,6 +669,22 @@ mod tests {
             });
             assert_eq!(found.id(), *id, "hotkey {key:?} moved to the wrong button");
         }
+    }
+
+    /// The size button must not be named after a line property.
+    ///
+    /// It carries the font size when the text tool is active, so a line-specific
+    /// name like 粗细 is wrong half the time — which is what made the split feel
+    /// off. Pinned because the name is only copy, easy to "tidy" back by
+    /// accident, while the id and hotkey beside it are frozen contract.
+    #[test]
+    fn the_size_button_is_named_generically() {
+        let button = ANNOTATE_BUTTONS
+            .iter()
+            .find(|button| button.id == "anno.width")
+            .expect("the size button exists");
+        assert_eq!(button.label, "大小");
+        assert_eq!(button.hotkey, "w", "the hotkey is part of the contract");
     }
 
     /// The annotate bar's hotkeys are pinned the same way.

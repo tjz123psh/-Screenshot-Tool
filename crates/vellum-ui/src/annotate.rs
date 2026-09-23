@@ -26,7 +26,7 @@ pub const PALETTE: [(f64, f64, f64); 6] = [
 
 pub const WIDTHS: [f64; 4] = [2.0, 4.0, 7.0, 11.0];
 
-/// Label font sizes offered by the 粗细 popup while the text tool is active.
+/// Label font sizes offered by the 大小 popup while the text tool is active.
 ///
 /// Discrete steps because that is what the popup can express, and it keeps the
 /// size in the same place as every other annotation setting. The wheel stays for
