@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=ai.vellum.Shortcuts
+Exec=@VELLUM_LAUNCHER@ shortcuts run
+SystemdService=vellum-shortcuts.service

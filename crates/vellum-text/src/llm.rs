@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use vellum_core::config::{ApiConfig, LlmConfig};
 
-use crate::api::{self, ApiError};
+use crate::api::{self, ApiError, RequestControl};
 
 /// Traditional-Chinese-only characters. Their presence means text is Han but
 /// still needs conversion, so the "already simplified Chinese" shortcut must
@@ -83,21 +83,55 @@ pub fn translate(
     api: &ApiConfig,
     llm: &LlmConfig,
 ) -> Result<Translation, TranslateError> {
+    let control = RequestControl::new(Duration::from_secs(api.timeout_s.max(1)));
+    translate_with_control(text, api, llm, &control)
+}
+
+/// All model attempts share this control's deadline; cancellation suppresses
+/// fallback and late results, but cannot instantly stop blocking network I/O.
+pub fn translate_with_control(
+    text: &str,
+    api: &ApiConfig,
+    llm: &LlmConfig,
+    control: &RequestControl,
+) -> Result<Translation, TranslateError> {
+    translate_using(text, api, llm, control, api::chat_with_control)
+}
+
+fn translate_using(
+    text: &str,
+    api: &ApiConfig,
+    llm: &LlmConfig,
+    control: &RequestControl,
+    mut chat: impl FnMut(
+        &ApiConfig,
+        &str,
+        serde_json::Value,
+        &RequestControl,
+    ) -> Result<String, ApiError>,
+) -> Result<Translation, TranslateError> {
+    control.check().map_err(map_api_error)?;
     let trimmed = text.trim();
+    control.check().map_err(map_api_error)?;
     if trimmed.is_empty() {
         return Ok(Translation {
             text: String::new(),
             transport: Transport::AlreadyTarget,
         });
     }
-    if already_target_language(trimmed, &llm.target_lang) {
+    let already_target = already_target_language(trimmed, &llm.target_lang);
+    control.check().map_err(map_api_error)?;
+    if already_target {
+        let text = text.to_string();
+        control.check().map_err(map_api_error)?;
         return Ok(Translation {
-            text: text.to_string(),
+            text,
             transport: Transport::AlreadyTarget,
         });
     }
 
     let candidates = model_candidates(llm);
+    control.check().map_err(map_api_error)?;
     if candidates.is_empty() {
         return Err(TranslateError::NotFound(
             "未配置翻译模型：请在设置面板填写 [llm].model".into(),
@@ -116,27 +150,29 @@ pub fn translate(
     // Every candidate shares the one configured budget: a per-model timeout
     // would let a long fallback list run for minutes before the user sees
     // anything.
-    let timeout = Duration::from_secs(api.timeout_s.max(1));
     let mut first_refusal: Option<TranslateError> = None;
 
     for model in candidates {
-        let attempt = api::chat(api, model, messages.clone(), timeout)
-            .map_err(|err| map_api_error(err, model));
+        control.check().map_err(map_api_error)?;
+        let attempt = chat(api, model, messages.clone(), control).map_err(map_api_error);
+        control.check().map_err(map_api_error)?;
         match attempt {
             Ok(text) => {
                 // strip_leading_label keeps the original when a label is all
                 // there is, so a non-empty answer stays non-empty.
                 return Ok(Translation {
-                    text: clean_translation(&text),
+                    text: {
+                        let cleaned = clean_translation(&text);
+                        control.check().map_err(map_api_error)?;
+                        cleaned
+                    },
                     transport: Transport::Api {
                         model: model.to_string(),
                     },
                 });
             }
             Err(err @ TranslateError::Upstream(_)) => {
-                // Keep the first refusal: it names the model the user actually
-                // configured, which is the useful one to report if every
-                // candidate is refused.
+                // Keep the primary attempt's safe category, without model names.
                 first_refusal.get_or_insert(err);
             }
             // A missing key, an unreachable host or a broken response would hit
@@ -146,6 +182,7 @@ pub fn translate(
         }
     }
 
+    control.check().map_err(map_api_error)?;
     Err(first_refusal.unwrap_or_else(|| {
         TranslateError::NotFound("没有可用的翻译模型，请检查 [llm].model".into())
     }))
@@ -243,17 +280,14 @@ fn model_candidates(llm: &LlmConfig) -> Vec<&str> {
 
 /// One API failure as a translation failure.
 ///
-/// The model is named in the upstream message because that is the piece of
-/// information a fallback list makes ambiguous.
-fn map_api_error(err: ApiError, model: &str) -> TranslateError {
+/// Raw model identifiers are configuration data, not diagnostic text.
+fn map_api_error(err: ApiError) -> TranslateError {
     match err {
         ApiError::MissingKey => TranslateError::NotFound(ApiError::MissingKey.to_string()),
-        ApiError::Upstream(message) => {
-            TranslateError::Upstream(format!("模型 {model} 被上游拒绝：{message}"))
-        }
+        ApiError::Upstream(message) => TranslateError::Upstream(message),
         // A bigger model may fit what the small one could not, so this walks
         // the fallback list rather than failing outright.
-        ApiError::Truncated(message) => TranslateError::Upstream(format!("模型 {model} {message}")),
+        ApiError::Truncated(message) => TranslateError::Upstream(message),
         other => TranslateError::Failed(other.to_string()),
     }
 }
@@ -315,6 +349,7 @@ mod tests {
         ApiConfig {
             base_url,
             api_key: "sk-test".into(),
+            proxy: "none".into(),
             ..ApiConfig::default()
         }
     }
@@ -635,7 +670,14 @@ mod tests {
         let err = translate("Open the settings panel", &api(server.base_url()), &llm).unwrap_err();
         assert!(matches!(err, TranslateError::Upstream(_)), "{err:?}");
         let message = err.to_string();
-        assert!(message.contains("primary"), "{message}");
+        assert!(
+            !message.contains("primary"),
+            "private model leaked: {message}"
+        );
+        assert!(
+            !message.contains("backup"),
+            "private model leaked: {message}"
+        );
         assert!(message.contains("Invalid API key"), "{message}");
         assert_eq!(server.requests().len(), 2);
     }
@@ -671,5 +713,98 @@ mod tests {
         };
         let err = translate("Open the settings panel", &offline_api(), &llm).unwrap_err();
         assert!(matches!(err, TranslateError::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn fallbacks_receive_only_the_remaining_shared_budget() {
+        let control = RequestControl::with_test_clock(Duration::from_secs(10));
+        let llm = LlmConfig {
+            model: "primary".into(),
+            fallback_models: vec!["backup".into(), "unused".into()],
+            ..llm()
+        };
+        let mut budgets = Vec::new();
+        let error = translate_using(
+            "Open the panel",
+            &offline_api(),
+            &llm,
+            &control,
+            |_, _, _, control| {
+                budgets.push(control.remaining().unwrap());
+                control.advance(Duration::from_secs(6));
+                Err(ApiError::Upstream("safe synthetic refusal".into()))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            budgets,
+            vec![Duration::from_secs(10), Duration::from_secs(4)]
+        );
+        assert_eq!(error.to_string(), ApiError::DeadlineExceeded.to_string());
+    }
+
+    #[test]
+    fn cancellation_after_refusal_prevents_every_fallback() {
+        let control = RequestControl::with_test_clock(Duration::from_secs(10));
+        let llm = LlmConfig {
+            model: "primary".into(),
+            fallback_models: vec!["backup".into()],
+            ..llm()
+        };
+        let mut attempts = 0;
+        let error = translate_using(
+            "Open the panel",
+            &offline_api(),
+            &llm,
+            &control,
+            |_, _, _, control| {
+                attempts += 1;
+                control.cancel();
+                Err(ApiError::Upstream("safe synthetic refusal".into()))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error.to_string(), ApiError::Cancelled.to_string());
+    }
+
+    #[test]
+    fn success_after_deadline_is_not_published() {
+        let control = RequestControl::with_test_clock(Duration::from_secs(2));
+        let error = translate_using(
+            "Open the panel",
+            &offline_api(),
+            &llm(),
+            &control,
+            |_, _, _, control| {
+                control.advance(Duration::from_secs(2));
+                Ok("late synthetic text".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), ApiError::DeadlineExceeded.to_string());
+    }
+
+    #[test]
+    fn real_http_fallbacks_do_not_restart_the_timeout() {
+        let server = MockServer::start(vec![
+            Script::slow(Duration::from_millis(180), 429, "{}"),
+            Script::slow(Duration::from_millis(180), 429, "{}"),
+            Script::reply(200, choices("too late")),
+        ]);
+        let llm = LlmConfig {
+            model: "primary".into(),
+            fallback_models: vec!["backup".into(), "unused".into()],
+            ..llm()
+        };
+        let control = RequestControl::new(Duration::from_millis(280));
+        let error =
+            translate_with_control("Open the panel", &api(server.base_url()), &llm, &control)
+                .unwrap_err();
+        assert_eq!(error.to_string(), ApiError::DeadlineExceeded.to_string());
+        assert!(
+            server.requests().len() <= 2,
+            "a fallback restarted the budget"
+        );
     }
 }

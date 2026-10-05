@@ -25,7 +25,7 @@ anyhow = "=1.0.103"
 chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "=4.6.1", features = ["derive"] }
 flate2 = "=1.1.9"
-image = { version = "=0.25.10", default-features = false, features = ["png"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 libc = "=0.2.186"
 rayon = "=1.12.0"
 serde = { version = "=1.0.228", features = ["derive"] }
@@ -38,8 +38,8 @@ ureq = { version = "=3.3.0", features = ["json"] }
 # protocol code or dependencies on the shortcut hot path.
 memmap2 = "=0.9.11"
 tempfile = "=3.27.0"
-wayland-client = "=0.31.14"
-wayland-protocols = { version = "=0.32.13", features = ["client", "unstable"] }
+wayland-client = { version = "=0.31.14", features = ["system"] }
+wayland-protocols = { version = "=0.32.13", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
 
 # GTK stack. These seven versions must move as a set: gtk4 0.11.4 builds on

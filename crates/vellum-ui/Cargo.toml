@@ -27,6 +27,7 @@ wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
 pangocairo.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 vellum-core.workspace = true
 vellum-stitch.workspace = true

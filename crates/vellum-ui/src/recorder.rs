@@ -34,6 +34,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use vellum_core::compositor;
 use vellum_core::config::LongshotConfig;
 use vellum_core::geom::Rect;
+use vellum_core::image_limits::CAPTURE_FRAME_LIMITS;
 use vellum_core::longshot_trace::{LongshotTrace, TraceField};
 use vellum_core::{Rgb8, capture};
 use vellum_stitch::{StitchDecision, Stitcher};
@@ -81,9 +82,18 @@ const PANEL_HIDE_SETTLE_MS: u64 = 300;
 /// Bounded frame queue. Back pressure is applied instead of dropping frames:
 /// losing one bridging frame is enough to force the user to scroll back.
 const QUEUE_CAPACITY: usize = 48;
+/// RGB queue payload, not the output canvas or total process memory. Oversized
+/// frames are rejected before duplication, so no empty-queue exception is needed.
+const QUEUE_BYTE_LIMIT: usize = 96 * 1024 * 1024;
+
+fn queue_has_room(count: usize, bytes: usize, incoming: usize) -> bool {
+    count < QUEUE_CAPACITY
+        && bytes
+            .checked_add(incoming)
+            .is_some_and(|n| n <= QUEUE_BYTE_LIMIT)
+}
 
 /// Debounce for the "slow down" hint.
-const LOW_RUN_FRAMES: u32 = 12;
 const LOW_RUN_SECS: f64 = 0.55;
 
 /// How long `finish` waits for an in-flight grab after hiding the UI.
@@ -122,9 +132,9 @@ impl Hint {
     fn text(self) -> (&'static str, &'static str) {
         match self {
             Hint::Sampling => ("采集中", "平稳滚动；再次按长截图快捷键即可完成"),
-            Hint::Recovering => ("校准中", "正在自动寻找重叠，可继续滚动"),
+            Hint::Recovering => ("正在对齐", "画面暂未接上，请先停一下或缓慢往回滚"),
             Hint::Recovered => ("已恢复", "已自动接回画面，继续滚动即可"),
-            Hint::SlowDown => ("请慢一些", "减慢滚动即可，程序会继续寻找重叠"),
+            Hint::SlowDown => ("尚未接上", "请缓慢滚回已截区域；继续向前可能漏掉内容"),
             Hint::NoMove => ("等待滚动", "向上或向下滚动目标窗口"),
             Hint::CaptureRetry => ("采集重连中", "截屏后端暂时无响应，正在自动重试"),
             Hint::CaptureResumed => ("采集已恢复", "画面采集恢复，可继续滚动"),
@@ -155,6 +165,10 @@ struct CaptureStats {
     enqueued: u64,
     dequeued: u64,
     max_queue_depth: usize,
+    max_queue_bytes: usize,
+    backpressure_waits: u64,
+    backpressure_ms: u64,
+    max_capture_gap_ms: u64,
 }
 
 impl CaptureStats {
@@ -180,6 +194,8 @@ struct Queue {
     notice: Option<CaptureNotice>,
     idle_queued: bool,
     stats: CaptureStats,
+    last_capture_at: Option<Instant>,
+    resource_limited: bool,
 }
 
 impl Queue {
@@ -190,8 +206,14 @@ impl Queue {
             notice: None,
             idle_queued: false,
             stats: CaptureStats::default(),
+            last_capture_at: None,
+            resource_limited: false,
         }
     }
+}
+
+fn recovery_is_stalled(since: Option<Instant>, now: Instant) -> bool {
+    since.is_some_and(|since| now.saturating_duration_since(since).as_secs_f64() >= LOW_RUN_SECS)
 }
 
 fn take_unprocessed_latest(queue: &mut Queue, last_processed: u64) -> Option<CapturedFrame> {
@@ -275,6 +297,13 @@ impl Shared {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .stats
+    }
+
+    fn resource_limited(&self) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resource_limited
     }
 
     fn sampling(&self) -> bool {
@@ -503,12 +532,11 @@ impl State {
         if !first && !accepted {
             // Classify *why* the frame was rejected. `last_diff` is a mean
             // signature difference, so LOWER is a better match.
-            if self.stitcher.last_diff > self.max_diff {
+            if decision == StitchDecision::Rejected || self.stitcher.last_diff > self.max_diff {
                 self.consecutive_low += 1;
                 let now = Instant::now();
                 let since = *self.low_since.get_or_insert(now);
-                let sustained = self.consecutive_low >= LOW_RUN_FRAMES
-                    && now.duration_since(since).as_secs_f64() >= LOW_RUN_SECS;
+                let sustained = recovery_is_stalled(Some(since), now);
                 self.hint = Some(if sustained {
                     Hint::SlowDown
                 } else {
@@ -1092,7 +1120,7 @@ impl Recorder {
         content.set_margin_end(12);
 
         let header = GtkBox::new(Orientation::Horizontal, 8);
-        let dot = Label::new(Some("●"));
+        let dot = crate::controls::status_dot("vellum-live-dot");
         dot.add_css_class("vellum-live-dot");
         let title = Label::new(Some(panel_title(daemon_managed)));
         title.add_css_class("vellum-title");
@@ -1229,7 +1257,7 @@ impl Recorder {
         let cancel = Button::with_label("取消  Esc");
         cancel.add_css_class("vellum-quiet");
         cancel.set_tooltip_text(Some("取消长截图（Esc）"));
-        let confirm = Button::with_label("完成  Enter");
+        let confirm = crate::controls::secondary_button("完成并预览", Some("emblem-ok-symbolic"));
         confirm.add_css_class("suggested-action");
         confirm.set_tooltip_text(Some("完成并拼接长截图（Enter）"));
         buttons.append(&cancel);
@@ -1251,7 +1279,7 @@ impl Recorder {
         let micro_cancel = Button::with_label("取消");
         micro_cancel.add_css_class("vellum-quiet");
         micro_cancel.set_tooltip_text(Some("取消长截图"));
-        let micro_dot = Label::new(Some("●"));
+        let micro_dot = crate::controls::status_dot("vellum-live-dot");
         micro_dot.add_css_class("vellum-live-dot");
         micro_dot.set_tooltip_text(Some("长截图正在采集"));
         let micro_chip = Label::new(Some("采集中"));
@@ -1827,6 +1855,26 @@ impl Recorder {
         // closure carries nothing but the queue: it looks the recorder up again
         // on the thread that is allowed to touch it.
         ACTIVE.with(|slot| slot.replace(Some(Rc::downgrade(self))));
+        // Duplicate/static captures are deliberately not stitched again. Revisit
+        // recovery status on elapsed time so one bad jump cannot say "aligning"
+        // forever after the user stops scrolling. This timer owns no recorder.
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let Some(recorder) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !recorder.shared.sampling() {
+                return glib::ControlFlow::Break;
+            }
+            let mut state = recorder.state.borrow_mut();
+            if state.hint == Some(Hint::Recovering)
+                && recovery_is_stalled(state.low_since, Instant::now())
+            {
+                state.hint = Some(Hint::SlowDown);
+                state.update_status();
+            }
+            glib::ControlFlow::Continue
+        });
         let notify = {
             let shared = Arc::clone(&shared);
             move || {
@@ -1908,7 +1956,7 @@ impl Recorder {
             let depth_after = queue.frames.len();
             (frame, notice, depth_after)
         };
-        if self.shared.sampling()
+        if (self.shared.sampling() || self.shared.resource_limited())
             && let Some(frame) = frame
         {
             self.trace.emit(
@@ -1920,6 +1968,10 @@ impl Recorder {
                 ],
             );
             self.state.borrow_mut().process(frame, "main_loop");
+        }
+        if self.shared.resource_limited() || self.state.borrow().stitcher.resource_limited() {
+            self.finish(false);
+            return;
         }
         // Apply the backend notice after the frame so a one-shot "resumed"
         // message is not immediately overwritten by the normal stitch status.
@@ -2117,6 +2169,9 @@ impl Recorder {
         // pointer can no longer put it into the output.
         self.cursor.borrow_mut().take();
 
+        if self.shared.resource_limited() {
+            self.state.borrow_mut().stitcher.stop_at_resource_limit();
+        }
         let outcome = self.state.borrow_mut().stitcher.result();
         match outcome {
             Ok(result) => {
@@ -2138,7 +2193,8 @@ impl Recorder {
                 // "startup failed (code 1)" one from the daemon for a legitimate
                 // user action, so it takes the cancellation path instead: no
                 // image, no notification, exit 130.
-                let empty_session = worker_joined
+                let empty_session = !self.state.borrow().stitcher.resource_limited()
+                    && worker_joined
                     && self
                         .shared
                         .capture_stats()
@@ -2185,6 +2241,22 @@ impl Recorder {
                 (
                     "queue_max_depth",
                     TraceField::U64(capture.max_queue_depth as u64),
+                ),
+                (
+                    "queue_max_bytes",
+                    TraceField::U64(capture.max_queue_bytes as u64),
+                ),
+                (
+                    "queue_backpressure_waits",
+                    TraceField::U64(capture.backpressure_waits),
+                ),
+                (
+                    "queue_backpressure_ms",
+                    TraceField::U64(capture.backpressure_ms),
+                ),
+                (
+                    "capture_max_gap_ms",
+                    TraceField::U64(capture.max_capture_gap_ms),
                 ),
                 ("stitch_processed", TraceField::U64(state.stats.processed)),
                 ("stitch_seed", TraceField::U64(state.stats.seed)),
@@ -2350,7 +2422,12 @@ fn capture_loop_with<F, C>(
     }
     let mut consecutive_failures = 0u32;
     let mut pending = None;
-    match capture_success(&shared, grab()) {
+    let first = capture_success(&shared, grab());
+    if shared.resource_limited() {
+        notify();
+        return;
+    }
+    match first {
         Ok(frame) if !discard_first => pending = Some(frame),
         Ok(frame) => {
             {
@@ -2380,11 +2457,18 @@ fn capture_loop_with<F, C>(
         }
     }
 
-    while shared.sampling() {
+    // A persistent backend may finish its first grab after graceful stop.
+    // Publish that already-owned frame to `latest`, just like later in-flight
+    // grabs, even though no new sampling or FIFO notification is allowed.
+    while pending.is_some() || shared.sampling() {
         let captured = match pending.take() {
             Some(frame) => Ok(frame),
             None => capture_success(&shared, grab()),
         };
+        if shared.resource_limited() {
+            notify();
+            break;
+        }
         let frame = match captured {
             Ok(frame) => frame,
             Err(capture::CaptureError::Cancelled) if shared.aborting() || !shared.sampling() => {
@@ -2455,12 +2539,28 @@ fn capture_loop_with<F, C>(
         }
         queue.latest = Some(frame.clone());
         // Pause sampling when the queue is full instead of dropping a frame.
-        while shared.sampling() && queue.frames.len() >= QUEUE_CAPACITY {
+        let queued_bytes: usize = queue.frames.iter().map(|f| f.image.data.len()).sum();
+        let blocked = !queue_has_room(queue.frames.len(), queued_bytes, frame.image.data.len());
+        let waited_since = Instant::now();
+        if blocked {
+            queue.stats.backpressure_waits += 1;
+            shared.room.notify_all();
+        }
+        while shared.sampling()
+            && !queue_has_room(
+                queue.frames.len(),
+                queue.frames.iter().map(|f| f.image.data.len()).sum(),
+                frame.image.data.len(),
+            )
+        {
             let (guard, _) = shared
                 .room
                 .wait_timeout(queue, Duration::from_millis(50))
                 .unwrap_or_else(|e| e.into_inner());
             queue = guard;
+        }
+        if blocked {
+            queue.stats.backpressure_ms += waited_since.elapsed().as_millis() as u64;
         }
         if !shared.sampling() {
             break;
@@ -2469,6 +2569,8 @@ fn capture_loop_with<F, C>(
         queue.frames.push_back(frame);
         queue.stats.enqueued += 1;
         queue.stats.max_queue_depth = queue.stats.max_queue_depth.max(queue.frames.len());
+        let payload: usize = queue.frames.iter().map(|f| f.image.data.len()).sum();
+        queue.stats.max_queue_bytes = queue.stats.max_queue_bytes.max(payload);
         let queue_depth = queue.frames.len();
         let max_queue_depth = queue.stats.max_queue_depth;
         let should_notify = !queue.idle_queued;
@@ -2496,16 +2598,32 @@ fn capture_success(
     shared: &Shared,
     captured: Result<Rgb8, capture::CaptureError>,
 ) -> Result<CapturedFrame, capture::CaptureError> {
-    captured.map(|image| {
+    captured.and_then(|image| {
+        if CAPTURE_FRAME_LIMITS.check(image.width, image.height, 3) != Ok(image.data.len()) {
+            shared
+                .queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resource_limited = true;
+            shared.stop_sampling();
+            return Err(capture::CaptureError::Cancelled);
+        }
         let sequence = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if let Some(previous) = queue.last_capture_at.replace(now) {
+                queue.stats.max_capture_gap_ms = queue
+                    .stats
+                    .max_capture_gap_ms
+                    .max(now.duration_since(previous).as_millis() as u64);
+            }
             queue.stats.successful += 1;
             queue.stats.successful
         };
         shared
             .trace
             .emit("capture_succeeded", &[("frame", TraceField::U64(sequence))]);
-        CapturedFrame { sequence, image }
+        Ok(CapturedFrame { sequence, image })
     })
 }
 
@@ -2558,6 +2676,10 @@ fn sleep_while_sampling(shared: &Shared, duration: Duration) {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "recorder_live_test.rs"]
+mod live_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2685,6 +2807,161 @@ mod tests {
     }
 
     #[test]
+    fn oversized_capture_stops_without_replacing_last_safe_frame() {
+        let shared = Arc::new(Shared::new());
+        let safe = Rgb8::new(2, 2);
+        shared.queue.lock().unwrap().latest = Some(CapturedFrame {
+            sequence: 7,
+            image: safe.clone(),
+        });
+        let impossible = Rgb8 {
+            width: usize::MAX,
+            height: 2,
+            data: Vec::new(),
+        };
+        let result = capture_success(&shared, Ok(impossible));
+        assert!(matches!(result, Err(capture::CaptureError::Cancelled)));
+        assert!(!shared.sampling());
+        assert!(shared.resource_limited());
+        assert_eq!(
+            shared.queue.lock().unwrap().latest.as_ref().unwrap().image,
+            safe
+        );
+    }
+
+    #[test]
+    fn oversized_first_capture_notifies_once_and_never_loops() {
+        let shared = Arc::new(Shared::new());
+        let grabs = Cell::new(0);
+        let notices = Cell::new(0);
+        capture_loop_with(
+            Arc::clone(&shared),
+            Duration::ZERO,
+            || notices.set(notices.get() + 1),
+            false,
+            || {
+                grabs.set(grabs.get() + 1);
+                Ok(Rgb8 {
+                    width: usize::MAX,
+                    height: 2,
+                    data: Vec::new(),
+                })
+            },
+        );
+        assert_eq!(grabs.get(), 1);
+        assert_eq!(notices.get(), 1);
+        assert!(shared.resource_limited());
+        assert!(shared.queue.lock().unwrap().frames.is_empty());
+    }
+
+    #[test]
+    fn resource_stop_preserves_fifo_and_deduplicates_the_safe_tail() {
+        let shared = Arc::new(Shared::new());
+        let grabs = Cell::new(0);
+        capture_loop_with(
+            Arc::clone(&shared),
+            Duration::ZERO,
+            || {},
+            false,
+            || {
+                let n = grabs.get() + 1;
+                grabs.set(n);
+                if n <= 2 {
+                    Ok(Rgb8::from_raw(2, 2, vec![n as u8; 12]))
+                } else {
+                    Ok(Rgb8 {
+                        width: usize::MAX,
+                        height: 2,
+                        data: Vec::new(),
+                    })
+                }
+            },
+        );
+        assert_eq!(grabs.get(), 3);
+        assert!(shared.resource_limited());
+        let mut queue = shared.queue.lock().unwrap();
+        assert_eq!(queue.frames.len(), 2);
+        assert_eq!(queue.frames.pop_front().unwrap().image.data, vec![1; 12]);
+        let last = queue.frames.pop_front().unwrap();
+        assert_eq!(last.image.data, vec![2; 12]);
+        assert!(take_unprocessed_latest(&mut queue, last.sequence).is_none());
+    }
+
+    #[test]
+    fn queue_admission_bounds_4k_payload_without_dropping_frames() {
+        let bytes = 3840 * 2160 * 3;
+        assert!(queue_has_room(3, 3 * bytes, bytes));
+        assert!(!queue_has_room(4, 4 * bytes, bytes));
+        assert!(!queue_has_room(QUEUE_CAPACITY, 48, 1));
+        assert!(!queue_has_room(0, 0, QUEUE_BYTE_LIMIT + 1));
+        assert!(!queue_has_room(1, usize::MAX, 1));
+        assert!(!queue_has_room(1, QUEUE_BYTE_LIMIT + 1, 1));
+    }
+
+    #[test]
+    fn one_failed_view_still_times_out_without_more_distinct_frames() {
+        let since = Instant::now();
+        assert!(!recovery_is_stalled(None, since + Duration::from_secs(10)));
+        assert!(!recovery_is_stalled(
+            Some(since),
+            since + Duration::from_millis(500)
+        ));
+        assert!(recovery_is_stalled(
+            Some(since),
+            since + Duration::from_millis(600)
+        ));
+    }
+
+    #[test]
+    fn graceful_stop_at_a_saturated_queue_preserves_fifo_and_owned_tail() {
+        let shared = Arc::new(Shared::new());
+        {
+            let mut queue = shared.queue.lock().unwrap();
+            for sequence in 1..=QUEUE_CAPACITY as u64 {
+                queue.frames.push_back(CapturedFrame {
+                    sequence,
+                    image: Rgb8::from_raw(2, 2, vec![sequence as u8; 12]),
+                });
+            }
+            queue.stats.successful = QUEUE_CAPACITY as u64;
+            queue.latest = queue.frames.back().cloned();
+        }
+        let producer = shared.clone();
+        let worker = std::thread::spawn(move || {
+            capture_loop_with(
+                producer,
+                Duration::ZERO,
+                || panic!("full queue must not notify another frame"),
+                false,
+                || Ok(Rgb8::from_raw(2, 2, vec![49; 12])),
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        {
+            let mut queue = shared.queue.lock().unwrap();
+            while queue.stats.backpressure_waits == 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "producer did not reach saturation");
+                let (next, _) = shared.room.wait_timeout(queue, remaining).unwrap();
+                queue = next;
+            }
+        }
+        shared.stop_sampling();
+        worker.join().unwrap();
+        let mut queue = shared.queue.lock().unwrap();
+        assert_eq!(queue.stats.successful, 49);
+        assert_eq!(
+            queue.frames.iter().map(|f| f.sequence).collect::<Vec<_>>(),
+            (1..=48).collect::<Vec<_>>()
+        );
+        let last = queue.frames.drain(..).next_back().unwrap().sequence;
+        let tail = take_unprocessed_latest(&mut queue, last).unwrap();
+        assert_eq!(tail.sequence, 49);
+        assert_eq!(tail.image.data, vec![49; 12]);
+        assert!(take_unprocessed_latest(&mut queue, 49).is_none());
+    }
+
+    #[test]
     fn every_hint_has_text() {
         for hint in [
             Hint::Sampling,
@@ -2736,6 +3013,46 @@ mod tests {
         assert_eq!(queue.stats.enqueued, 1);
         assert_eq!(queue.stats.max_queue_depth, 1);
         assert_eq!(queue.stats.exact_duplicates, 0);
+    }
+
+    #[test]
+    fn a_first_persistent_frame_finishing_during_graceful_stop_is_kept() {
+        let shared = Arc::new(Shared::new());
+        let mut calls = 0;
+        let expected = Rgb8::from_raw(2, 2, vec![7; 12]);
+        capture_loop_with(
+            Arc::clone(&shared),
+            Duration::ZERO,
+            || panic!("stopped sampling must not queue another notification"),
+            false,
+            || {
+                calls += 1;
+                assert_eq!(calls, 1, "finish must not request another frame");
+                shared.stop_sampling();
+                Ok(expected.clone())
+            },
+        );
+
+        let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls, 1);
+        assert!(!shared.aborting());
+        assert!(queue.frames.is_empty());
+        assert_eq!(queue.stats.successful, 1);
+        assert_eq!(queue.stats.warmup_discarded, 0);
+        assert_eq!(queue.stats.enqueued, 0);
+        assert_eq!(queue.stats.failures, 0);
+        let latest = take_unprocessed_latest(&mut queue, 0)
+            .expect("finish must recover the successful first grab");
+        assert_eq!(latest.sequence, 1);
+        assert_eq!(latest.image, expected);
+        assert!(take_unprocessed_latest(&mut queue, latest.sequence).is_none());
+
+        let mut stitcher = Stitcher::new(
+            vellum_stitch::DEFAULT_MAX_DIFF,
+            vellum_stitch::DEFAULT_MIN_SHIFT_PX,
+        );
+        stitcher.add(&latest.image);
+        assert_eq!(stitcher.result().unwrap().image, expected);
     }
 
     #[test]

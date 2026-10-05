@@ -348,12 +348,8 @@ impl Service {
                 ),
             ],
         );
-        if notify_abnormal && !code.is_some_and(|c| NORMAL_EXITS.contains(&c)) {
-            vellum_core::io::notify(
-                "Vellum 启动失败",
-                &format!("{message}。请右键托盘运行诊断或执行 vellum doctor"),
-                "critical",
-            );
+        if notify_abnormal && let Some((title, body, urgency)) = exit_notice(action, code) {
+            vellum_core::io::notify(title, &body, urgency);
         }
     }
 
@@ -609,9 +605,31 @@ fn describe_exit(action: Action, code: Option<i32>) -> String {
     match code {
         Some(0) => format!("{}已完成", action.display_name()),
         Some(130) => format!("{}已取消", action.display_name()),
+        Some(crate::protocol::OUTPUT_FAILED_EXIT_CODE) => {
+            format!("{}采集已结束，但输出未全部完成", action.display_name())
+        }
         Some(other) => format!("{}启动失败（代码 {other}）", action.display_name()),
         None => format!("{}异常结束", action.display_name()),
     }
+}
+
+fn exit_notice(action: Action, code: Option<i32>) -> Option<(&'static str, String, &'static str)> {
+    if code.is_some_and(|c| NORMAL_EXITS.contains(&c)) {
+        return None;
+    }
+    let message = describe_exit(action, code);
+    if code == Some(crate::protocol::OUTPUT_FAILED_EXIT_CODE) {
+        return Some((
+            "Vellum 输出未完成",
+            format!("{message}。请在结果窗口重试；也可执行 vellum recover list 查看待恢复图片"),
+            "normal",
+        ));
+    }
+    Some((
+        "Vellum 启动失败",
+        format!("{message}。请右键托盘运行诊断或执行 vellum doctor"),
+        "critical",
+    ))
 }
 
 fn spawn_output_forwarder<R>(reader: R, log: Arc<Log>, level: &'static str) -> std::io::Result<()>
@@ -961,6 +979,25 @@ mod tests {
             describe_exit(Action::PinLast, Some(2)),
             "钉图启动失败（代码 2）"
         );
+    }
+
+    #[test]
+    fn completed_capture_with_output_failure_never_claims_startup_failed() {
+        for action in [Action::Region, Action::Long] {
+            let code = Some(crate::protocol::OUTPUT_FAILED_EXIT_CODE);
+            let event = describe_exit(action, code);
+            assert!(event.contains("采集已结束"));
+            assert!(event.contains("输出未全部完成"));
+            assert!(!event.contains("启动失败"));
+            let (title, body, urgency) = exit_notice(action, code).unwrap();
+            assert_eq!(title, "Vellum 输出未完成");
+            assert!(!body.contains("启动失败"));
+            assert!(body.contains("recover list"));
+            assert_eq!(urgency, "normal");
+            assert!(exit_notice(action, Some(0)).is_none());
+            assert!(exit_notice(action, Some(130)).is_none());
+            assert_eq!(exit_notice(action, Some(1)).unwrap().0, "Vellum 启动失败");
+        }
     }
 
     #[test]

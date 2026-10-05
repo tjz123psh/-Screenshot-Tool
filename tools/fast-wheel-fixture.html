@@ -1,0 +1,12 @@
+<!doctype html><meta charset="utf-8"><title>Vellum synthetic wheel fixture</title>
+<style>*{box-sizing:border-box}html{scrollbar-width:none}body{margin:0;background:white;color:#20242b;font:15px/1.5 sans-serif}main{width:620px;margin:auto;padding:20px}h1{margin:0 0 16px;font-size:24px}article{height:92px;border-bottom:1px solid #dedee3;padding:12px 0}h2{margin:0;font-size:16px}p{margin:5px 0;color:#656b75}span{float:right;color:#32719e;font:13px monospace}canvas{position:fixed;left:0;top:0;width:4px;height:480px;z-index:9999;pointer-events:none}</style>
+<main><h1>快速滚动 · 连续画面验证</h1><section></section></main><canvas width="4" height="480"></canvas>
+<script>
+const section=document.querySelector('section');
+for(let i=0;i<200;i++){const row=document.createElement('article');row.innerHTML='<h2><span>#'+String(i+1).padStart(3,'0')+'</span>高速滚动时仍要保留完整文字</h2><p>项目 '+(i+1)+' · 校验 '+(i*17+31)+' · 不应漏行、重复或错位。</p>';section.append(row);}
+const context=document.querySelector('canvas').getContext('2d',{willReadFrequently:true});
+let target=0,lastDirection=0;
+addEventListener('wheel',event=>{event.preventDefault();const direction=Math.sign(event.deltaY);if(direction&&direction!==lastDirection)target=scrollY;lastDirection=direction;target=Math.max(0,Math.min(document.documentElement.scrollHeight-innerHeight,target+event.deltaY));},{passive:false});
+function tick(){const delta=target-scrollY;if(Math.abs(delta)>.5)scrollTo(0,Math.round(scrollY+Math.max(-70,Math.min(70,delta))));const top=scrollY;for(let y=0;y<480;y++){const source=top+y;context.fillStyle='rgb('+(source&255)+','+(source>>8)+',173)';context.fillRect(0,y,4,1);}requestAnimationFrame(tick);}
+tick();
+</script>

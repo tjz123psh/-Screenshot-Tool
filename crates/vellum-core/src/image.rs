@@ -131,17 +131,43 @@ impl Rgb8 {
     }
 
     pub fn save_png(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_png()?).map_err(|e| e.to_string())
+        self.save_png_result(path).map_err(|e| e.to_string())
+    }
+
+    /// Typed variant preserves the committed-but-durability-unconfirmed state.
+    pub fn save_png_result(&self, path: &Path) -> std::io::Result<()> {
+        let bytes = self.to_png().map_err(std::io::Error::other)?;
+        crate::io::replace_image_bytes(path, &bytes)
     }
 
     pub fn from_encoded(data: &[u8]) -> Result<Self, String> {
         let decoded = image::load_from_memory(data).map_err(|e| e.to_string())?;
-        let rgb = decoded.to_rgb8();
-        Ok(Rgb8::from_raw(
-            rgb.width() as usize,
-            rgb.height() as usize,
-            rgb.into_raw(),
-        ))
+        Ok(Self::from_dynamic_on_white(decoded))
+    }
+
+    /// Flatten visible input pixels onto white before alpha is discarded.
+    /// RGB inputs retain their owned buffer. RGBA inputs are composited and
+    /// compacted in place, without allocating a second full-size RGB image.
+    pub(crate) fn from_dynamic_on_white(decoded: image::DynamicImage) -> Self {
+        if !decoded.color().has_alpha() {
+            let rgb = decoded.into_rgb8();
+            return Self::from_raw(rgb.width() as usize, rgb.height() as usize, rgb.into_raw());
+        }
+        let rgba = decoded.into_rgba8();
+        let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+        let mut data = rgba.into_raw();
+        let pixels = data.len() / 4;
+        for index in 0..pixels {
+            let source = index * 4;
+            let alpha = u32::from(data[source + 3]);
+            for channel in 0..3 {
+                let value = u32::from(data[source + channel]);
+                data[index * 3 + channel] =
+                    ((value * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+            }
+        }
+        data.truncate(pixels * 3);
+        Self::from_raw(width, height, data)
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -190,6 +216,16 @@ mod tests {
         let padded = solid(2, 2, 5).fit_width(4);
         assert_eq!(padded.pixel(0, 0), [5, 5, 5]);
         assert_eq!(padded.pixel(3, 0), [0, 0, 0]);
+    }
+
+    #[test]
+    fn opaque_rgb_conversion_moves_the_original_buffer() {
+        let raw = vec![10, 20, 30, 40, 50, 60];
+        let address = raw.as_ptr();
+        let image = image::RgbImage::from_raw(2, 1, raw).unwrap();
+        let result = Rgb8::from_dynamic_on_white(image::DynamicImage::ImageRgb8(image));
+        assert_eq!(result.data.as_ptr(), address);
+        assert_eq!(result.data, vec![10, 20, 30, 40, 50, 60]);
     }
 
     #[test]

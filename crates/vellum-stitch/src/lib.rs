@@ -14,10 +14,11 @@
 //!      `[H, 3]` sequence ([`signature`]). This smooths sub-pixel noise.
 //!   2. Slide the previous accepted frame's signatures over the incoming
 //!      frame's and take the mean absolute difference over the overlap
-//!      ([`scoring::col_diff`]). Lowest diff wins.
+//!      ([`scoring::col_diff`]). Refine near-perfect row-score ties with RGB.
 //!   3. Ignore a slice of the top and bottom of the overlap so scroll inertia
 //!      and fade-in rows cannot poison the score.
-//!   4. Search offsets outward from the previous one, with an early exit.
+//!   4. Search offsets outward from the previous one; early exit requires both
+//!      a near-perfect row score and exact sparse-RGB agreement.
 //!   5. A tiny whole-frame signature skips matching when nothing moved.
 //!   6. On failure, retry with a trimmed row score that tolerates a bounded set
 //!      of locally-changing rows (video, spinner, caret).
@@ -39,7 +40,7 @@ pub use fixed_regions::{FixedBands, FixedRegionDetector};
 pub use scoring::{
     FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, MIN_CHANGED_FRACTION, ROBUST_MAX_PIXEL_DIFF,
 };
-pub use stitcher::{StitchDecision, StitchResult, Stitcher, stitch_frames};
+pub use stitcher::{INCOMPLETE_WARNING, StitchDecision, StitchResult, Stitcher, stitch_frames};
 
 /// Default acceptance threshold for the row-signature overlap diff. This is a
 /// mean per-channel absolute difference on the 8-bit brightness scale; ~9

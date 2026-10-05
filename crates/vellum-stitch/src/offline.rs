@@ -10,15 +10,14 @@
 //! If no complete path validates, the caller keeps the online canvas. Silently
 //! returning a partially reconstructed image would be worse than the greedy one.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::io::Read;
 
 use vellum_core::image::Rgb8;
 
 use crate::fixed_regions::FixedBands;
-use crate::scoring::{
-    self, FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, Mask, ROBUST_MAX_PIXEL_DIFF, is_false_motion,
-};
+use crate::scoring::{FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, Mask, ROBUST_MAX_PIXEL_DIFF};
 use crate::signature::{Cols, Sparse, is_static_view, matching_cols};
 
 /// Lossless keyframes retained for reconstruction. Excludes one pending raw
@@ -40,7 +39,7 @@ pub enum KeyframeReason {
 
 impl KeyframeReason {
     /// Eviction priority: lower is dropped first.
-    fn priority(self) -> u8 {
+    pub(crate) fn priority(self) -> u8 {
         match self {
             KeyframeReason::Motion => 0,
             KeyframeReason::Tail => 1,
@@ -124,16 +123,6 @@ impl OfflineCtx<'_> {
         }
     }
 
-    fn find_shift(
-        &self,
-        previous: &Cols,
-        current: &Cols,
-        predict: i32,
-        robust: bool,
-    ) -> (i32, f32) {
-        crate::stitcher::find_shift_for(previous, current, predict, robust, &self.mask())
-    }
-
     /// One directed edge of the reconstruction graph, or `None` when the pair
     /// cannot be trusted at any offset.
     fn edge(&self, previous: &Keyframe, current: &Keyframe) -> Option<GraphEdge> {
@@ -152,18 +141,14 @@ impl OfflineCtx<'_> {
         let mask = self.mask();
         let mut best: Option<GraphEdge> = None;
         for predict in predictions {
-            let (mut shift, mut diff) =
-                self.find_shift(&previous_cols, &current_cols, predict, false);
-            let mut robust = false;
-            if diff > self.max_diff {
-                let (robust_shift, robust_diff) =
-                    self.find_shift(&previous_cols, &current_cols, predict, true);
-                if robust_diff < diff {
-                    shift = robust_shift;
-                    diff = robust_diff;
-                    robust = robust_diff <= self.max_diff;
-                }
-            }
+            let matched = crate::stitcher::find_match(
+                (&previous_cols, &previous.pixels),
+                (&current_cols, &current.pixels),
+                predict,
+                self.max_diff,
+                &mask,
+            );
+            let (shift, diff, robust) = (matched.shift, matched.diff, matched.robust);
             if diff > self.max_diff {
                 continue;
             }
@@ -186,24 +171,7 @@ impl OfflineCtx<'_> {
                     cost: diff + 0.25,
                 }
             } else {
-                let aligned = if robust {
-                    scoring::robust_pixel_overlap_diff(
-                        &previous.pixels,
-                        &current.pixels,
-                        shift,
-                        &mask,
-                    )
-                } else {
-                    scoring::pixel_overlap_diff(&previous.pixels, &current.pixels, shift, &mask)
-                };
-                let stationary = if robust {
-                    scoring::robust_pixel_overlap_diff(&previous.pixels, &current.pixels, 0, &mask)
-                } else {
-                    scoring::pixel_overlap_diff(&previous.pixels, &current.pixels, 0, &mask)
-                };
-                let changed =
-                    scoring::pixel_change_fraction(&previous.pixels, &current.pixels, &mask);
-                if is_false_motion(aligned, stationary, changed, robust) {
+                if matched.false_motion {
                     continue;
                 }
                 GraphEdge {
@@ -216,6 +184,12 @@ impl OfflineCtx<'_> {
             if best.is_none_or(|current_best| candidate.cost < current_best.cost) {
                 best = Some(candidate);
             }
+            // A validated exact overlap at the online prediction needs no
+            // second exhaustive search from zero. Keep the slower retry for
+            // noisy/robust edges, where another prediction can still help.
+            if !robust && diff < 0.25 && matched.aligned == 0.0 {
+                break;
+            }
         }
         best
     }
@@ -227,7 +201,24 @@ pub fn rebuild(frames: &[Keyframe], ctx: &OfflineCtx<'_>) -> Option<Rgb8> {
         return None;
     }
     let path = shortest_path(frames, ctx)?;
+    // Skipping a damaged bridge is useful; skipping the only spatial extremum
+    // would silently erase captured content. Positions may be corrected by the
+    // graph, so compare represented input coverage rather than output height.
+    if online_span(frames.iter()) != online_span(path.iter().map(|(index, _)| &frames[*index])) {
+        return None;
+    }
     fuse(frames, &path, ctx)
+}
+
+fn online_span<'a>(frames: impl Iterator<Item = &'a Keyframe>) -> Option<(i64, i64)> {
+    frames
+        .filter_map(|frame| frame.online_position.map(|p| (p, p + frame.height as i64)))
+        .fold(None, |span, (start, end)| {
+            Some(match span {
+                None => (start, end),
+                Some((low, high)) => (low.min(start), high.max(end)),
+            })
+        })
 }
 
 /// Cheapest complete path from the first to the last keyframe, as
@@ -300,17 +291,31 @@ fn shortest_path(frames: &[Keyframe], ctx: &OfflineCtx<'_>) -> Option<Vec<(usize
 
 /// Blend the path's frames into one canvas with feathered viewport weights.
 fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Option<Rgb8> {
+    fuse_with_decoder(frames, path, ctx, Keyframe::decode)
+}
+
+// Keep decoded ownership visible so tests can measure live frame memory, not
+// merely decode-call count. Production uses Rgb8 directly, without a wrapper.
+fn fuse_with_decoder<D: Borrow<Rgb8>>(
+    frames: &[Keyframe],
+    path: &[(usize, i64)],
+    ctx: &OfflineCtx<'_>,
+    mut decode: impl FnMut(&Keyframe) -> Option<D>,
+) -> Option<Rgb8> {
     let width = ctx.width;
-    let mut decoded: Vec<(i64, Rgb8)> = Vec::with_capacity(path.len());
-    for &(index, position) in path {
-        let frame = frames[index].decode()?;
-        if frame.width != width {
+    let &(first_index, first_position) = path.first()?;
+    let first_keyframe = frames.get(first_index)?;
+    let frame_height = first_keyframe.height;
+    // Canvas geometry needs only metadata. Reject inconsistent viewports before
+    // allocating/decoding; they cannot share the fusion weights below.
+    for &(index, _) in path {
+        let frame = frames.get(index)?;
+        if frame.width != width || frame.height != frame_height {
             return None;
         }
-        decoded.push((position, frame));
     }
-
-    let frame_height = decoded[0].1.height;
+    let first_decoded = decode(first_keyframe)?;
+    let first_frame = first_decoded.borrow();
     let mut bands = ctx.bands;
     // A band pair covering the whole viewport is a detection failure, not chrome.
     if bands.top + bands.bottom >= frame_height {
@@ -328,13 +333,31 @@ fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Opt
         };
     }
 
-    let min_position = decoded
+    // Sparse columns are enough for matching, not for destructive cropping.
+    // Their midpoint boundary can include the first pixels of a scrolling
+    // glyph. Only remove columns proven fixed in the decoded keyframes.
+    // Keep only the first reference and one current frame alive. Refinement
+    // must precede fusion, but a second decode pass is needed only for sidebars;
+    // the compressed-store budget must not become N raw viewport allocations.
+    if bands.left > 0 || bands.right > 0 {
+        for &(index, _) in &path[1..] {
+            let decoded = decode(&frames[index])?;
+            let frame = decoded.borrow();
+            bands.left = stable_sidebar_width(first_frame, frame, bands.left, false);
+            bands.right = stable_sidebar_width(first_frame, frame, bands.right, true);
+            if bands.left == 0 && bands.right == 0 {
+                break;
+            }
+        }
+    }
+
+    let min_position = path
         .iter()
-        .map(|(position, _)| position + bands.top as i64)
+        .map(|&(_, position)| position + bands.top as i64)
         .min()?;
-    let max_position = decoded
+    let max_position = path
         .iter()
-        .map(|(position, frame)| position + (frame.height - bands.bottom) as i64)
+        .map(|&(_, position)| position + (frame_height - bands.bottom) as i64)
         .max()?;
     let content_height = (max_position - min_position).max(0) as usize;
     let center_start = bands.left;
@@ -354,7 +377,16 @@ fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Opt
     let mut weight_sum = vec![0u32; content_height];
     let mut peak_weight = vec![0u32; content_height];
 
-    for (position, frame) in &decoded {
+    for &(index, position) in path {
+        // Reuse the retained first frame; every other decode drops at the end
+        // of this iteration, including early returns on invalid reconstruction.
+        let decoded;
+        let frame = if index == first_index {
+            first_frame
+        } else {
+            decoded = decode(&frames[index])?;
+            decoded.borrow()
+        };
         let content_rows = frame.height.checked_sub(bands.top + bands.bottom)?;
         if content_rows != content_weights.len() {
             return None;
@@ -411,30 +443,33 @@ fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Opt
         return None;
     }
 
-    // Fixed sidebars cannot be repeated down the page: extend the nearest
-    // scrolling pixel as neutral background, then paste the real sidebar once.
+    // Fixed sidebars cannot be repeated down the page. A solid page margin is
+    // already neutral background: preserve its colour rather than dragging the
+    // nearest scrolling glyph into it. Non-uniform chrome keeps the existing
+    // edge-fill policy; the real sidebar is pasted once below.
     if bands.left > 0 || bands.right > 0 {
+        let left_background = uniform_band(first_frame, 0, center_start);
+        let right_background = uniform_band(first_frame, center_end, width);
         for y in 0..content_height {
             let row = canvas.row_mut(y);
             if bands.left > 0 {
-                let edge = [
+                let edge = left_background.unwrap_or([
                     row[center_start * 3],
                     row[center_start * 3 + 1],
                     row[center_start * 3 + 2],
-                ];
+                ]);
                 for x in 0..center_start {
                     row[x * 3..x * 3 + 3].copy_from_slice(&edge);
                 }
             }
             if bands.right > 0 {
                 let base = (center_end - 1) * 3;
-                let edge = [row[base], row[base + 1], row[base + 2]];
+                let edge = right_background.unwrap_or([row[base], row[base + 1], row[base + 2]]);
                 for x in center_end..width {
                     row[x * 3..x * 3 + 3].copy_from_slice(&edge);
                 }
             }
         }
-        let (first_position, first_frame) = &decoded[0];
         let start = first_position + bands.top as i64 - min_position;
         let content_rows = first_frame.height - bands.top - bands.bottom;
         if start < 0 || start as usize + content_rows > content_height {
@@ -454,7 +489,6 @@ fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Opt
     }
 
     // A fixed header/footer belongs in the output exactly once.
-    let first_frame = &decoded[0].1;
     let mut parts: Vec<Rgb8> = Vec::with_capacity(3);
     if bands.top > 0 {
         parts.push(first_frame.rows_slice(0, bands.top));
@@ -468,6 +502,43 @@ fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Opt
     } else {
         Rgb8::vstack(&parts)
     })
+}
+
+/// Refine an approximate sparse band inward, never outward. A changed pixel
+/// keeps its column in the scrolling image; noisy/animated chrome therefore
+/// degrades conservatively instead of deleting real text.
+fn stable_sidebar_width(first: &Rgb8, frame: &Rgb8, limit: usize, right: bool) -> usize {
+    if frame.width != first.width || frame.height != first.height {
+        return 0;
+    }
+    for depth in 0..limit.min(first.width) {
+        let x = if right {
+            first.width - 1 - depth
+        } else {
+            depth
+        };
+        if (0..first.height)
+            .any(|y| first.row(y)[x * 3..x * 3 + 3] != frame.row(y)[x * 3..x * 3 + 3])
+        {
+            return depth;
+        }
+    }
+    limit.min(first.width)
+}
+
+/// A solid excluded margin needs no invented content when the canvas grows.
+fn uniform_band(frame: &Rgb8, start: usize, end: usize) -> Option<[u8; 3]> {
+    if start >= end || end > frame.width || frame.height == 0 {
+        return None;
+    }
+    let colour: [u8; 3] = frame.row(0)[start * 3..start * 3 + 3].try_into().ok()?;
+    (0..frame.height)
+        .all(|y| {
+            frame.row(y)[start * 3..end * 3]
+                .chunks_exact(3)
+                .all(|pixel| pixel == colour)
+        })
+        .then_some(colour)
 }
 
 /// Evict keyframes until the memory and count caps hold. Returns false when the
@@ -557,6 +628,212 @@ mod tests {
         ];
         let mut used = 4096;
         assert!(!trim(&mut frames, &mut used, 16));
+    }
+
+    fn image_keyframe(image: &Rgb8, sequence: u64) -> Keyframe {
+        Keyframe {
+            data: compress_frame(image),
+            width: image.width,
+            height: image.height,
+            ..keyframe(sequence, KeyframeReason::Motion)
+        }
+    }
+
+    fn fusion_context(width: usize, bands: FixedBands) -> OfflineCtx<'static> {
+        OfflineCtx {
+            max_diff: crate::DEFAULT_MAX_DIFF,
+            min_shift_px: crate::DEFAULT_MIN_SHIFT_PX,
+            width,
+            row_mask: None,
+            column_mask: None,
+            bands,
+        }
+    }
+
+    #[test]
+    fn fusion_preserves_pixel_order_and_refined_fixed_bands() {
+        // Covers upward growth, revisits, low-delta blending, high-contrast
+        // replacement, an approximate sidebar boundary, and fixed chrome.
+        let positions = [0, -3, 0, 3, 6, 9];
+        let frames: Vec<_> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &position)| {
+                let mut image = Rgb8::new(12, 10);
+                for y in 0..10 {
+                    for x in 0..12 {
+                        let pixel = if x == 0 {
+                            [240; 3] // uniform left page margin
+                        } else if x == 11 {
+                            [y as u8 * 17; 3] // non-uniform right chrome
+                        } else if y == 0 || y == 9 {
+                            [x as u8 * 13; 3]
+                        } else {
+                            let document_y = (y as i64 + position + 3) as usize;
+                            let base = ((document_y * 17 + x * 7) % 150 + 30) as u8;
+                            if x == 5 && i % 2 == 1 {
+                                [250, 10, 80]
+                            } else {
+                                [base + i as u8, base, base + (y % 3) as u8]
+                            }
+                        };
+                        image.row_mut(y)[x * 3..x * 3 + 3].copy_from_slice(&pixel);
+                    }
+                }
+                image_keyframe(&image, i as u64)
+            })
+            .collect();
+        let path: Vec<_> = positions.into_iter().enumerate().collect();
+        // Golden hashes recorded from the eager decoder before this refactor.
+        for (bands, expected_hash) in [
+            (FixedBands::default(), 0x2e86db71cfaf15f4),
+            (
+                FixedBands {
+                    top: 1,
+                    bottom: 1,
+                    left: 2,
+                    right: 2,
+                },
+                0xc56ed8cfa1ec3835,
+            ),
+        ] {
+            let image = fuse(&frames, &path, &fusion_context(12, bands)).unwrap();
+            let hash = image
+                .data
+                .iter()
+                .fold(0xcbf29ce484222325u64, |hash, &byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
+            assert_eq!((image.width, image.height), (12, 22));
+            assert_eq!(hash, expected_hash, "fusion pixels changed for {bands:?}");
+        }
+    }
+
+    #[derive(Default)]
+    struct DecodeMemory {
+        live_bytes: std::cell::Cell<usize>,
+        peak_bytes: std::cell::Cell<usize>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    struct TrackedDecode<'a> {
+        image: Rgb8,
+        memory: &'a DecodeMemory,
+    }
+
+    impl DecodeMemory {
+        fn decode(&self, keyframe: &Keyframe) -> Option<TrackedDecode<'_>> {
+            let image = keyframe.decode()?;
+            let bytes = self.live_bytes.get() + image.data.len();
+            self.live_bytes.set(bytes);
+            self.peak_bytes.set(self.peak_bytes.get().max(bytes));
+            self.calls.set(self.calls.get() + 1);
+            Some(TrackedDecode {
+                image,
+                memory: self,
+            })
+        }
+    }
+
+    impl Borrow<Rgb8> for TrackedDecode<'_> {
+        fn borrow(&self) -> &Rgb8 {
+            &self.image
+        }
+    }
+
+    impl Drop for TrackedDecode<'_> {
+        fn drop(&mut self) {
+            self.memory
+                .live_bytes
+                .set(self.memory.live_bytes.get() - self.image.data.len());
+        }
+    }
+
+    #[test]
+    fn fusion_holds_at_most_two_decoded_frames_regardless_of_path_length() {
+        let image = Rgb8::from_raw(512, 256, vec![42; 512 * 256 * 3]);
+        let frames: Vec<_> = (0..KEYFRAME_MAX_COUNT)
+            .map(|i| image_keyframe(&image, i as u64))
+            .collect();
+        let path: Vec<_> = (0..frames.len()).map(|i| (i, 0)).collect();
+        assert!(frames.iter().map(Keyframe::memory_used).sum::<usize>() < KEYFRAME_MEMORY_LIMIT);
+        assert!(image.data.len() * frames.len() > KEYFRAME_MEMORY_LIMIT);
+
+        for bands in [
+            FixedBands::default(),
+            FixedBands {
+                top: 1,
+                bottom: 1,
+                left: 1,
+                right: 1,
+            },
+        ] {
+            let memory = DecodeMemory::default();
+            let output =
+                fuse_with_decoder(&frames, &path, &fusion_context(image.width, bands), |key| {
+                    memory.decode(key)
+                })
+                .unwrap();
+            assert_eq!(output, image);
+            assert_eq!(memory.peak_bytes.get(), 2 * image.data.len());
+            assert_eq!(
+                memory.live_bytes.get(),
+                0,
+                "all decoded frames must be released"
+            );
+            let expected_calls = if bands.left == 0 {
+                frames.len()
+            } else {
+                2 * frames.len() - 1
+            };
+            assert_eq!(memory.calls.get(), expected_calls);
+        }
+    }
+
+    #[test]
+    fn fusion_discards_partial_output_and_releases_decodes_on_corruption() {
+        let image = Rgb8::from_raw(8, 10, vec![42; 240]);
+        for bands in [
+            FixedBands::default(),
+            FixedBands {
+                top: 1,
+                bottom: 1,
+                left: 1,
+                right: 1,
+            },
+        ] {
+            for corrupt_index in 0..3 {
+                let mut frames: Vec<_> = (0..3).map(|i| image_keyframe(&image, i)).collect();
+                frames[corrupt_index].data = vec![0];
+                let memory = DecodeMemory::default();
+                assert!(
+                    fuse_with_decoder(
+                        &frames,
+                        &[(0, 0), (1, 3), (2, 6)],
+                        &fusion_context(8, bands),
+                        |key| memory.decode(key)
+                    )
+                    .is_none()
+                );
+                assert_eq!(memory.live_bytes.get(), 0);
+                assert!(memory.peak_bytes.get() <= 2 * image.data.len());
+            }
+        }
+    }
+
+    #[test]
+    fn fusion_skips_damaged_off_path_frames_but_rejects_gaps_and_size_changes() {
+        let image = Rgb8::from_raw(8, 10, vec![42; 240]);
+        let mut frames: Vec<_> = (0..3).map(|i| image_keyframe(&image, i)).collect();
+        frames[1].data = vec![0];
+        let ctx = fusion_context(8, FixedBands::default());
+        let output = fuse(&frames, &[(0, 0), (2, 3)], &ctx).unwrap();
+        assert_eq!(output, Rgb8::from_raw(8, 13, vec![42; 8 * 13 * 3]));
+        assert!(fuse(&frames, &[(0, 0), (2, 11)], &ctx).is_none());
+        frames[2] = image_keyframe(&Rgb8::new(8, 9), 2);
+        assert!(fuse(&frames, &[(0, 0), (2, 3)], &ctx).is_none());
+        frames[2] = image_keyframe(&Rgb8::new(7, 10), 2);
+        assert!(fuse(&frames, &[(0, 0), (2, 3)], &ctx).is_none());
     }
 
     #[test]

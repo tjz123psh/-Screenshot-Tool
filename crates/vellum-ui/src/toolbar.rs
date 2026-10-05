@@ -3,32 +3,32 @@
 //! Ported from `overlay/toolbar.py`. Button order is the user-visible order and
 //! the hotkeys are part of the interface contract, so both are kept verbatim.
 //!
-//! The visual language is "Deep Obsidian Crystal": a dark translucent slab with
-//! a two-layer diffuse shadow, a vertical crystal gradient, a specular edge that
-//! runs from a lit top facet through a cold rim to a dark inner base, and
-//! ghost-style buttons that only materialise on hover. Layer-shell surfaces get
-//! no compositor shadow, so every bit of depth has to be painted here.
+//! Compact smoked-metal controls share Vellum’s warm accent and quiet surface
+//! hierarchy. Geometry owns text padding and row-local separators, so the
+//! compact and wrapped layouts stay as precise as the full-width bar.
 
 use cairo::Context;
 use vellum_core::geom::Rect;
 
 use crate::paint::{self, Bounds, Stop};
 
-pub const LABEL_FONT: &str = "Sans 10.5";
+pub const LABEL_FONT: &str = "Sans 9.5";
 pub const HINT_FONT: &str = "Sans Bold 7.5";
 
-const BTN_PAD_X: f64 = 12.0;
-const BTN_PAD_Y: f64 = 8.0;
-const BTN_GAP: f64 = 5.0;
-const GROUP_GAP: f64 = 10.0;
+const BTN_PAD_X: f64 = 8.0;
+const BTN_PAD_Y: f64 = 5.0;
+const ICON_SIZE: f64 = 16.0;
+const ICON_GAP: f64 = 5.0;
+const BTN_GAP: f64 = 2.0;
+const GROUP_GAP: f64 = 8.0;
 const BAR_MARGIN: f64 = 10.0;
-const BAR_INNER_PAD: f64 = 6.0;
+const BAR_INNER_PAD: f64 = 4.0;
 const HINT_GAP: f64 = 8.0;
-const CORNER_R: f64 = 13.0;
+const CORNER_R: f64 = 8.0;
 const EDGE_MARGIN: f64 = 4.0;
 
 /// Button corner radius. Uniform across every button by design.
-const BUTTON_R: f64 = 8.0;
+const BUTTON_R: f64 = 4.0;
 /// Keycap badge geometry.
 const KEYCAP_R: f64 = 4.5;
 const KEYCAP_PAD_X: f64 = 5.0;
@@ -39,24 +39,24 @@ const KEYCAP_PAD_Y: f64 = 2.0;
 // intent of each value survives the next edit.
 
 /// Primary action button (confirm / anno.done).
-const PRIMARY_TOP: Stop = Stop(0.0, 0.31, 0.36, 0.92, 0.98);
-const PRIMARY_BOTTOM: Stop = Stop(1.0, 0.24, 0.28, 0.85, 0.98);
-const PRIMARY_EDGE: (f64, f64, f64, f64) = (0.6, 0.7, 1.0, 0.35);
-const PRIMARY_INK: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 1.0);
+const PRIMARY_TOP: Stop = Stop(0.0, 0.36, 0.33, 0.27, 1.0);
+const PRIMARY_BOTTOM: Stop = Stop(1.0, 0.33, 0.30, 0.24, 1.0);
+const PRIMARY_EDGE: (f64, f64, f64, f64) = (0.94, 0.86, 0.67, 0.13);
+const PRIMARY_INK: (f64, f64, f64, f64) = (0.98, 0.94, 0.85, 1.0);
 
 /// Ghost button states.
-const GHOST_DEFAULT: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.035);
+const GHOST_DEFAULT: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.0);
 const GHOST_HOVER: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.11);
 const GHOST_HOVER_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.14);
-const GHOST_ACTIVE: (f64, f64, f64, f64) = (0.26, 0.35, 0.70, 0.85);
+const GHOST_ACTIVE: (f64, f64, f64, f64) = (0.83, 0.76, 0.60, 0.14);
 /// Cancel leans red so the destructive exit reads as such before it is pressed.
 const GHOST_CANCEL_HOVER: (f64, f64, f64, f64) = (0.85, 0.25, 0.25, 0.20);
-const BUTTON_INK: (f64, f64, f64, f64) = (0.94, 0.96, 0.98, 0.96);
+const BUTTON_INK: (f64, f64, f64, f64) = (0.89, 0.86, 0.80, 1.0);
 
 /// Keycap badge.
-const KEYCAP_BG: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.07);
-const KEYCAP_EDGE: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.12);
-const KEYCAP_INK: (f64, f64, f64, f64) = (0.78, 0.84, 0.94, 0.82);
+const KEYCAP_BG: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.18);
+const KEYCAP_EDGE: (f64, f64, f64, f64) = (0.90, 0.85, 0.73, 0.16);
+const KEYCAP_INK: (f64, f64, f64, f64) = (0.85, 0.81, 0.71, 1.0);
 
 /// Separator: a hairline that fades in and out vertically.
 const SEPARATOR_INK: (f64, f64, f64, f64) = (1.0, 1.0, 1.0, 0.08);
@@ -99,7 +99,7 @@ struct Spacing {
 /// Below this the spacing stops being worth defending and the bar wraps to a
 /// second row instead: a cramped strip is worse than a taller one, and the labels
 /// themselves are never shrunk either way.
-const MIN_PAD_X: f64 = 6.0;
+const MIN_PAD_X: f64 = 5.0;
 
 impl Spacing {
     const fn common() -> Self {
@@ -108,7 +108,7 @@ impl Spacing {
             btn_gap: BTN_GAP,
             group_gap: GROUP_GAP,
             inner_pad: BAR_INNER_PAD,
-            keycaps: true,
+            keycaps: false,
         }
     }
 
@@ -124,7 +124,7 @@ impl Spacing {
                 btn_gap: (self.btn_gap - 0.5).max(2.0),
                 group_gap: (self.group_gap - 0.5).max(4.0),
                 inner_pad: (self.inner_pad - 0.5).max(3.0),
-                keycaps: true,
+                keycaps: false,
             });
         }
         self.keycaps.then_some(Self {
@@ -171,7 +171,7 @@ impl Spacing {
 
 /// A toolbar entry. `id` is the action string the overlay dispatches on and
 /// `hotkey` is matched case-insensitively against key events.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ButtonSpec {
     pub id: &'static str,
     pub label: &'static str,
@@ -195,7 +195,7 @@ const fn spec(
 
 /// Main toolbar, shown once a selection exists.
 pub const BUTTONS: &[ButtonSpec] = &[
-    spec("confirm", "完成", "Return", "⏎"),
+    spec("confirm", "完成", "Return", "Enter · Ctrl+Enter 预览"),
     spec("annotate", "标注", "d", "D"),
     spec("ocr", "OCR", "o", "O"),
     spec("translate", "翻译", "t", "T"),
@@ -211,8 +211,8 @@ pub const ANNOTATE_BUTTONS: &[ButtonSpec] = &[
     spec("tool.rect", "矩形", "r", "R"),
     spec("tool.ellipse", "椭圆", "e", "E"),
     spec("tool.text", "文字", "x", "X"),
-    // Redaction, not decoration: these two destroy the pixels they cover, which is
-    // why they are their own tools rather than a style of the rectangle.
+    // Sampled effects reduce detail but are not opaque privacy covers.
+    // Cover is a separate tool and remains topmost in every exported image.
     spec("tool.mosaic", "马赛克", "m", "M"),
     spec("tool.blur", "模糊", "g", "G"),
     // A tool, so it sits with the tools: the bar groups as finish / tools /
@@ -229,8 +229,64 @@ pub const ANNOTATE_BUTTONS: &[ButtonSpec] = &[
     spec("anno.width", "大小", "w", "W"),
     spec("anno.undo", "撤销", "u", "U"),
     spec("anno.redo", "重做", "y", "Y"),
-    spec("anno.done", "完成", "Return", "⏎"),
+    spec("anno.done", "完成", "Return", "Enter · Ctrl+Enter 预览"),
+    spec("tool.cover", "实色遮挡", "h", "H"),
 ];
+
+/// Compact drawing row; the registry above still defines keyboard actions.
+pub const ANNOTATE_TOOLS: &[ButtonSpec] = &[
+    ANNOTATE_BUTTONS[0],
+    ANNOTATE_BUTTONS[1],
+    ANNOTATE_BUTTONS[2],
+    ANNOTATE_BUTTONS[3],
+    ANNOTATE_BUTTONS[4],
+    ANNOTATE_BUTTONS[13],
+    ANNOTATE_BUTTONS[5],
+    ANNOTATE_BUTTONS[6],
+    ANNOTATE_BUTTONS[7],
+    ANNOTATE_BUTTONS[10],
+    ANNOTATE_BUTTONS[11],
+    spec("anno.back", "返回选区", "Escape", "Esc"),
+    ANNOTATE_BUTTONS[12],
+];
+
+pub fn annotation_properties(tool: crate::annotate::Tool) -> Vec<ButtonSpec> {
+    use crate::annotate::Tool;
+    let current = *ANNOTATE_BUTTONS
+        .iter()
+        .find(|b| b.id == tool.button_id())
+        .unwrap();
+    let mut result = vec![spec("anno.current", current.label, "", "")];
+    if tool.supports_color() {
+        result.push(ANNOTATE_BUTTONS[8]);
+    }
+    if tool.supports_size() {
+        result.push(spec(
+            "anno.width",
+            if tool == Tool::Text {
+                "字号"
+            } else {
+                "线宽"
+            },
+            "w",
+            "W",
+        ));
+    } else {
+        result.push(spec(
+            "anno.guide",
+            if tool == Tool::Pick {
+                "点击取色并复制色值"
+            } else if tool == Tool::Cover {
+                "拖动框选 · 纯黑覆盖置顶"
+            } else {
+                "拖动框选处理区域"
+            },
+            "",
+            "",
+        ));
+    }
+    result
+}
 
 /// Separators land before these ids, which groups the bar as
 /// "finish / tools / cancel" instead of one undifferentiated strip.
@@ -241,7 +297,8 @@ const GROUP_BREAK_BEFORE: &[&str] = &[
     // Undo and redo are history, not settings, so they get their own group
     // instead of sitting with the colour and size they do not affect.
     "anno.undo",
-    "anno.done",
+    "tool.cover",
+    "anno.back",
 ];
 
 /// Vertical gap between wrapped rows of buttons.
@@ -309,6 +366,8 @@ fn row_width(
 pub struct Button {
     pub spec: ButtonSpec,
     pub bounds: Bounds,
+    /// The actual layout padding, including compact layouts.
+    padding_x: f64,
 }
 
 impl Button {
@@ -323,13 +382,15 @@ pub struct Toolbar {
     specs: Vec<ButtonSpec>,
     buttons: Vec<Button>,
     bar: Bounds,
-    separators: Vec<f64>,
+    separators: Vec<Bounds>,
     measured: Option<Vec<Measured>>,
     /// Whether the last layout had room for the keycap badges.
     ///
     /// Set while fitting the bar to the output and read back by the draw pass, so
     /// both agree on whether a badge occupies space.
     keycaps: bool,
+    compact_icons: bool,
+    disabled: Vec<&'static str>,
 }
 
 /// Cached text metrics for one button.
@@ -349,6 +410,7 @@ struct Measured {
     /// Keycap box dimensions, precomputed so `draw` never measures again.
     cap_w: f64,
     cap_h: f64,
+    icon_only: bool,
 }
 
 impl Toolbar {
@@ -359,8 +421,66 @@ impl Toolbar {
             bar: Bounds::default(),
             separators: Vec::new(),
             measured: None,
-            keycaps: true,
+            keycaps: false,
+            compact_icons: specs.iter().any(|s| s.id == "anno.done"),
+            disabled: Vec::new(),
         }
+    }
+
+    pub fn set_specs(&mut self, specs: &[ButtonSpec]) {
+        if self.specs != specs {
+            self.specs = specs.to_vec();
+            self.measured = None;
+            self.buttons.clear();
+            self.disabled.clear();
+        }
+    }
+
+    pub fn set_enabled(&mut self, id: &'static str, enabled: bool) {
+        self.disabled.retain(|disabled| *disabled != id);
+        if !enabled {
+            self.disabled.push(id);
+        }
+    }
+
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        self.bar.contains(x, y)
+    }
+
+    pub fn move_y(&mut self, y: f64) {
+        let dy = y - self.bar.y;
+        self.bar.y = y;
+        for button in &mut self.buttons {
+            button.bounds.y += dy;
+        }
+        for line in &mut self.separators {
+            line.y += dy;
+        }
+    }
+
+    pub fn draw_tooltip(&self, cr: &Context, hover: Option<&str>, screen_w: i32, screen_h: i32) {
+        let Some(button) = self.buttons.iter().find(|b| Some(b.id()) == hover) else {
+            return;
+        };
+        let text = if button.spec.hint.is_empty() {
+            button.spec.label.to_owned()
+        } else {
+            format!("{}  ·  {}", button.spec.label, button.spec.hint)
+        };
+        let (w, h) = paint::text_size(cr, "Sans 9", &text);
+        let width = w + 18.0;
+        let height = h + 12.0;
+        let x = (button.bounds.x + button.bounds.w / 2.0 - width / 2.0)
+            .clamp(4.0, (f64::from(screen_w) - width - 4.0).max(4.0));
+        let y = if self.bar.y - height - 6.0 >= 4.0 {
+            self.bar.y - height - 6.0
+        } else {
+            (self.bar.y + self.bar.h + 6.0)
+                .min(f64::from(screen_h) - height - 4.0)
+                .max(4.0)
+        };
+        paint::soft_panel(cr, Bounds::new(x, y, width, height), 5.0);
+        paint::draw_text(cr, "Sans 9", &text, x + 9.0, y + 6.0, BUTTON_INK);
     }
 
     pub fn buttons(&self) -> &[Button] {
@@ -384,7 +504,9 @@ impl Toolbar {
     }
 
     pub fn hit(&self, px: f64, py: f64) -> Option<&Button> {
-        self.buttons.iter().find(|b| b.bounds.contains(px, py))
+        self.buttons
+            .iter()
+            .find(|b| b.bounds.contains(px, py) && !self.disabled.contains(&b.id()))
     }
 
     /// Finds a button by its hotkey, matched case-insensitively.
@@ -401,7 +523,20 @@ impl Toolbar {
                 .specs
                 .iter()
                 .map(|spec| {
-                    let (label_w, label_h) = paint::text_size(cr, LABEL_FONT, spec.label);
+                    let (text_w, label_h) = paint::text_size(cr, LABEL_FONT, spec.label);
+                    let icon_only = self.compact_icons
+                        && (spec.id.starts_with("tool.")
+                            || matches!(spec.id, "anno.undo" | "anno.redo" | "anno.back"));
+                    let label_w = if icon_only {
+                        ICON_SIZE
+                    } else if matches!(spec.id, "anno.guide" | "anno.current") {
+                        text_w
+                    } else {
+                        text_w
+                            + ICON_SIZE
+                            + ICON_GAP
+                            + if spec.id == "anno.width" { 34.0 } else { 0.0 }
+                    };
                     let (hint_w, hint_h) = if spec.hint.is_empty() {
                         (0.0, 0.0)
                     } else {
@@ -419,6 +554,7 @@ impl Toolbar {
                         hint_h,
                         cap_w,
                         cap_h,
+                        icon_only,
                     }
                 })
                 .collect();
@@ -453,6 +589,7 @@ impl Toolbar {
                 .fold(0.0f64, f64::max)
                 .max(0.0)
                 + BTN_PAD_Y * 2.0;
+            let button_h = button_h.max(30.0);
             let label_total: f64 = measured.iter().map(|m| m.label_w).sum();
             let cap_total: f64 = measured.iter().map(|m| m.cap_w).sum();
             (measured.len(), button_h, label_total, cap_total)
@@ -548,13 +685,19 @@ impl Toolbar {
                     if GROUP_BREAK_BEFORE.contains(&spec.id) {
                         // Separators only sit inside a row: a break at the start of
                         // one has nothing to separate it from.
-                        self.separators.push(x + spacing.group_gap / 2.0);
+                        self.separators.push(Bounds::new(
+                            x + spacing.group_gap / 2.0,
+                            row_y,
+                            1.0,
+                            button_h,
+                        ));
                         x += spacing.group_gap;
                     }
                 }
                 self.buttons.push(Button {
                     spec: *spec,
                     bounds: Bounds::new(x, row_y, width, button_h),
+                    padding_x: spacing.pad_x,
                 });
                 x += width;
             }
@@ -568,13 +711,21 @@ impl Toolbar {
         }
         let bar = self.bar;
         draw_slab(cr, bar);
-        for x in &self.separators {
-            draw_separator(cr, *x, bar);
+        for line in &self.separators {
+            draw_separator(cr, line.x, *line);
         }
 
         let measured = self.measured.as_deref().unwrap_or_default();
         for (button, m) in self.buttons.iter().zip(measured.iter()) {
-            draw_button(cr, button, m, hover, active, self.keycaps);
+            draw_button(
+                cr,
+                button,
+                m,
+                hover,
+                active,
+                self.keycaps,
+                !self.disabled.contains(&button.id()),
+            );
         }
         // A leaked current point would join the next shape's first arc to this
         // origin with a stray diagonal. Nothing below runs in this frame, but
@@ -586,12 +737,12 @@ impl Toolbar {
 fn draw_slab(cr: &Context, bar: Bounds) {
     // The material itself lives in `paint` because the size chip, the popups and
     // the hint rails all use it; only the corner radius is the toolbar's.
-    paint::crystal_slab(cr, bar, CORNER_R);
+    paint::soft_panel(cr, bar, CORNER_R);
 }
 
 /// A single separator hairline that fades in at the top and out at the bottom.
 fn draw_separator(cr: &Context, x: f64, bar: Bounds) {
-    let inset = BAR_INNER_PAD + 3.0;
+    let inset = 6.0;
     // `x.floor()` and not `+ 0.5`: this rect is FILLED, not stroked. Half-pixel
     // snapping is the convention for a stroke, where cairo centres the line on
     // the path; applied to a fill it splits one 1 px column across two at 50 %
@@ -630,16 +781,20 @@ fn draw_button(
     hover: Option<&str>,
     active: Option<&str>,
     keycaps: bool,
+    enabled: bool,
 ) {
     let id = button.spec.id;
     let b = button.bounds;
-    let hovered = hover == Some(id);
+    let hovered = enabled && hover == Some(id);
     let primary = is_primary(id);
     let is_active = is_active_style(id, active);
 
     if primary {
         paint::fill_rounded_gradient(cr, b, BUTTON_R, &[PRIMARY_TOP, PRIMARY_BOTTOM]);
         paint::stroke_rounded(cr, b, BUTTON_R, 1.0, PRIMARY_EDGE);
+        if hovered {
+            paint::fill_rounded(cr, b, BUTTON_R, (1.0, 0.96, 0.82, 0.09));
+        }
     } else {
         let fill = if is_active {
             GHOST_ACTIVE
@@ -653,26 +808,49 @@ fn draw_button(
         paint::fill_rounded(cr, b, BUTTON_R, fill);
         // Only the hover state carries a rim: a border on the resting ghost
         // makes the bar look like a grid of boxes instead of a single slab.
-        if hovered && !is_active {
+        if hovered {
             paint::stroke_rounded(cr, b, BUTTON_R, 1.0, GHOST_HOVER_EDGE);
         }
     }
 
-    let ink = if primary { PRIMARY_INK } else { BUTTON_INK };
+    let mut ink = if primary { PRIMARY_INK } else { BUTTON_INK };
+    if !enabled {
+        ink.3 = if matches!(id, "anno.guide" | "anno.current") {
+            0.76
+        } else {
+            0.32
+        };
+    }
+    if !matches!(id, "anno.guide" | "anno.current") {
+        draw_action_icon(
+            cr,
+            id,
+            b.x + button.padding_x,
+            b.y + (b.h - ICON_SIZE) / 2.0,
+            ink,
+        );
+    }
     let label_y = b.y + (b.h - m.label_h) / 2.0;
-    paint::draw_text(
-        cr,
-        LABEL_FONT,
-        button.spec.label,
-        b.x + BTN_PAD_X,
-        label_y,
-        ink,
-    );
+    if !m.icon_only {
+        paint::draw_text(
+            cr,
+            LABEL_FONT,
+            button.spec.label,
+            b.x + button.padding_x
+                + if matches!(id, "anno.guide" | "anno.current") {
+                    0.0
+                } else {
+                    ICON_SIZE + ICON_GAP
+                },
+            label_y,
+            ink,
+        );
+    }
 
     // Drawn only when the layout reserved room for it, so text and badge can
     // never overlap on a compacted bar.
     if keycaps && m.hint_w > 0.0 {
-        let cap_x = b.x + b.w - BTN_PAD_X - m.cap_w;
+        let cap_x = b.x + b.w - button.padding_x - m.cap_w;
         let cap_y = b.y + (b.h - m.cap_h) / 2.0;
         let cap = Bounds::new(cap_x, cap_y, m.cap_w, m.cap_h);
         paint::fill_rounded(cr, cap, KEYCAP_R, KEYCAP_BG);
@@ -686,6 +864,163 @@ fn draw_button(
             KEYCAP_INK,
         );
     }
+}
+
+/// One consistent 16px line-icon family, independent of the installed icon theme.
+fn draw_action_icon(cr: &Context, id: &str, x: f64, y: f64, ink: (f64, f64, f64, f64)) {
+    let _ = cr.save();
+    cr.translate(x, y);
+    cr.set_source_rgba(ink.0, ink.1, ink.2, ink.3);
+    cr.set_line_width(1.5);
+    cr.set_line_cap(cairo::LineCap::Round);
+    cr.set_line_join(cairo::LineJoin::Round);
+    cr.new_path();
+    match id {
+        "confirm" | "anno.done" => {
+            cr.move_to(2.5, 8.0);
+            cr.line_to(6.0, 11.5);
+            cr.line_to(13.5, 4.0);
+        }
+        "anno.back" => {
+            cr.move_to(7.0, 3.5);
+            cr.line_to(2.5, 8.0);
+            cr.line_to(7.0, 12.5);
+            cr.move_to(3.0, 8.0);
+            cr.line_to(13.5, 8.0);
+        }
+        "cancel" => {
+            cr.move_to(4.0, 4.0);
+            cr.line_to(12.0, 12.0);
+            cr.move_to(12.0, 4.0);
+            cr.line_to(4.0, 12.0);
+        }
+        "annotate" | "tool.pen" => {
+            cr.move_to(3.0, 10.5);
+            cr.line_to(10.5, 3.0);
+            cr.line_to(13.0, 5.5);
+            cr.line_to(5.5, 13.0);
+            cr.line_to(2.5, 13.5);
+            cr.close_path();
+            cr.move_to(9.0, 4.5);
+            cr.line_to(11.5, 7.0);
+        }
+        "tool.arrow" => {
+            cr.move_to(3.0, 13.0);
+            cr.line_to(13.0, 3.0);
+            cr.move_to(6.0, 3.0);
+            cr.line_to(13.0, 3.0);
+            cr.line_to(13.0, 10.0);
+        }
+        "tool.rect" => paint::rounded_rect(cr, 2.5, 3.5, 11.0, 9.0, 1.5),
+        "tool.ellipse" => {
+            cr.save().ok();
+            cr.translate(8.0, 8.0);
+            cr.scale(1.0, 0.75);
+            cr.arc(0.0, 0.0, 5.5, 0.0, std::f64::consts::TAU);
+            cr.restore().ok();
+        }
+        "ocr" => {
+            for (sx, sy, dx, dy) in [
+                (2.0, 6.0, 2.0, 2.0),
+                (10.0, 2.0, 14.0, 2.0),
+                (14.0, 10.0, 14.0, 14.0),
+                (6.0, 14.0, 2.0, 14.0),
+            ] {
+                cr.move_to(sx, sy);
+                cr.line_to(dx, dy);
+            }
+            cr.move_to(5.5, 11.0);
+            cr.line_to(8.0, 5.0);
+            cr.line_to(10.5, 11.0);
+            cr.move_to(6.5, 9.0);
+            cr.line_to(9.5, 9.0);
+        }
+        "tool.text" | "translate" => {
+            cr.move_to(3.0, 4.0);
+            cr.line_to(13.0, 4.0);
+            cr.move_to(8.0, 4.0);
+            cr.line_to(8.0, 13.0);
+            cr.move_to(5.5, 13.0);
+            cr.line_to(10.5, 13.0);
+        }
+        "pin" => {
+            cr.move_to(6.0, 2.5);
+            cr.line_to(12.5, 9.0);
+            cr.move_to(7.0, 3.5);
+            cr.line_to(4.5, 7.5);
+            cr.line_to(3.0, 8.0);
+            cr.line_to(8.0, 13.0);
+            cr.line_to(8.5, 11.5);
+            cr.line_to(12.0, 8.5);
+            cr.move_to(5.5, 10.5);
+            cr.line_to(2.0, 14.0);
+        }
+        "long" => {
+            paint::rounded_rect(cr, 4.0, 1.5, 8.0, 13.0, 1.5);
+            cr.move_to(6.5, 5.0);
+            cr.line_to(9.5, 5.0);
+            cr.move_to(6.5, 8.0);
+            cr.line_to(9.5, 8.0);
+            cr.move_to(6.5, 11.0);
+            cr.line_to(9.5, 11.0);
+        }
+        "tool.cover" => {
+            paint::rounded_rect(cr, 2.5, 3.5, 11.0, 9.0, 1.0);
+            cr.fill().ok();
+        }
+        "tool.mosaic" => {
+            for sy in [3.0, 9.0] {
+                for sx in [3.0, 9.0] {
+                    cr.rectangle(sx, sy, 4.0, 4.0);
+                }
+            }
+        }
+        "tool.blur" => {
+            cr.arc(8.0, 8.0, 5.5, 0.0, std::f64::consts::TAU);
+            cr.move_to(6.0, 4.0);
+            cr.line_to(6.0, 12.0);
+            cr.move_to(10.0, 4.0);
+            cr.line_to(10.0, 12.0);
+        }
+        "tool.pick" => {
+            cr.move_to(3.0, 13.0);
+            cr.line_to(5.0, 13.0);
+            cr.line_to(12.0, 6.0);
+            cr.line_to(10.0, 4.0);
+            cr.close_path();
+            cr.move_to(9.0, 3.0);
+            cr.line_to(13.0, 7.0);
+        }
+        "anno.color" => {
+            cr.arc(8.0, 8.0, 5.5, 0.0, std::f64::consts::TAU);
+            cr.move_to(8.0, 2.5);
+            cr.line_to(8.0, 13.5);
+        }
+        "anno.width" => {
+            for (sy, sx) in [(4.0, 5.0), (8.0, 3.0), (12.0, 1.0)] {
+                cr.move_to(sx, sy);
+                cr.line_to(16.0 - sx, sy);
+            }
+        }
+        "anno.undo" | "anno.redo" => {
+            if id == "anno.redo" {
+                cr.translate(16.0, 0.0);
+                cr.scale(-1.0, 1.0);
+            }
+            cr.move_to(6.0, 3.0);
+            cr.line_to(2.5, 6.5);
+            cr.line_to(6.0, 10.0);
+            cr.move_to(3.0, 6.5);
+            cr.line_to(10.0, 6.5);
+            cr.curve_to(15.0, 6.5, 15.0, 13.0, 10.0, 13.0);
+        }
+        _ => {
+            cr.arc(8.0, 8.0, 4.0, 0.0, std::f64::consts::TAU);
+        }
+    }
+    cr.stroke().ok();
+    cr.restore().ok();
+    cr.new_path();
 }
 
 #[cfg(test)]
@@ -743,7 +1078,11 @@ mod tests {
     #[test]
     fn group_breaks_reference_real_buttons() {
         for id in GROUP_BREAK_BEFORE {
-            let known = BUTTONS.iter().chain(ANNOTATE_BUTTONS).any(|b| b.id == *id);
+            let known = BUTTONS
+                .iter()
+                .chain(ANNOTATE_BUTTONS)
+                .chain(ANNOTATE_TOOLS)
+                .any(|b| b.id == *id);
             assert!(known, "group break for unknown button {id}");
         }
     }
@@ -818,8 +1157,8 @@ mod tests {
         assert_eq!(button.hotkey, "i", "i for 吸管");
         assert_eq!(
             ANNOTATE_BUTTONS.len(),
-            13,
-            "the annotation bar now carries thirteen buttons"
+            14,
+            "the annotation registry includes opaque cover"
         );
 
         let done = ANNOTATE_BUTTONS
@@ -847,6 +1186,7 @@ mod tests {
             ("e", "tool.ellipse"),
             ("x", "tool.text"),
             ("m", "tool.mosaic"),
+            ("h", "tool.cover"),
             ("g", "tool.blur"),
             ("i", "tool.pick"),
             ("c", "anno.color"),
@@ -997,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_button_paints_a_filled_indigo_body() {
+    fn the_primary_button_paints_a_warm_metallic_body() {
         let (surface, cr) = surface();
         let mut toolbar = Toolbar::new(BUTTONS);
         toolbar.layout(&cr, Rect::new(10, 10, 400, 100), 900, 200);
@@ -1017,8 +1357,8 @@ mod tests {
         );
         assert!(a > 200, "primary body should be near-opaque, got alpha {a}");
         assert!(
-            b > r && b > 150,
-            "primary body should be indigo (blue-dominant), got ({r},{g},{b})"
+            r > g && g > b && (90..170).contains(&r),
+            "primary body should be warm and restrained, got ({r},{g},{b})"
         );
     }
 
@@ -1127,13 +1467,13 @@ mod tests {
             toolbar.bar().w
         };
         let wide = measure(1920);
-        let narrow = measure(640);
+        let narrow = measure(480);
         assert!(
             narrow < wide,
             "the bar did not compact for a narrow output: {narrow:.0} vs {wide:.0}"
         );
         assert!(
-            narrow <= 640.0 - 2.0 * 4.0 + 0.001,
+            narrow <= 480.0 - 2.0 * 4.0 + 0.001,
             "still too wide: {narrow:.0}"
         );
     }
@@ -1154,7 +1494,13 @@ mod tests {
         let keycaps = toolbar.shows_keycaps();
         for (button, spec) in toolbar.buttons().iter().zip(ANNOTATE_BUTTONS.iter()) {
             let (label_w, _) = paint::text_size(&cr, LABEL_FONT, spec.label);
-            let mut content = label_w;
+            let mut content = if spec.id.starts_with("tool.")
+                || matches!(spec.id, "anno.undo" | "anno.redo")
+            {
+                ICON_SIZE
+            } else {
+                label_w + ICON_SIZE + ICON_GAP + if spec.id == "anno.width" { 34.0 } else { 0.0 }
+            };
             if keycaps && !spec.hint.is_empty() {
                 let (hint_w, _) = paint::text_size(&cr, HINT_FONT, spec.hint);
                 content += hint_w;
@@ -1185,7 +1531,7 @@ mod tests {
         drop(cr);
         surface.flush();
 
-        let inset = BAR_INNER_PAD + 3.0;
+        let inset = 6.0;
         let sample_y = (bar.y + inset + 4.0) as usize;
         let lit: Vec<usize> = (24..40)
             .filter(|x| pixel(&mut surface, *x, sample_y).0 > 0)
@@ -1197,6 +1543,112 @@ mod tests {
              occupy exactly one device column",
             lit.len()
         );
+    }
+
+    #[test]
+    fn compact_text_and_keycaps_keep_real_padding() {
+        let (_, cr) = surface();
+        for width in [200, 320, 480, 640, 800, 1000, 1366, 1920] {
+            let mut toolbar = Toolbar::new(ANNOTATE_BUTTONS);
+            toolbar.layout(&cr, Rect::new(10, 10, 100, 100), width, 1080);
+            for (button, measured) in toolbar
+                .buttons
+                .iter()
+                .zip(toolbar.measured.as_ref().unwrap())
+            {
+                let content_left = button.bounds.x + button.padding_x;
+                let text_end = content_left + measured.label_w;
+                let right = button.bounds.x + button.bounds.w - button.padding_x;
+                assert!(button.padding_x >= MIN_PAD_X);
+                if toolbar.keycaps {
+                    assert!(text_end + HINT_GAP <= right - measured.cap_w + 0.001);
+                } else {
+                    assert!(text_end <= right + 0.001);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_separators_stay_inside_their_own_row() {
+        let (_, cr) = surface();
+        let mut toolbar = Toolbar::new(ANNOTATE_BUTTONS);
+        toolbar.layout(&cr, Rect::new(10, 10, 100, 100), 320, 1080);
+        assert!(
+            toolbar
+                .buttons
+                .windows(2)
+                .any(|pair| pair[0].bounds.y != pair[1].bounds.y)
+        );
+        for line in &toolbar.separators {
+            assert!(line.h < toolbar.bar.h);
+            assert!(
+                toolbar
+                    .buttons
+                    .iter()
+                    .any(|button| button.bounds.y == line.y && button.bounds.h == line.h)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_default_keeps_buttons_small_and_actions_reachable() {
+        let (_, cr) = surface();
+        for specs in [BUTTONS, ANNOTATE_TOOLS] {
+            let mut toolbar = Toolbar::new(specs);
+            toolbar.layout(&cr, Rect::new(10, 10, 900, 500), 1920, 1080);
+            assert!(!toolbar.shows_keycaps());
+            assert!(
+                toolbar.bar().w < 550.0,
+                "toolbar too wide: {:?}",
+                toolbar.bar()
+            );
+            assert!(toolbar.bar().h <= 42.0);
+            assert!(toolbar.buttons().iter().all(|b| b.bounds.h >= 30.0));
+            for button in toolbar.buttons() {
+                assert_eq!(
+                    toolbar
+                        .hit(
+                            button.bounds.x + button.bounds.w / 2.0,
+                            button.bounds.y + button.bounds.h / 2.0
+                        )
+                        .unwrap()
+                        .id(),
+                    button.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_properties_are_real_not_cosmetic_controls() {
+        use crate::annotate::Tool;
+        for tool in [
+            Tool::Pen,
+            Tool::Arrow,
+            Tool::Rect,
+            Tool::Ellipse,
+            Tool::Text,
+        ] {
+            let properties = annotation_properties(tool);
+            assert!(properties.iter().any(|b| b.id == "anno.color"));
+            let size = properties.iter().find(|b| b.id == "anno.width").unwrap();
+            assert_eq!(
+                size.label,
+                if tool == Tool::Text {
+                    "字号"
+                } else {
+                    "线宽"
+                }
+            );
+        }
+        for tool in [Tool::Mosaic, Tool::Blur, Tool::Pick, Tool::Cover] {
+            assert!(
+                annotation_properties(tool)
+                    .iter()
+                    .all(|b| b.id != "anno.color" && b.id != "anno.width")
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 
 use vellum_core::image::Rgb8;
+use vellum_core::image_limits::{CAPTURE_LIMITS, ImageLimitError, ImageLimits};
 
 use crate::signature::{Cols, Sparse, compute_cols, matching_cols, sample_pixels};
 
@@ -43,10 +44,15 @@ pub struct Canvas {
     height: usize,
     width: usize,
     preview_enabled: bool,
+    limits: ImageLimits,
 }
 
 impl Canvas {
     pub fn new(preview_enabled: bool) -> Self {
+        Self::with_limits(preview_enabled, CAPTURE_LIMITS)
+    }
+
+    pub fn with_limits(preview_enabled: bool, limits: ImageLimits) -> Self {
         Self {
             blocks: VecDeque::new(),
             thumbs: VecDeque::new(),
@@ -54,6 +60,7 @@ impl Canvas {
             height: 0,
             width: 0,
             preview_enabled,
+            limits,
         }
     }
 
@@ -73,9 +80,34 @@ impl Canvas {
         self.width = width;
     }
 
-    pub fn push(&mut self, block: Rgb8, side: Side) {
+    /// Admission check must precede slicing/copying the incoming rows.
+    pub fn check_append(&self, width: usize, rows: usize) -> Result<usize, ImageLimitError> {
+        if self.width != 0 && width != self.width {
+            return Err(ImageLimitError::Dimensions);
+        }
+        let height = self
+            .height
+            .checked_add(rows)
+            .ok_or(ImageLimitError::Overflow)?;
+        self.limits.check(width, height, 3)
+    }
+
+    /// Returns false without mutating the canvas if the payload cannot be admitted.
+    pub fn push(&mut self, block: Rgb8, side: Side) -> bool {
         if block.height == 0 {
-            return;
+            return true;
+        }
+        if self.check_append(block.width, block.height).is_err()
+            || block
+                .width
+                .checked_mul(block.height)
+                .and_then(|n| n.checked_mul(3))
+                != Some(block.data.len())
+        {
+            return false;
+        }
+        if self.width == 0 {
+            self.width = block.width;
         }
 
         // Index only the rows actually added to the canvas. Across a complete
@@ -105,6 +137,7 @@ impl Canvas {
                 self.matches.push_front(matching);
             }
         }
+        true
     }
 
     /// Flatten the row signatures plus only the sparse columns used by the
@@ -198,8 +231,14 @@ impl Canvas {
         if self.blocks.len() == 1 {
             return Some(self.blocks[0].clone());
         }
-        let blocks: Vec<Rgb8> = self.blocks.iter().cloned().collect();
-        Some(Rgb8::vstack(&blocks))
+        // Copy each borrowed block directly into the final image. Cloning the
+        // blocks before vstack temporarily held THREE full RGB canvases.
+        let bytes = self.limits.check(self.width, self.height, 3).ok()?;
+        let mut data = Vec::with_capacity(bytes);
+        for block in &self.blocks {
+            data.extend_from_slice(&block.data);
+        }
+        Some(Rgb8::from_raw(self.width, self.height, data))
     }
 
     /// Down-scaled snapshot of the newest canvas content, fitted into the box.

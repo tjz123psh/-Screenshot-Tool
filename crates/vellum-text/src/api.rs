@@ -13,20 +13,29 @@ use std::time::Duration;
 use serde_json::Value;
 use vellum_core::config::ApiConfig;
 
+#[path = "privacy.rs"]
+mod privacy;
+#[path = "request_control.rs"]
+mod request_control;
+pub use request_control::{Deadline, RequestControl};
+
 /// Translation wants a little freedom in wording; OCR must have none. The
 /// temperature therefore travels with the request instead of being a constant
 /// of the public entry point.
 const TRANSLATION_TEMPERATURE: f64 = 0.2;
 
-/// A gateway that breaks can answer with an unbounded HTML error page. The
-/// reason ends up in a small result window, so it is clipped.
-const MAX_DETAIL_CHARS: usize = 300;
+/// Bound local parsing work and memory even for a malicious gateway.
+const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     /// No key is configured and the endpoint is not local, so the request was
     /// never sent.
     MissingKey,
+    /// Cancellation is cooperative; this does not assert that the server stopped.
+    Cancelled,
+    /// All stages and fallback candidates spent the same total budget.
+    DeadlineExceeded,
     /// The request never produced a response: DNS, connect, TLS or timeout.
     Transport(String),
     /// The endpoint answered and refused (4xx/5xx).
@@ -48,6 +57,10 @@ impl std::fmt::Display for ApiError {
             Self::MissingKey => f.write_str(
                 "未配置 API 密钥：请在设置面板填写，或设置环境变量 VELLUM_API_KEY / OPENAI_API_KEY",
             ),
+            Self::Cancelled => f.write_str("已取消本次请求结果；不会继续尝试后备模型"),
+            Self::DeadlineExceeded => {
+                f.write_str("请求总时限已到：请检查网络、代理或缩小内容后重试")
+            }
             Self::Transport(message)
             | Self::Upstream(message)
             | Self::Protocol(message)
@@ -77,6 +90,17 @@ pub fn chat(
     chat_at(api, model, messages, TRANSLATION_TEMPERATURE, timeout)
 }
 
+/// Chat using a budget shared with other stages and model attempts.
+/// See [RequestControl] for the cooperative cancellation limitations.
+pub fn chat_with_control(
+    api: &ApiConfig,
+    model: &str,
+    messages: Value,
+    control: &RequestControl,
+) -> Result<String, ApiError> {
+    chat_at_with_control(api, model, messages, TRANSLATION_TEMPERATURE, control)
+}
+
 /// Same request with an explicit temperature. Private to the crate: only OCR
 /// needs the deterministic setting, and exposing it would invite callers to
 /// tune a value nobody should touch.
@@ -87,6 +111,23 @@ pub(crate) fn chat_at(
     temperature: f64,
     timeout: Duration,
 ) -> Result<String, ApiError> {
+    chat_at_with_control(
+        api,
+        model,
+        messages,
+        temperature,
+        &RequestControl::new(timeout),
+    )
+}
+
+pub(crate) fn chat_at_with_control(
+    api: &ApiConfig,
+    model: &str,
+    messages: Value,
+    temperature: f64,
+    control: &RequestControl,
+) -> Result<String, ApiError> {
+    control.check()?;
     let body = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -97,12 +138,15 @@ pub(crate) fn chat_at(
         &api.chat_completions_url(),
         "POST",
         Some(&body),
-        timeout,
+        control,
     )?;
-    ensure_success(&response)?;
+    let status = ensure_success(&response);
+    control.check()?;
+    status?;
 
     let payload: Value = serde_json::from_str(&response.body)
         .map_err(|_| ApiError::Protocol("接口返回了非 JSON 响应".into()))?;
+    control.check()?;
     let choice = payload
         .get("choices")
         .and_then(|choices| choices.get(0))
@@ -135,6 +179,7 @@ pub(crate) fn chat_at(
     if text.is_empty() {
         return Err(ApiError::Protocol("模型没有返回任何文字".into()));
     }
+    control.check()?;
     Ok(text)
 }
 
@@ -142,24 +187,37 @@ pub(crate) fn chat_at(
 /// calls this: a wrong base URL, a rejected key and an unreachable host each
 /// produce a different message, which is the whole point of the button.
 pub fn probe(api: &ApiConfig, timeout: Duration) -> Result<Vec<String>, String> {
-    let response =
-        send(api, &api.models_url(), "GET", None, timeout).map_err(|err| err.to_string())?;
-    if let Err(err) = ensure_success(&response) {
-        return Err(err.to_string());
-    }
+    probe_with_control(api, &RequestControl::new(timeout)).map_err(|err| err.to_string())
+}
 
-    let payload: Value = serde_json::from_str(&response.body)
-        .map_err(|_| "模型列表不是 JSON：请确认地址指向 OpenAI 兼容接口".to_string())?;
+/// Connection test using the same cancellation and deadline contract as chat.
+pub fn probe_with_control(
+    api: &ApiConfig,
+    control: &RequestControl,
+) -> Result<Vec<String>, ApiError> {
+    control.check()?;
+    let response = send(api, &api.models_url(), "GET", None, control)?;
+    let status = ensure_success(&response);
+    control.check()?;
+    status?;
+
+    let payload: Value = serde_json::from_str(&response.body).map_err(|_| {
+        ApiError::Protocol("模型列表不是 JSON：请确认地址指向 OpenAI 兼容接口".into())
+    })?;
+    control.check()?;
     let items = payload
         .get("data")
         .and_then(Value::as_array)
         .or_else(|| payload.as_array())
-        .ok_or_else(|| "模型列表缺少 data 字段：请确认地址指向 OpenAI 兼容接口".to_string())?;
+        .ok_or_else(|| {
+            ApiError::Protocol("模型列表缺少 data 字段：请确认地址指向 OpenAI 兼容接口".into())
+        })?;
 
     // Order is the provider's; duplicates would only make the panel's picker
     // repeat itself.
     let mut ids: Vec<String> = Vec::new();
     for item in items {
+        control.check()?;
         let Some(id) = item.get("id").and_then(Value::as_str) else {
             continue;
         };
@@ -168,6 +226,7 @@ pub fn probe(api: &ApiConfig, timeout: Duration) -> Result<Vec<String>, String> 
             ids.push(id.to_string());
         }
     }
+    control.check()?;
     Ok(ids)
 }
 
@@ -193,28 +252,28 @@ fn prepare<T>(
     request: ureq::RequestBuilder<T>,
     authorization: &Option<String>,
     proxy: &Option<String>,
-    timeout: Duration,
+    control: &RequestControl,
 ) -> Result<ureq::RequestBuilder<T>, ApiError> {
+    control.check()?;
     let mut request = request.header("Accept", "application/json");
     if let Some(value) = authorization {
         request = request.header("Authorization", value);
     }
     let mut config = request
         .config()
-        .timeout_global(Some(timeout))
-        // Off on purpose: the body of a 4xx/5xx response carries the provider's
-        // own explanation ("Invalid API key"), and a bare status-code error
-        // would throw it away.
-        .http_status_as_error(false);
+        // Inspect only exact allowlisted provider codes, never raw messages.
+        .http_status_as_error(false)
+        // Explicit None must disable ureq's own environment-proxy default.
+        .proxy(None);
     if let Some(url) = proxy {
         // A blocked endpoint (api.openai.com or Google from a mainland
         // network) is reachable only through the user's own proxy, and the
         // failure without it is an opaque timeout.
         let parsed = ureq::Proxy::new(url)
-            .map_err(|err| ApiError::Transport(format!("代理地址无效：{url}（{err}）")))?;
+            .map_err(|_| ApiError::Transport("代理地址无效：请检查代理设置格式".into()))?;
         config = config.proxy(Some(parsed));
     }
-    Ok(config.build())
+    Ok(config.timeout_global(Some(control.remaining()?)).build())
 }
 
 fn send(
@@ -222,51 +281,67 @@ fn send(
     url: &str,
     method: &str,
     body: Option<&Value>,
-    timeout: Duration,
+    control: &RequestControl,
 ) -> Result<HttpResponse, ApiError> {
+    control.check()?;
     let authorization = authorization(api)?;
     let proxy = api.resolve_proxy();
-    let call = match (method, body) {
-        ("GET", _) => prepare(ureq::get(url), &authorization, &proxy, timeout)?.call(),
-        (_, Some(payload)) => {
-            prepare(ureq::post(url), &authorization, &proxy, timeout)?.send_json(payload)
-        }
-        (_, None) => prepare(ureq::post(url), &authorization, &proxy, timeout)?.send_empty(),
+    // send_json serializes before ureq starts its network clock. Serialize here
+    // instead, then calculate the remaining budget, so a large image payload
+    // cannot buy extra network time or be sent after cancellation during encode.
+    let encoded = body
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| ApiError::Protocol("请求 JSON 编码失败".into()))?;
+    control.check()?;
+    let call = match (method, encoded.as_deref()) {
+        ("GET", _) => prepare(ureq::get(url), &authorization, &proxy, control)?.call(),
+        (_, Some(payload)) => prepare(
+            ureq::post(url).header("Content-Type", "application/json"),
+            &authorization,
+            &proxy,
+            control,
+        )?
+        .send(payload),
+        (_, None) => prepare(ureq::post(url), &authorization, &proxy, control)?.send_empty(),
     };
-    let mut response = call.map_err(|err| transport_error(api, err, timeout))?;
+    control.check()?;
+    let mut response = call.map_err(transport_error)?;
     let status = response.status().as_u16();
     let body = response
         .body_mut()
-        .read_to_string()
-        .map_err(|err| ApiError::Transport(format!("读取接口响应失败：{err}")))?;
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .read_to_string();
+    control.check()?;
+    let body = body.map_err(transport_error)?;
     Ok(HttpResponse { status, body })
 }
 
-/// Turn a transport failure into a message that names the endpoint and the
-/// likely cause.
-///
-/// ureq's own text ("timeout: global") reads like a bug in vellum and sent one
-/// user looking in the wrong place, so the timeout, DNS and connection cases
-/// each get a sentence that points at the network, the address or the proxy.
-fn transport_error(api: &ApiConfig, err: ureq::Error, timeout: Duration) -> ApiError {
-    let host = api.host();
-    let via = match api.resolve_proxy() {
-        Some(proxy) => format!("（经代理 {proxy}）"),
-        None => String::new(),
+/// Classify failures without ever formatting ureq/proxy/IO strings: those can
+/// embed credentials, full request URIs or an arbitrary upstream CONNECT reply.
+fn transport_error(err: ureq::Error) -> ApiError {
+    use std::io::ErrorKind;
+    let detail = match err {
+        ureq::Error::Timeout(_) => return ApiError::DeadlineExceeded,
+        ureq::Error::HostNotFound => "无法解析接口或代理主机：请检查地址与 DNS",
+        ureq::Error::InvalidProxyUrl => "代理地址无效：请检查代理设置格式",
+        ureq::Error::ConnectProxyFailed(_) => "代理连接失败：请检查代理认证与网络",
+        ureq::Error::BadUri(_) => "接口地址无效：请检查地址格式",
+        ureq::Error::Tls(_) | ureq::Error::TlsRequired => "TLS 安全连接失败：请检查证书与系统时间",
+        ureq::Error::BodyExceedsLimit(_) => "接口响应超过安全大小上限",
+        ureq::Error::Io(error) => match error.kind() {
+            ErrorKind::TimedOut => return ApiError::DeadlineExceeded,
+            ErrorKind::ConnectionRefused => "连接被拒绝：请检查服务是否运行以及代理设置",
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                "连接中断：请检查网络或代理"
+            }
+            ErrorKind::UnexpectedEof => "接口响应不完整：连接提前关闭",
+            _ => "接口网络读写失败：请检查网络或代理",
+        },
+        _ => "接口连接或协议失败：请检查网络、证书与代理设置",
     };
-    match err {
-        ureq::Error::Timeout(_) => ApiError::Transport(format!(
-            "连接 {host} 超时（{} 秒）{via}：检查网络，或在设置面板/环境变量里配置代理",
-            timeout.as_secs().max(1)
-        )),
-        ureq::Error::HostNotFound => {
-            ApiError::Transport(format!("无法解析主机 {host}：检查接口地址拼写与 DNS"))
-        }
-        ureq::Error::Io(error) => ApiError::Transport(format!(
-            "无法连接 {host}{via}：{error}；若接口在墙外，请配置代理"
-        )),
-        other => ApiError::Transport(format!("无法连接 {host}{via}：{other}")),
-    }
+    ApiError::Transport(detail.into())
 }
 
 fn ensure_success(response: &HttpResponse) -> Result<(), ApiError> {
@@ -282,32 +357,11 @@ fn ensure_success(response: &HttpResponse) -> Result<(), ApiError> {
     )))
 }
 
-/// Render a refusal with the status code *and* the provider's message: the
-/// status alone cannot tell a rejected key from a missing model.
+/// Expose HTTP status and only a fixed, allowlisted category. Never echo the
+/// provider's free-form message, even if it is short and valid JSON.
 fn upstream(status: u16, body: &str) -> ApiError {
-    let detail = error_message(body).unwrap_or_else(|| clip(body));
-    let detail = if detail.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        format!("{detail}（HTTP {status}）")
-    };
-    ApiError::Upstream(format!("接口拒绝请求：{detail}"))
-}
-
-/// The provider's own explanation, when it sent one. OpenAI uses
-/// `error.message`; a few gateways answer with a bare `message` or
-/// `detail`.
-fn error_message(body: &str) -> Option<String> {
-    let payload: Value = serde_json::from_str(body).ok()?;
-    let candidates = [
-        payload.get("error").and_then(|error| error.get("message")),
-        payload.get("error").filter(|error| error.is_string()),
-        payload.get("message"),
-        payload.get("detail"),
-    ];
-    let message = candidates.into_iter().flatten().find_map(Value::as_str)?;
-    let message = message.trim();
-    (!message.is_empty()).then(|| clip(message))
+    let category = privacy::upstream_category(status, body);
+    ApiError::Upstream(format!("接口拒绝请求：{category}（HTTP {status}）"))
 }
 
 /// Chat completions normally carry a plain string. Newer endpoints may answer
@@ -325,16 +379,6 @@ fn content_text(content: &Value) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn clip(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= MAX_DETAIL_CHARS {
-        return trimmed.to_string();
-    }
-    let mut out: String = trimmed.chars().take(MAX_DETAIL_CHARS).collect();
-    out.push('…');
-    out
 }
 
 /// RFC 4648 base64 with padding.
@@ -383,6 +427,7 @@ mod tests {
         ApiConfig {
             base_url,
             api_key: "sk-test".into(),
+            proxy: "none".into(),
             ..ApiConfig::default()
         }
     }
@@ -456,12 +501,9 @@ mod tests {
         assert_eq!(chat(&api, "m", message(), timeout()).unwrap(), "hello");
         assert_eq!(chat(&api, "m", message(), timeout()).unwrap(), "hello");
     }
-    /// A blocked endpoint must not surface as ureq's own text ("timeout:
-    /// global"): the message names the host and points at the proxy, because
-    /// that is the failure a user hits with api.openai.com or Google from a
-    /// mainland network.
+    /// A timeout retains a useful category, without disclosing the endpoint.
     #[test]
-    fn a_timeout_names_the_host_and_the_proxy_hint() {
+    fn a_timeout_hides_the_host_and_keeps_the_proxy_hint() {
         let server = MockServer::start(vec![Script::slow(
             Duration::from_millis(500),
             200,
@@ -472,7 +514,8 @@ mod tests {
         api.proxy = "none".into();
         let error = chat(&api, "mock-model", message(), Duration::from_millis(80)).unwrap_err();
         let text = error.to_string();
-        assert!(text.contains("127.0.0.1"), "host missing: {text}");
+        assert!(!text.contains("127.0.0.1"), "host leaked: {text}");
+        assert_eq!(error, ApiError::DeadlineExceeded);
         assert!(text.contains("代理"), "proxy hint missing: {text}");
         assert!(!text.contains("global"), "raw ureq text leaked: {text}");
     }
@@ -605,11 +648,16 @@ mod tests {
     }
 
     #[test]
-    fn refusals_carry_the_server_message_and_the_status() {
+    fn refusals_carry_safe_category_and_status_not_server_message() {
         let statuses = [401u16, 403, 404, 422, 429, 500, 503];
         let script = statuses
             .iter()
-            .map(|status| Script::reply(*status, r#"{"error":{"message":"Invalid API key"}}"#))
+            .map(|status| {
+                Script::reply(
+                    *status,
+                    r#"{"error":{"message":"synthetic-secret-marker"}}"#,
+                )
+            })
             .collect();
         let server = MockServer::start(script);
         let api = api(server.base_url());
@@ -620,7 +668,10 @@ mod tests {
                 matches!(err, ApiError::Upstream(_)),
                 "{status} -> {message}"
             );
-            assert!(message.contains("Invalid API key"), "{status} -> {message}");
+            assert!(
+                !message.contains("synthetic-secret-marker"),
+                "{status} -> {message}"
+            );
             assert!(
                 message.contains(&status.to_string()),
                 "{status} -> {message}"
@@ -687,7 +738,7 @@ mod tests {
             Duration::from_millis(120),
         )
         .unwrap_err();
-        assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+        assert_eq!(err, ApiError::DeadlineExceeded);
     }
 
     #[test]
@@ -714,5 +765,121 @@ mod tests {
         );
         assert!(probe(&api, timeout()).unwrap_err().contains("JSON"));
         assert!(probe(&api, timeout()).unwrap_err().contains("data"));
+    }
+
+    #[test]
+    fn a_cancelled_or_expired_control_never_opens_a_socket() {
+        let server = MockServer::start(vec![Script::reply(200, choices("unused"))]);
+        let api = api(server.base_url());
+        let control = RequestControl::new(timeout());
+        control.cancel();
+        assert_eq!(
+            chat_with_control(&api, "m", message(), &control),
+            Err(ApiError::Cancelled)
+        );
+        assert_eq!(probe_with_control(&api, &control), Err(ApiError::Cancelled));
+        let expired = RequestControl::new(Duration::ZERO);
+        assert_eq!(
+            chat_with_control(&api, "m", message(), &expired),
+            Err(ApiError::DeadlineExceeded)
+        );
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn unsafe_transport_details_never_reach_display_or_debug() {
+        let secret = "synthetic-secret-marker";
+        for raw in [
+            ureq::Error::BadUri(format!(
+                "https://u:{secret}@private.invalid/v1?token={secret}"
+            )),
+            ureq::Error::ConnectProxyFailed(format!("proxy echoed Bearer {secret}")),
+            ureq::Error::Io(std::io::Error::other(secret)),
+        ] {
+            let err = transport_error(raw);
+            let visible = format!("{err} {err:?}");
+            assert!(!visible.contains(secret));
+            assert!(!visible.contains("private.invalid"));
+        }
+        let mut api = api("http://127.0.0.1:1/v1".into());
+        api.proxy =
+            format!("invalid-scheme://user:{secret}@synthetic-proxy.invalid/?password={secret}");
+        let err = chat(&api, "synthetic-private-model", message(), timeout()).unwrap_err();
+        let visible = format!("{err} {err:?}");
+        assert!(visible.contains("代理"));
+        for hidden in [secret, "synthetic-proxy.invalid", "synthetic-private-model"] {
+            assert!(!visible.contains(hidden));
+        }
+    }
+
+    #[test]
+    fn response_body_reading_uses_the_same_deadline_as_headers() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = api(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf);
+            let body = choices("too late");
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(800));
+            let _ = socket.write_all(body.as_bytes());
+        });
+        let started = Instant::now();
+        let result = chat(&api, "m", message(), Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert_eq!(result, Err(ApiError::DeadlineExceeded));
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "body ignored total deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn cancelling_an_inflight_response_rejects_its_late_success() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = api(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf);
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let body = choices("late response");
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let control = RequestControl::new(Duration::from_secs(2));
+        let worker_control = control.clone();
+        let worker =
+            std::thread::spawn(move || chat_with_control(&api, "m", message(), &worker_control));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        control.cancel();
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Err(ApiError::Cancelled));
+        server.join().unwrap();
     }
 }

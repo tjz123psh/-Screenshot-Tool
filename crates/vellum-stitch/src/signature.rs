@@ -230,19 +230,32 @@ pub fn is_static_view(
 
 /// Rows ignored at the top of an overlap so scroll inertia does not poison it.
 pub fn content_top_ignore(length: usize) -> usize {
-    if length < 80 {
-        0
-    } else {
-        (length / 4).min((length / 10).max(16))
-    }
+    // Introduce at most one discarded row per extra overlap row across both
+    // edges, rather than suddenly removing 32 rows at length 80.
+    let ramp = length.saturating_sub(79).div_ceil(2);
+    ramp.min((length / 4).min((length / 10).max(16)))
 }
 
 /// Rows ignored at the bottom of an overlap (fade-in / kinetic tail).
 pub fn content_bottom_ignore(length: usize) -> usize {
-    if length < 80 {
-        0
+    let ramp = length.saturating_sub(79) / 2;
+    ramp.min((length / 4).min((length * 8 / 100).max(16)))
+}
+
+/// Edge-trimmed bounds without spending the rows needed to trust a match.
+/// Masks still have to pass the scorer's separate trusted-pair count check.
+/// Short overlaps are not made valid here; the signature gate rejects them.
+pub(crate) fn content_overlap_bounds(length: usize, min_overlap: usize) -> (usize, usize) {
+    let top = content_top_ignore(length);
+    let bottom = content_bottom_ignore(length);
+    let budget = length.saturating_sub(min_overlap);
+    if top + bottom > budget {
+        // The top allowance is always at least the bottom allowance. Split a
+        // limited budget evenly, assigning an odd remaining row to the top.
+        let bottom = bottom.min(budget / 2);
+        (budget - bottom, length - bottom)
     } else {
-        (length / 4).min((length * 8 / 100).max(16))
+        (top, length - bottom)
     }
 }
 
@@ -399,15 +412,40 @@ mod tests {
     }
 
     #[test]
-    fn ignore_bands_match_python_formulas() {
+    fn ignore_bands_ramp_into_the_original_long_overlap_formulas() {
         assert_eq!(content_top_ignore(79), 0);
         assert_eq!(content_bottom_ignore(79), 0);
-        assert_eq!(content_top_ignore(80), 16);
-        assert_eq!(content_bottom_ignore(80), 16);
+        assert_eq!(content_top_ignore(80), 1);
+        assert_eq!(content_bottom_ignore(80), 0);
+        assert_eq!(content_top_ignore(100), 11);
+        assert_eq!(content_bottom_ignore(100), 10);
+        assert_eq!(content_top_ignore(111), 16);
+        assert_eq!(content_bottom_ignore(111), 16);
         assert_eq!(content_top_ignore(400), 40);
         assert_eq!(content_bottom_ignore(400), 32);
-        // The length/4 cap dominates for mid-size overlaps.
-        assert_eq!(content_top_ignore(100), 16);
+        let mut previous = 79;
+        for length in 80..=132 {
+            let retained = length - content_top_ignore(length) - content_bottom_ignore(length);
+            assert!(retained >= previous);
+            previous = retained;
+        }
+    }
+
+    #[test]
+    fn overlap_bounds_preserve_minimum_without_exceeding_edge_allowances() {
+        for length in 0..=720 {
+            for minimum in [12, 60, 100, 247, 700] {
+                let (top, end) = content_overlap_bounds(length, minimum);
+                assert!(top <= end && end <= length);
+                assert!(end - top >= minimum.min(length));
+                assert!(top <= content_top_ignore(length));
+                assert!(length - end <= content_bottom_ignore(length));
+            }
+        }
+        assert_eq!(content_overlap_bounds(100, 100), (0, 100));
+        assert_eq!(content_overlap_bounds(131, 100), (16, 116));
+        assert_eq!(content_overlap_bounds(132, 100), (16, 116));
+        assert_eq!(content_overlap_bounds(400, 100), (40, 368));
     }
 
     #[test]

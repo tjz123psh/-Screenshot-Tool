@@ -85,8 +85,13 @@ pub fn tray_config_path() -> PathBuf {
 }
 
 /// Screenshot output directory, matching niri's default.
-pub fn screenshot_dir() -> PathBuf {
+pub fn default_screenshot_dir() -> PathBuf {
     home().join("Pictures/Screenshots")
+}
+
+/// Latest user preference; writing callers use prefs::load_checked to reject damage.
+pub fn screenshot_dir() -> PathBuf {
+    crate::prefs::load().resolved_output_dir()
 }
 
 #[cfg(test)]

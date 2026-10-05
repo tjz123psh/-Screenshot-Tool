@@ -51,8 +51,15 @@ enum Command {
     PinLast,
     /// 托盘图标
     Tray,
-    /// 打开设置面板（配置 OCR 与翻译的 API 接入）
+    /// 打开截图工作台与偏好设置
     Panel,
+    /// 浏览 PNG 图片，支持长图滚动、缩放、复制与另存为
+    Preview { path: String },
+    /// 查看、重新打开或明确清理未完成交接的图片
+    Recover {
+        #[command(subcommand)]
+        command: Option<RecoveryCommand>,
+    },
     /// 查看服务状态
     Status {
         /// 以 JSON 输出
@@ -73,7 +80,7 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         lines: usize,
     },
-    /// 管理截图快捷键（niri 可自动写入，Hyprland Lua 配置输出片段）
+    /// 管理应用全局快捷键（通过系统授权，无需编辑桌面配置）
     Shortcuts {
         #[command(subcommand)]
         command: Option<ShortcutsCommand>,
@@ -89,7 +96,7 @@ enum Command {
     #[command(hide = true)]
     PinFile {
         path: String,
-        /// 读取后删除该文件（overlay 用临时文件传图）
+        /// 兼容旧内部参数；任意用户文件不会因该标记被删除
         #[arg(long)]
         cleanup: bool,
     },
@@ -99,19 +106,68 @@ enum Command {
         path: String,
         #[arg(long, value_enum, default_value_t = TextMode::Ocr)]
         mode: TextMode,
-        /// 读取后删除该文件
+        /// 兼容旧内部参数；清理由经过验证的图片交接协议负责
         #[arg(long)]
         cleanup: bool,
     },
 }
 
 #[derive(Subcommand)]
-enum ShortcutsCommand {
-    /// 列出当前配置里的 vellum 快捷键
+enum RecoveryCommand {
+    /// 只读列出待恢复图片编号
     List,
-    /// 写入默认快捷键（有冲突则整组不写）
+    /// 重新打开指定图片；保留恢复副本直到明确清理
+    Open {
+        #[arg(value_parser = recovery_id)]
+        id: String,
+    },
+    /// 明确删除指定恢复副本，不删除用户另存的图片
+    Discard {
+        #[arg(value_parser = recovery_id)]
+        id: String,
+    },
+}
+
+fn recovery_id(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("请输入 recover list 列出的图片编号，不接受文件路径".into());
+    }
+    Ok(value.into())
+}
+
+fn recovery_args(command: Option<RecoveryCommand>) -> Vec<String> {
+    match command.unwrap_or(RecoveryCommand::List) {
+        RecoveryCommand::List => vec!["recover-list".into()],
+        RecoveryCommand::Open { id } => vec!["recover-image".into(), id],
+        RecoveryCommand::Discard { id } => vec!["recover-discard".into(), id],
+    }
+}
+
+#[derive(Subcommand)]
+enum ShortcutsCommand {
+    /// 查看系统实际授权的快捷键
+    List,
+    /// 查看快捷键服务状态
+    Status,
+    /// 启用并申请系统授权
+    Enable,
+    /// 停用应用管理的快捷键（不动旧桌面绑定）
+    Disable,
+    /// 打开系统快捷键配置（需要接口版本2）
+    Configure,
+    /// 运行持久快捷键服务
+    #[command(hide = true)]
+    Run,
+    /// 只读查看旧桌面配置中的绑定
+    LegacyList,
+    /// 传统兼容方式：显式写入桌面快捷键配置，不是默认方案
     Install,
-    /// 移除 vellum 托管的快捷键区域
+    /// 传统兼容方式：移除旧 vellum 托管配置块
     Remove,
 }
 
@@ -203,11 +259,22 @@ fn run() -> anyhow::Result<u8> {
         Command::PinLast => capture(Action::PinLast, &OutputFlags::default(), &[]),
         Command::Tray => handover(ui::TRAY_BINARY, &[]),
         Command::Panel => handover(ui::UI_BINARY, &["panel".to_string()]),
+        Command::Preview { path } => {
+            let path = std::fs::canonicalize(path)?;
+            handover(
+                ui::UI_BINARY,
+                &[
+                    "preview-file".to_string(),
+                    path.to_string_lossy().into_owned(),
+                ],
+            )
+        }
+        Command::Recover { command } => handover(ui::UI_BINARY, &recovery_args(command)),
         Command::Status { json } => status(json),
         Command::Doctor { json } => Ok(doctor(json)),
         Command::Restart => Ok(restart()),
         Command::Logs { lines } => Ok(logs(lines)),
-        Command::Shortcuts { command } => Ok(manage_shortcuts(command)),
+        Command::Shortcuts { command } => manage_shortcuts(command),
         Command::Daemon => Ok(vellum_ipc::daemon::run()? as u8),
         Command::DebugCapture { output } => {
             let mut args = vec!["debug-capture".to_string()];
@@ -398,12 +465,18 @@ fn logs(lines: usize) -> u8 {
     0
 }
 
-fn manage_shortcuts(command: Option<ShortcutsCommand>) -> u8 {
-    match command.unwrap_or(ShortcutsCommand::List) {
-        ShortcutsCommand::List => list_shortcuts(),
-        ShortcutsCommand::Install => report_shortcuts(shortcuts::install(None)),
-        ShortcutsCommand::Remove => report_shortcuts(shortcuts::remove(None)),
-    }
+fn manage_shortcuts(command: Option<ShortcutsCommand>) -> anyhow::Result<u8> {
+    let action = match command.unwrap_or(ShortcutsCommand::Status) {
+        ShortcutsCommand::LegacyList => return Ok(list_shortcuts()),
+        ShortcutsCommand::Install => return Ok(report_shortcuts(shortcuts::install(None))),
+        ShortcutsCommand::Remove => return Ok(report_shortcuts(shortcuts::remove(None))),
+        ShortcutsCommand::Run => return handover(ui::UI_BINARY, &["shortcuts-service".into()]),
+        ShortcutsCommand::List | ShortcutsCommand::Status => "status",
+        ShortcutsCommand::Enable => "enable",
+        ShortcutsCommand::Disable => "disable",
+        ShortcutsCommand::Configure => "configure",
+    };
+    handover(ui::UI_BINARY, &["shortcuts-control".into(), action.into()])
 }
 
 fn list_shortcuts() -> u8 {
@@ -466,6 +539,31 @@ fn report_shortcuts(result: shortcuts::InstallResult) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_is_explicit_and_never_accepts_a_file_path() {
+        for (args, expected) in [
+            (vec!["vellum", "recover"], vec!["recover-list"]),
+            (vec!["vellum", "recover", "list"], vec!["recover-list"]),
+            (
+                vec!["vellum", "recover", "open", "request-123"],
+                vec!["recover-image", "request-123"],
+            ),
+            (
+                vec!["vellum", "recover", "discard", "request-123"],
+                vec!["recover-discard", "request-123"],
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Command::Recover { command } = cli.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(recovery_args(command), expected);
+        }
+        for id in ["", "../private.png", "/tmp/photo.png", "a/b", "..", "a b"] {
+            assert!(Cli::try_parse_from(["vellum", "recover", "discard", id]).is_err());
+        }
+    }
 
     #[test]
     fn the_panel_subcommand_is_reachable_from_the_cli() {

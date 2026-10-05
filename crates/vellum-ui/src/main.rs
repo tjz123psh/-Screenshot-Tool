@@ -17,8 +17,12 @@
 //!   selection overlay and creating the recorder.
 
 mod annotate;
+mod background_blur;
 mod controls;
+mod document;
 mod drag;
+mod editor;
+mod handoff;
 mod highlight;
 mod imaging;
 mod model_picker;
@@ -26,10 +30,13 @@ mod own_window;
 mod paint;
 mod panel;
 mod pin;
+mod portal_shortcuts;
+mod preview;
 mod recorder;
 mod result;
 mod screencopy;
 mod selector;
+mod session_transfer;
 mod surface;
 
 #[cfg(test)]
@@ -37,9 +44,9 @@ mod test_support;
 mod theme;
 mod toolbar;
 mod trace;
+mod ui_job;
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -60,6 +67,8 @@ use surface::Outcome;
 /// Cancelling is a normal outcome, not a failure. The control service treats
 /// this code as a clean exit so it does not raise a critical notification.
 const EXIT_CANCELLED: i32 = 130;
+/// Capture finished, but an independent export or result handoff failed.
+const EXIT_OUTPUT_FAILED: i32 = 3;
 
 /// How often the main loop checks for a delivered finish signal.
 ///
@@ -176,7 +185,7 @@ fn main() -> std::process::ExitCode {
 fn dispatch(args: &[String]) -> anyhow::Result<i32> {
     let Some(action) = args.first().map(String::as_str) else {
         eprintln!(
-            "usage: vellum-ui <region|long|pin-last|debug-capture|pin-file|text-file|panel> [..]"
+            "usage: vellum-ui <region|long|pin-last|debug-capture|pin-file|preview-file|text-file|panel> [..]"
         );
         return Ok(1);
     };
@@ -184,6 +193,54 @@ fn dispatch(args: &[String]) -> anyhow::Result<i32> {
     let daemon_managed = std::env::var(vellum_core::DAEMON_MANAGED_ENV).as_deref() == Ok("1");
 
     match action {
+        "recover-list" => {
+            let ids = handoff::list()?;
+            if ids.is_empty() {
+                println!("没有待恢复图片");
+            }
+            for id in ids {
+                println!("{id}\t已保留，可打开或明确丢弃");
+            }
+            Ok(0)
+        }
+        "recover-image" | "recover-discard" => {
+            let id = args
+                .get(1)
+                .ok_or_else(|| anyhow::anyhow!("missing recovery ID"))?;
+            let asset = handoff::Asset::open(id)?;
+            if action == "recover-discard" {
+                asset.discard()?;
+                println!("已丢弃恢复图片 {id}");
+                Ok(0)
+            } else {
+                // Opening is not consent to delete: retain until explicit discard.
+                let image = load_image(&asset.image_path(), false)?;
+                let context = asset.context_args().unwrap_or_else(|_| {
+                    eprintln!("[vellum] 恢复状态记录不可读；仍可打开原图并重新保存或复制");
+                    Vec::new()
+                });
+                let incomplete = context.iter().any(|arg| arg == "--incomplete");
+                Ok(preview::run(
+                    image,
+                    incomplete,
+                    preview::OutputReport::from_args(&context),
+                ))
+            }
+        }
+        "shortcuts-service" => portal_shortcuts::run_service(),
+        "shortcuts-control" => {
+            let action = args.get(1).map(String::as_str).unwrap_or("status");
+            let method = match action {
+                "enable" => "Enable",
+                "disable" => "Disable",
+                "configure" => "Configure",
+                _ => "GetStatus",
+            };
+            let result = portal_shortcuts::control(method, method == "Enable")
+                .map_err(anyhow::Error::msg)?;
+            println!("{result}");
+            Ok(0)
+        }
         "region" => run_region(flags, false, false, LongshotTrace::default()),
         "long" => run_region(
             flags,
@@ -193,6 +250,42 @@ fn dispatch(args: &[String]) -> anyhow::Result<i32> {
         ),
         "debug-capture" => debug_capture(flags),
         "pin-last" => Ok(pin::run_from_clipboard()),
+        // Exercise the real completion handoff with synthetic pixels, without
+        // screen capture, user export preferences, or clipboard side effects.
+        "demo-longshot-result" if std::env::var("VELLUM_UI_DEMO").as_deref() == Ok("1") => {
+            let (path, _) = file_args(&args[1..])?;
+            let image = load_image(&path, false)?;
+            Ok(deliver_longshot(
+                image,
+                OutputFlags {
+                    save: false,
+                    copy: false,
+                },
+                false,
+            ))
+        }
+        "preview-file" => {
+            let (path, cleanup) = file_args(&args[1..])?;
+            match load_image(&path, cleanup) {
+                Ok(image) => {
+                    let document = receive_edit_document(args, &image);
+                    Ok(preview::run_with_document(
+                        image,
+                        document,
+                        args.iter().any(|arg| arg == "--incomplete"),
+                        preview::OutputReport::from_args(args),
+                    ))
+                }
+                Err(error) => {
+                    vellum_core::io::notify(
+                        "Vellum 无法预览",
+                        "图片加载失败；已保存的原图不受影响",
+                        "normal",
+                    );
+                    Err(error)
+                }
+            }
+        }
         "pin-file" => {
             let (path, cleanup) = file_args(&args[1..])?;
             let image = load_image(&path, cleanup)?;
@@ -206,13 +299,55 @@ fn dispatch(args: &[String]) -> anyhow::Result<i32> {
             let (path, cleanup) = file_args(&args[1..])?;
             let mode = flag_value(&args[1..], "--mode").unwrap_or_else(|| "ocr".to_string());
             let image = load_image(&path, cleanup)?;
-            Ok(result::run_text_action(image, mode == "translate"))
+            if let Some(document) = receive_edit_document(args, &image) {
+                Ok(result::run_document(document, mode == "translate"))
+            } else if !handoff::has_pending_receiver() {
+                let mut document =
+                    document::Document::from_raster(image).map_err(anyhow::Error::msg)?;
+                document.mark_saved(document.revision());
+                Ok(result::run_document(
+                    Rc::new(RefCell::new(document)),
+                    mode == "translate",
+                ))
+            } else {
+                Ok(result::run_text_action(image, mode == "translate"))
+            }
         }
         other => {
             eprintln!("[vellum] unknown action: {other}");
             Ok(1)
         }
     }
+}
+
+fn decode_edit_document(bytes: &[u8], image: &Rgb8) -> Option<document::Document> {
+    document::Document::decode_session(bytes)
+        .ok()
+        .filter(|doc| {
+            doc.snapshot()
+                .is_ok_and(|snapshot| snapshot.image.as_ref() == image)
+        })
+}
+
+fn receive_edit_document(args: &[String], image: &Rgb8) -> Option<document::SharedDocument> {
+    let requested = args.iter().any(|arg| arg == session_transfer::FLAG);
+    let decoded = if requested {
+        session_transfer::read_stdin()
+            .ok()
+            .and_then(|bytes| decode_edit_document(&bytes, image))
+    } else {
+        None
+    };
+    if (requested && decoded.is_none())
+        || args.iter().any(|arg| arg == "--edit-session-unavailable")
+    {
+        vellum_core::io::notify(
+            "Vellum 编辑草稿未传递",
+            "已保留遮挡后的成品图片。可添加新标注，但不能撤销原有标注。",
+            "normal",
+        );
+    }
+    decoded.map(|doc| Rc::new(RefCell::new(doc)))
 }
 
 /// `--save`/`--no-save`/`--no-copy` as forwarded by the CLI.
@@ -256,23 +391,30 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
 /// Extracts the positional path plus `--cleanup` for the internal commands.
 fn file_args(args: &[String]) -> anyhow::Result<(PathBuf, bool)> {
     let cleanup = args.iter().any(|arg| arg == "--cleanup");
-    let path = args
-        .iter()
-        .find(|arg| !arg.starts_with('-') && *arg != "ocr" && *arg != "translate")
-        .ok_or_else(|| anyhow::anyhow!("missing file argument"))?;
-    Ok((PathBuf::from(path), cleanup))
+    let mut values = args.iter();
+    while let Some(arg) = values.next() {
+        if matches!(arg.as_str(), "--mode" | "--save-status" | "--copy-status") {
+            values.next();
+        } else if !arg.starts_with('-') {
+            return Ok((PathBuf::from(arg), cleanup));
+        }
+    }
+    Err(anyhow::anyhow!("missing file argument"))
 }
 
-/// Loads an image handed over through a temp file, deleting it when asked.
-///
-/// The unlink happens even on a load failure: the file is ours and nobody else
-/// will clean it up.
-fn load_image(path: &Path, cleanup: bool) -> anyhow::Result<Rgb8> {
-    let result = Rgb8::load(path);
-    if cleanup {
-        let _ = std::fs::remove_file(path);
+/// --cleanup alone never proves ownership. Only a parent with a matching mapped
+/// window receipt may remove its exact recovery asset; failed decoding keeps it.
+fn load_image(path: &Path, _cleanup: bool) -> anyhow::Result<Rgb8> {
+    match Rgb8::load(path) {
+        Ok(image) => {
+            handoff::arm_after_decode(path)?;
+            Ok(image)
+        }
+        Err(_) => {
+            handoff::reject(path, "decode");
+            Err(anyhow::anyhow!("无法读取图片；原文件仍保留，可修复后重试"))
+        }
     }
-    result.map_err(|err| anyhow::anyhow!("failed to load {}: {err}", path.display()))
 }
 
 /// A screen grab running while GTK starts up, collected in `activate`.
@@ -379,7 +521,7 @@ fn capture_error_kind(error: &CaptureError) -> &'static str {
 fn debug_capture(flags: OutputFlags) -> anyhow::Result<i32> {
     let image = vellum_core::capture::grab_full()?;
     println!("captured: {}x{}", image.width, image.height);
-    Ok(keep_image(&image, flags, "vellum-debug", false))
+    Ok(keep_image(image, flags, "vellum-debug", false))
 }
 
 fn longshot_done_failed(has_image: bool, warning_count: usize) -> bool {
@@ -570,7 +712,8 @@ impl Session {
                 )],
             );
         }
-        self.exit_code.set(self.handle(outcome.cropped, &action));
+        self.exit_code
+            .set(self.handle(outcome.cropped, &action, outcome.document));
         app.quit();
     }
 
@@ -613,7 +756,18 @@ impl Session {
                     eprintln!("[vellum] {warning}");
                 }
                 let code = match image {
-                    Some(image) => done_session.handle(Some(image), "long_done"),
+                    Some(image) => done_session.handle(
+                        Some(image),
+                        if warnings
+                            .iter()
+                            .any(|warning| warning == vellum_stitch::INCOMPLETE_WARNING)
+                        {
+                            "long_done_incomplete"
+                        } else {
+                            "long_done"
+                        },
+                        None,
+                    ),
                     None if failed => {
                         vellum_core::io::notify(
                             "Vellum 长截图失败",
@@ -655,128 +809,821 @@ impl Session {
     }
 
     /// Turns an overlay action into an exit code.
-    fn handle(&self, cropped: Option<Rgb8>, action: &str) -> i32 {
+    fn handle(
+        &self,
+        cropped: Option<Rgb8>,
+        action: &str,
+        document: Option<document::Document>,
+    ) -> i32 {
         match action {
             "cancel" => {
                 println!("[vellum] cancelled");
                 EXIT_CANCELLED
             }
-            "long_done" => match cropped {
-                Some(image) => keep_image(&image, self.flags, "vellum-long", true),
+            "long_done" | "long_done_incomplete" => match cropped {
+                Some(image) => {
+                    deliver_longshot(image, self.flags, action == "long_done_incomplete")
+                }
                 None => EXIT_CANCELLED,
             },
-            "pin" => spawn_detached(cropped, &["pin-file", "--cleanup"], "pinned"),
+            "pin" => spawn_detached(cropped, &["pin-file", "--cleanup"], "pinned", None),
             "ocr" => spawn_detached(
                 cropped,
                 &["text-file", "--mode", "ocr", "--cleanup"],
                 "ocr started",
+                document,
             ),
             "translate" => spawn_detached(
                 cropped,
                 &["text-file", "--mode", "translate", "--cleanup"],
                 "translate started",
+                document,
             ),
             // "confirm" and "annotate" both end in keeping the crop.
             _ => match cropped {
-                Some(image) => keep_image(&image, self.flags, "vellum", false),
+                Some(image) => keep_document_image(
+                    image,
+                    self.flags,
+                    "vellum",
+                    false,
+                    document,
+                    action == "preview",
+                ),
                 None => EXIT_CANCELLED,
             },
         }
     }
 }
 
-/// Saves and/or copies the result.
-///
-/// Save and copy are attempted independently: one failing must not discard the
-/// other, because the user asked for both.
-fn keep_image(image: &Rgb8, flags: OutputFlags, prefix: &str, long_shot: bool) -> i32 {
-    let mut code = 0;
-    if flags.save {
-        match vellum_core::io::save_image(image, prefix) {
-            Ok(path) => println!("saved: {}", path.display()),
-            Err(err) => {
-                eprintln!("[vellum] save failed: {err}");
-                code = 1;
+/// Result of independent exports and, when necessary, a recovery handoff.
+/// Only fixed, user-facing error descriptions enter this result, never paths or
+/// arbitrary error strings from subprocesses.
+#[derive(Debug, PartialEq, Eq)]
+struct RegionDelivery {
+    save: Option<Result<(), &'static str>>,
+    copy: Option<Result<(), &'static str>>,
+    preview_started: Option<bool>,
+}
+
+impl RegionDelivery {
+    fn output_report(&self) -> preview::OutputReport {
+        use preview::ExportState;
+        let save = match self.save {
+            None => ExportState::NotRequested,
+            Some(Ok(())) => ExportState::Done,
+            Some(Err("图片已写入，但持久化尚未确认；请保留恢复图片或当前窗口。")) => {
+                ExportState::Uncertain
             }
-        }
+            Some(Err(_)) => ExportState::Failed,
+        };
+        let copy = match self.copy {
+            None => ExportState::NotRequested,
+            Some(Ok(())) => ExportState::Done,
+            Some(Err(_)) => ExportState::Failed,
+        };
+        preview::OutputReport { save, copy }
     }
-    if flags.copy {
-        match vellum_core::io::copy_image(image) {
-            Ok(()) => {
-                if long_shot {
-                    println!("long-shot done: {}x{} copied", image.width, image.height);
-                } else {
-                    println!("copied: {}x{} to clipboard", image.width, image.height);
+
+    fn export_failed(&self) -> bool {
+        matches!(self.save, Some(Err(_))) || matches!(self.copy, Some(Err(_)))
+    }
+
+    fn needs_preview(&self) -> bool {
+        (self.save.is_none() && self.copy.is_none()) || self.export_failed()
+    }
+
+    fn exit_code(&self) -> i32 {
+        // Recovery does not turn a failed requested export into success.
+        i32::from(self.export_failed() || self.preview_started == Some(false))
+    }
+
+    fn failure_message(&self) -> Option<String> {
+        if self.exit_code() == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        match self.save {
+            Some(Ok(())) => parts.push("图片已保存。"),
+            Some(Err(message)) => parts.push(message),
+            None => {}
+        }
+        match self.copy {
+            Some(Ok(())) => parts.push("图片已复制到剪贴板。"),
+            Some(Err(message)) => parts.push(message),
+            None => {}
+        }
+        if self.save.is_none() && self.copy.is_none() {
+            parts.push("未启用自动保存或复制。");
+        }
+        match self.preview_started {
+            Some(true) => parts.push("图片预览已就绪，可在预览中重试保存或复制。"),
+            Some(false) => {
+                parts.push("图片预览未确认就绪。");
+                if self.save != Some(Ok(())) && self.copy != Some(Ok(())) {
+                    parts.push(
+                        "请用 vellum recover list 查找恢复图片；无法落盘时请保持内存预览打开。",
+                    );
                 }
             }
-            Err(err) => {
-                eprintln!("[vellum] copy failed: {err}");
-                code = 1;
-            }
+            None => {}
+        }
+        Some(parts.join(""))
+    }
+}
+
+/// Keep decisions testable without GTK, a clipboard, subprocesses, or image I/O.
+#[cfg(test)]
+fn deliver_region_with(
+    flags: OutputFlags,
+    save: impl FnOnce() -> Result<(), &'static str>,
+    copy: impl FnOnce() -> Result<(), &'static str>,
+    preview: impl FnOnce(&[&str]) -> i32,
+) -> RegionDelivery {
+    deliver_region_policy_with(flags, false, save, copy, preview)
+}
+fn deliver_region_policy_with(
+    flags: OutputFlags,
+    force_preview: bool,
+    save: impl FnOnce() -> Result<(), &'static str>,
+    copy: impl FnOnce() -> Result<(), &'static str>,
+    preview: impl FnOnce(&[&str]) -> i32,
+) -> RegionDelivery {
+    let mut delivery = RegionDelivery {
+        // Do not short-circuit: either export can succeed on its own.
+        save: flags.save.then(save),
+        copy: flags.copy.then(copy),
+        preview_started: None,
+    };
+    if force_preview || delivery.needs_preview() {
+        // Export failure is not missing long-shot content: no --incomplete.
+        delivery.preview_started =
+            Some(preview(&preview_args(delivery.output_report(), false)) == 0);
+    }
+    delivery
+}
+
+fn region_save_failure_message(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind;
+    if vellum_core::io::committed_save_path(error).is_some() {
+        return "图片已写入，但持久化尚未确认；请保留恢复图片或当前窗口。";
+    }
+    match error.kind() {
+        ErrorKind::PermissionDenied => "保存图片失败：没有写入权限，请检查截图保存目录的权限。",
+        ErrorKind::StorageFull => "保存图片失败：存储空间已满，请清理空间后重试。",
+        ErrorKind::ReadOnlyFilesystem => "保存图片失败：保存位置只读，请更换截图保存目录。",
+        ErrorKind::NotFound | ErrorKind::NotADirectory => {
+            "保存图片失败：保存目录不可用，请检查截图保存目录。"
+        }
+        _ => "保存图片失败：无法写入图片，请检查保存目录和可用空间后重试。",
+    }
+}
+
+fn region_copy_failure_message(error: &vellum_core::io::ClipboardError) -> &'static str {
+    match error {
+        vellum_core::io::ClipboardError::NotFound(_) => {
+            "复制到剪贴板失败：未找到 wl-copy，请安装 wl-clipboard 后重试。"
+        }
+        vellum_core::io::ClipboardError::Failed(_) => {
+            "复制到剪贴板失败：剪贴板操作未完成，请检查桌面会话后重试。"
+        }
+        vellum_core::io::ClipboardError::Timeout => "复制到剪贴板失败：操作超时，可重试。",
+        vellum_core::io::ClipboardError::TooLarge => "复制到剪贴板失败：图片超过安全大小限制。",
+        vellum_core::io::ClipboardError::NoImage => "复制到剪贴板失败：未取得图片。",
+        vellum_core::io::ClipboardError::UnsupportedFormat => {
+            "复制到剪贴板失败：图片格式不受支持。"
+        }
+        vellum_core::io::ClipboardError::InvalidImage(_) => {
+            "复制到剪贴板失败：图片无效或无法解码。"
         }
     }
-    code
+}
+
+/// Save and copy independently, retaining an image preview if neither was
+/// requested or any requested export failed. A preview handoff releases the
+/// overlay promptly without discarding the user's crop.
+fn keep_image(image: Rgb8, flags: OutputFlags, prefix: &str, long_shot: bool) -> i32 {
+    keep_document_image(image, flags, prefix, long_shot, None, false)
+}
+fn keep_document_image(
+    image: Rgb8,
+    flags: OutputFlags,
+    prefix: &str,
+    long_shot: bool,
+    document: Option<document::Document>,
+    force_preview: bool,
+) -> i32 {
+    let handoff = Cell::new(HandoffOutcome::Ready);
+    let delivery = deliver_region_policy_with(
+        flags,
+        force_preview || vellum_core::prefs::load().always_preview,
+        || {
+            vellum_core::io::save_image(&image, prefix)
+                .map(|path| println!("saved: {}", path.display()))
+                .map_err(|error| region_save_failure_message(&error))
+        },
+        || {
+            vellum_core::io::copy_image(&image)
+                .map(|()| {
+                    if long_shot {
+                        println!("long-shot done: {}x{} copied", image.width, image.height);
+                    } else {
+                        println!("copied: {}x{} to clipboard", image.width, image.height);
+                    }
+                })
+                .map_err(|error| region_copy_failure_message(&error))
+        },
+        |args| {
+            let outcome = encode_document_handoff(&image, document.as_ref(), args, "preview ready");
+            handoff.set(outcome);
+            outcome.exit_code()
+        },
+    );
+    if let Some(message) = delivery.failure_message() {
+        eprintln!("[vellum] {message}");
+        vellum_core::io::notify("Vellum 截图输出未完成", &message, "normal");
+    }
+    recover_in_memory_if_needed(
+        image,
+        handoff.get(),
+        delivery.output_report(),
+        false,
+        move |image, incomplete, output| {
+            let document = document.map(|doc| Rc::new(RefCell::new(doc)));
+            preview::run_memory_document(image, document, incomplete, output)
+        },
+    );
+    if delivery.exit_code() == 0 {
+        0
+    } else {
+        EXIT_OUTPUT_FAILED
+    }
 }
 
 /// Hands the crop to a detached sibling process through a temp PNG.
 ///
-/// The overlay process must exit promptly so the control service stops
-/// reporting "busy"; the pin window and the text pipeline outlive it. The child
-/// deletes the temp file itself via `--cleanup`.
-fn spawn_detached(cropped: Option<Rgb8>, args: &[&str], message: &str) -> i32 {
+/// The pin window and text pipeline outlive the overlay. A bounded wait for
+/// the mapped-window receipt replaces the unsafe spawn-and-delete contract.
+fn spawn_detached(
+    cropped: Option<Rgb8>,
+    args: &[&str],
+    message: &str,
+    document: Option<document::Document>,
+) -> i32 {
     let Some(image) = cropped else {
         return EXIT_CANCELLED;
     };
-    let png = match image.to_png() {
-        Ok(png) => png,
-        Err(err) => {
-            eprintln!("[vellum] encode failed: {err}");
-            return 1;
+    let outcome = encode_document_handoff(&image, document.as_ref(), args, message);
+    recover_in_memory_if_needed(
+        image,
+        outcome,
+        preview::OutputReport::default(),
+        false,
+        move |image, incomplete, output| {
+            let document = document.map(|doc| Rc::new(RefCell::new(doc)));
+            preview::run_memory_document(image, document, incomplete, output)
+        },
+    );
+    outcome.exit_code()
+}
+
+/// Borrow the original pixels; opening a second viewer need not clone RGB first.
+pub(crate) fn spawn_detached_image(image: &Rgb8, args: &[&str], message: &str) -> i32 {
+    // Worker callers already retain the original in their owning window. Never
+    // run GTK here; the capture-only caller handles its own memory fallback.
+    encode_and_handoff(image, args, message).exit_code()
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffOutcome {
+    Ready,
+    Retained,
+    Unavailable,
+}
+impl HandoffOutcome {
+    fn exit_code(self) -> i32 {
+        if self == Self::Ready {
+            0
+        } else {
+            EXIT_OUTPUT_FAILED
+        }
+    }
+}
+fn encode_and_handoff(image: &Rgb8, args: &[&str], message: &str) -> HandoffOutcome {
+    match image.to_png() {
+        Ok(png) => spawn_encoded(&png, args, message),
+        Err(_) => HandoffOutcome::Unavailable,
+    }
+}
+fn recover_in_memory_if_needed(
+    image: Rgb8,
+    outcome: HandoffOutcome,
+    report: preview::OutputReport,
+    incomplete: bool,
+    open: impl FnOnce(Rgb8, bool, preview::OutputReport) -> i32,
+) {
+    if outcome == HandoffOutcome::Unavailable {
+        // Only this exceptional path keeps the capture process busy. Move the
+        // RGB buffer instead of duplicating a potentially very tall image.
+        let _ = open(image, incomplete, report);
+    }
+}
+
+fn report_retained(asset: &handoff::Asset) {
+    let message = format!(
+        "图片尚未被结果窗口确认，已私有保留。运行 vellum recover open {} 可重试；vellum recover list 可列出恢复图片。",
+        asset.id()
+    );
+    eprintln!("[vellum] {message}");
+    vellum_core::io::notify("Vellum 图片已保留", &message, "normal");
+}
+
+fn spawn_encoded(png: &[u8], args: &[&str], message: &str) -> HandoffOutcome {
+    spawn_encoded_session(png, args, message, None)
+}
+fn encode_document_handoff(
+    image: &Rgb8,
+    document: Option<&document::Document>,
+    args: &[&str],
+    message: &str,
+) -> HandoffOutcome {
+    let Some(document) = document else {
+        return encode_and_handoff(image, args, message);
+    };
+    // Persistence and share channels receive only the rendered image, never the
+    // original pixels contained in this optional anonymous editing stream.
+    let session = document
+        .encode_session()
+        .ok()
+        .and_then(|bytes| session_transfer::prepare(&bytes).ok());
+    let mut args = args.to_vec();
+    if session.is_none() {
+        args.push("--edit-session-unavailable");
+        eprintln!("[vellum] 编辑草稿未能传递；成品图片仍可保留和重新标注");
+    }
+    let outcome = match image.to_png() {
+        Ok(png) => spawn_encoded_session(&png, &args, message, session),
+        Err(_) => HandoffOutcome::Unavailable,
+    };
+    if outcome == HandoffOutcome::Retained {
+        vellum_core::io::notify(
+            "Vellum 编辑会话未确认",
+            "恢复文件只保留遮挡后的成品，不含可编辑原图或对象。若结果窗口稍后出现，请保持窗口打开以继续编辑。",
+            "normal",
+        );
+    }
+    outcome
+}
+fn spawn_encoded_session(
+    png: &[u8],
+    args: &[&str],
+    message: &str,
+    session: Option<std::fs::File>,
+) -> HandoffOutcome {
+    let asset = match handoff::Asset::create(png) {
+        Ok(asset) => asset,
+        Err(error) => {
+            eprintln!("[vellum] 无法建立恢复副本: {:?}", error.kind());
+            vellum_core::io::notify(
+                "Vellum 图片交接失败",
+                "无法写入私有恢复目录；请检查可用空间及目录权限",
+                "critical",
+            );
+            return HandoffOutcome::Unavailable;
         }
     };
-
-    let path = std::env::temp_dir().join(format!("vellum-{}.png", vellum_core::io::timestamp()));
-    let write = std::fs::File::create(&path).and_then(|mut file| file.write_all(&png));
-    if let Err(err) = write {
-        eprintln!("[vellum] handover failed: {err}");
-        let _ = std::fs::remove_file(&path);
-        return 1;
+    if asset.write_context(args).is_err() {
+        report_retained(&asset);
+        return HandoffOutcome::Retained;
     }
-
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
-        Err(err) => {
-            eprintln!("[vellum] cannot locate self: {err}");
-            let _ = std::fs::remove_file(&path);
-            return 1;
+        Err(_) => {
+            report_retained(&asset);
+            return HandoffOutcome::Retained;
         }
     };
-
-    let spawned = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .args(args)
-        .arg(&path)
+        .arg(asset.image_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn();
-
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    if let Some(session) = session {
+        command
+            .arg(session_transfer::FLAG)
+            .stdin(Stdio::from(session));
+    }
+    asset.configure_child(&mut command);
+    let spawned = command.spawn();
+    drop(command); // Close the parent memfd immediately after passing stdin.
     match spawned {
-        Ok(_) => {
-            println!("{message}");
-            0
+        Ok(mut child) => {
+            let ready = asset
+                .wait_ready(&mut child, handoff::READY_TIMEOUT)
+                .unwrap_or(false);
+            vellum_core::proc::reap_in_background(child);
+            if ready {
+                // Only the parent accepts this receipt. A late receipt after
+                // timeout cannot trigger any cleanup in the child.
+                if !args.contains(&"--retain-recovery") && asset.remove_confirmed().is_err() {
+                    eprintln!("[vellum] 已确认窗口；恢复副本未清理，可用 vellum recover list 查看");
+                }
+                println!("{message}");
+                HandoffOutcome::Ready
+            } else {
+                if let Ok(Some(reason)) = asset.rejection_reason() {
+                    eprintln!("[vellum] image handoff rejected: {reason}");
+                }
+                report_retained(&asset);
+                HandoffOutcome::Retained
+            }
         }
-        Err(err) => {
-            eprintln!("[vellum] spawn failed: {err}");
-            let _ = std::fs::remove_file(&path);
-            1
+        Err(_) => {
+            report_retained(&asset);
+            HandoffOutcome::Retained
         }
     }
+}
+
+/// Encode once for automatic export and independent preview. Export failures
+/// must not prevent the user from inspecting and retrying the completed image.
+fn deliver_longshot(image: Rgb8, flags: OutputFlags, incomplete: bool) -> i32 {
+    use preview::{ExportState, OutputReport};
+    let png = match image.to_png() {
+        Ok(png) => png,
+        Err(_) => {
+            vellum_core::io::notify(
+                "Vellum 长图输出未完成",
+                "采集已完成，但图片编码失败",
+                "normal",
+            );
+            recover_in_memory_if_needed(
+                image,
+                HandoffOutcome::Unavailable,
+                OutputReport::default(),
+                incomplete,
+                preview::run_memory_recovery,
+            );
+            return EXIT_OUTPUT_FAILED;
+        }
+    };
+    let mut report = OutputReport::default();
+    if flags.save {
+        let saved = vellum_core::io::save_default_bytes("vellum-long", &png);
+        report.save = match saved {
+            Ok(path) => {
+                println!("saved: {}", path.display());
+                ExportState::Done
+            }
+            Err(error) => {
+                eprintln!("[vellum] {}", region_save_failure_message(&error));
+                if vellum_core::io::committed_save_path(&error).is_some() {
+                    ExportState::Uncertain
+                } else {
+                    ExportState::Failed
+                }
+            }
+        };
+    }
+    if flags.copy {
+        report.copy = match vellum_core::io::copy_png(&png) {
+            Ok(()) => {
+                println!("long-shot done: {}x{} copied", image.width, image.height);
+                ExportState::Done
+            }
+            Err(error) => {
+                eprintln!("[vellum] {}", region_copy_failure_message(&error));
+                ExportState::Failed
+            }
+        };
+    }
+    let args = preview_args(report, incomplete);
+    let outcome = spawn_encoded(&png, &args, "preview ready");
+    drop(png);
+    let failed = longshot_output_failed(report, outcome == HandoffOutcome::Ready);
+    recover_in_memory_if_needed(
+        image,
+        outcome,
+        report,
+        incomplete,
+        preview::run_memory_recovery,
+    );
+    if failed {
+        vellum_core::io::notify(
+            "Vellum 长图输出未全部完成",
+            "采集已完成；保存、复制和预览状态分别显示，可在预览中重试。窗口未确认时用 vellum recover list 查找保留图片。",
+            "normal",
+        );
+    }
+    if failed { EXIT_OUTPUT_FAILED } else { 0 }
+}
+
+fn preview_args(report: preview::OutputReport, incomplete: bool) -> Vec<&'static str> {
+    let mut args = vec![
+        "preview-file",
+        "--cleanup",
+        "--save-status",
+        report.save.argument(),
+        "--copy-status",
+        report.copy.argument(),
+    ];
+    if incomplete {
+        args.push("--incomplete");
+    }
+    if report.save == preview::ExportState::Uncertain {
+        args.push("--retain-recovery");
+    }
+    args
+}
+fn longshot_output_failed(report: preview::OutputReport, preview_ready: bool) -> bool {
+    use preview::ExportState::{Failed, Uncertain};
+    !preview_ready
+        || matches!(report.save, Failed | Uncertain)
+        || matches!(report.copy, Failed | Uncertain)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_preview_keeps_successful_exports_and_opens_the_result() {
+        let previews = Cell::new(0);
+        let delivery = deliver_region_policy_with(
+            OutputFlags {
+                save: true,
+                copy: true,
+            },
+            true,
+            || Ok(()),
+            || Ok(()),
+            |_| {
+                previews.set(previews.get() + 1);
+                0
+            },
+        );
+        assert_eq!(previews.get(), 1);
+        assert_eq!(delivery.save, Some(Ok(())));
+        assert_eq!(delivery.copy, Some(Ok(())));
+        assert_eq!(delivery.exit_code(), 0);
+    }
+    #[test]
+    fn region_delivery_covers_all_flags_and_independent_failures() {
+        // 32 deterministic cases: all four flag combinations, each export's
+        // independent outcome, and success/failure of the recovery launch.
+        for save in [false, true] {
+            for copy in [false, true] {
+                for save_ok in [false, true] {
+                    for copy_ok in [false, true] {
+                        for preview_ok in [false, true] {
+                            let calls = RefCell::new(Vec::new());
+                            let save_result = if save_ok { Ok(()) } else { Err("save failed") };
+                            let copy_result = if copy_ok { Ok(()) } else { Err("copy failed") };
+                            let delivery = deliver_region_with(
+                                OutputFlags { save, copy },
+                                || {
+                                    calls.borrow_mut().push("save");
+                                    save_result
+                                },
+                                || {
+                                    calls.borrow_mut().push("copy");
+                                    copy_result
+                                },
+                                |args| {
+                                    calls.borrow_mut().push("preview");
+                                    assert_eq!(&args[..2], ["preview-file", "--cleanup"]);
+                                    assert!(!args.contains(&"--incomplete"));
+                                    if preview_ok { 0 } else { 17 }
+                                },
+                            );
+                            let failed = (save && !save_ok) || (copy && !copy_ok);
+                            let needs_preview = (!save && !copy) || failed;
+                            let mut expected_calls = Vec::new();
+                            if save {
+                                expected_calls.push("save");
+                            }
+                            if copy {
+                                expected_calls.push("copy");
+                            }
+                            if needs_preview {
+                                expected_calls.push("preview");
+                            }
+                            assert_eq!(*calls.borrow(), expected_calls);
+                            assert_eq!(delivery.save, save.then_some(save_result));
+                            assert_eq!(delivery.copy, copy.then_some(copy_result));
+                            assert_eq!(delivery.needs_preview(), needs_preview);
+                            assert_eq!(
+                                delivery.preview_started,
+                                needs_preview.then_some(preview_ok)
+                            );
+                            let expected_code = i32::from(failed || (needs_preview && !preview_ok));
+                            assert_eq!(delivery.exit_code(), expected_code, "{delivery:?}");
+                            assert_eq!(delivery.failure_message().is_some(), expected_code != 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn region_delivery_failure_feedback_preserves_successful_outputs() {
+        let save_error = region_save_failure_message(&std::io::ErrorKind::PermissionDenied.into());
+        let copy_error = region_copy_failure_message(&vellum_core::io::ClipboardError::Failed(
+            "synthetic failure".into(),
+        ));
+        for (save_ok, copy_ok) in [(false, true), (true, false), (false, false)] {
+            for preview_ok in [false, true] {
+                let delivery = deliver_region_with(
+                    OutputFlags {
+                        save: true,
+                        copy: true,
+                    },
+                    || if save_ok { Ok(()) } else { Err(save_error) },
+                    || if copy_ok { Ok(()) } else { Err(copy_error) },
+                    |_| if preview_ok { 0 } else { 1 },
+                );
+                assert_eq!(
+                    delivery.exit_code(),
+                    1,
+                    "recovery must not mask export failure"
+                );
+                let message = delivery.failure_message().unwrap();
+                assert_eq!(message.contains(save_error), !save_ok);
+                assert_eq!(message.contains(copy_error), !copy_ok);
+                assert_eq!(message.contains("图片已保存。"), save_ok);
+                assert_eq!(message.contains("图片已复制到剪贴板。"), copy_ok);
+                assert_eq!(message.contains("图片预览已就绪"), preview_ok);
+                assert_eq!(message.contains("图片预览未确认就绪"), !preview_ok);
+                assert_eq!(
+                    message.contains("保持内存预览打开"),
+                    !save_ok && !copy_ok && !preview_ok
+                );
+                assert!(!message.contains("不完整"));
+            }
+        }
+    }
+
+    #[test]
+    fn region_delivery_failed_preview_without_exports_is_not_success() {
+        let delivery = deliver_region_with(
+            OutputFlags {
+                save: false,
+                copy: false,
+            },
+            || panic!("save was not requested"),
+            || panic!("copy was not requested"),
+            |args| {
+                assert_eq!(&args[..2], ["preview-file", "--cleanup"]);
+                assert!(!args.contains(&"--incomplete"));
+                1
+            },
+        );
+        assert_eq!(delivery.exit_code(), 1);
+        assert_eq!(
+            delivery.failure_message().as_deref(),
+            Some(
+                "未启用自动保存或复制。图片预览未确认就绪。请用 vellum recover list 查找恢复图片；无法落盘时请保持内存预览打开。"
+            )
+        );
+    }
+
+    #[test]
+    fn region_delivery_feedback_redacts_untrusted_error_details() {
+        use std::io::ErrorKind;
+        let detail = "/private/example.png https://private.invalid/?token=synthetic";
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::StorageFull,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::NotFound,
+            ErrorKind::NotADirectory,
+            ErrorKind::Other,
+        ] {
+            let error = std::io::Error::new(kind, detail);
+            let message = region_save_failure_message(&error);
+            assert!(message.starts_with("保存图片失败："));
+            assert!(!message.contains("private"));
+            assert!(!message.contains("synthetic"));
+        }
+        for error in [
+            vellum_core::io::ClipboardError::NotFound(detail.into()),
+            vellum_core::io::ClipboardError::Failed(detail.into()),
+        ] {
+            let message = region_copy_failure_message(&error);
+            assert!(message.starts_with("复制到剪贴板失败："));
+            assert!(!message.contains("private"));
+            assert!(!message.contains("synthetic"));
+        }
+        assert!(region_save_failure_message(&ErrorKind::PermissionDenied.into()).contains("权限"));
+        assert!(region_save_failure_message(&ErrorKind::StorageFull.into()).contains("空间已满"));
+        assert!(
+            region_copy_failure_message(&vellum_core::io::ClipboardError::NotFound(detail.into()))
+                .contains("wl-clipboard")
+        );
+    }
+
+    #[test]
+    fn cleanup_flag_never_deletes_user_files_on_decode_success_or_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("user.png");
+        let png = Rgb8::new(2, 2).to_png().unwrap();
+        std::fs::write(&valid, &png).unwrap();
+        assert!(load_image(&valid, true).is_ok());
+        assert_eq!(std::fs::read(&valid).unwrap(), png);
+        let invalid = directory.path().join("damaged.png");
+        std::fs::write(&invalid, b"damaged").unwrap();
+        assert!(load_image(&invalid, true).is_err());
+        assert_eq!(std::fs::read(invalid).unwrap(), b"damaged");
+    }
+
+    #[test]
+    fn longshot_output_status_is_independent_of_incomplete_capture() {
+        use preview::{ExportState, OutputReport};
+        for save in [
+            ExportState::NotRequested,
+            ExportState::Done,
+            ExportState::Failed,
+            ExportState::Uncertain,
+        ] {
+            for copy in [
+                ExportState::NotRequested,
+                ExportState::Done,
+                ExportState::Failed,
+            ] {
+                let report = OutputReport { save, copy };
+                for incomplete in [false, true] {
+                    let args = preview_args(report, incomplete);
+                    assert_eq!(args.contains(&"--incomplete"), incomplete);
+                    assert_eq!(
+                        args.contains(&"--retain-recovery"),
+                        save == ExportState::Uncertain
+                    );
+                    let owned: Vec<_> = args.into_iter().map(str::to_string).collect();
+                    assert_eq!(OutputReport::from_args(&owned), report);
+                }
+                assert!(longshot_output_failed(report, false));
+                assert_eq!(
+                    longshot_output_failed(report, true),
+                    matches!(save, ExportState::Failed | ExportState::Uncertain)
+                        || copy == ExportState::Failed
+                );
+            }
+        }
+        assert_eq!(EXIT_OUTPUT_FAILED, 3);
+    }
+
+    #[test]
+    fn unavailable_storage_moves_image_into_memory_recovery_only() {
+        for outcome in [
+            HandoffOutcome::Ready,
+            HandoffOutcome::Retained,
+            HandoffOutcome::Unavailable,
+        ] {
+            let called = Cell::new(false);
+            let image = Rgb8::new(3, 4);
+            let pointer = image.data.as_ptr();
+            recover_in_memory_if_needed(
+                image,
+                outcome,
+                preview::OutputReport::default(),
+                true,
+                |image, incomplete, _| {
+                    assert_eq!(
+                        image.data.as_ptr(),
+                        pointer,
+                        "fallback must move, not duplicate RGB"
+                    );
+                    assert_eq!((image.width, image.height), (3, 4));
+                    assert!(incomplete);
+                    called.set(true);
+                    0
+                },
+            );
+            assert_eq!(called.get(), outcome == HandoffOutcome::Unavailable);
+        }
+    }
+
+    #[test]
+    fn file_argument_skips_output_status_values() {
+        let args = [
+            "--save-status",
+            "failed",
+            "--copy-status",
+            "done",
+            "--mode",
+            "translate",
+            session_transfer::FLAG,
+            "/tmp/example.png",
+            "--cleanup",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            file_args(&args).unwrap(),
+            (PathBuf::from("/tmp/example.png"), true)
+        );
+    }
 
     #[test]
     fn finish_poll_releases_recorder_borrow_before_synchronous_done_callback() {

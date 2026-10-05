@@ -9,6 +9,7 @@ pub mod compositor;
 pub mod config;
 pub mod geom;
 pub mod image;
+pub mod image_limits;
 pub mod io;
 pub mod longshot_trace;
 pub mod paths;

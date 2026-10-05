@@ -28,6 +28,11 @@ for bin in vellum vellumctl vellum-ui vellum-tray; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$VELLUM_TEST_SRC/target/release/$bin"
     chmod 0755 "$VELLUM_TEST_SRC/target/release/$bin"
 done
+cat > "$VELLUM_TEST_SRC/target/release/vellum" <<'LAUNCHER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${VELLUM_TEST_COMMANDS:?}"
+exit 0
+LAUNCHER
 CARGO
 
 cat > "$TMP/bin/systemctl" <<'SYSTEMCTL'
@@ -45,7 +50,7 @@ XDG_CONFIG_HOME="$TMP/home/.config" \
 XDG_DATA_HOME="$TMP/home/.local/share" \
 VELLUM_BIN_DIR="$TMP/home/.local/bin" \
 VELLUM_SKIP_PACKAGES=1 \
-VELLUM_SKIP_SHORTCUTS=1 \
+VELLUM_TEST_COMMANDS="$TMP/commands" \
 VELLUM_TEST_SRC="$SRC" \
     bash "$SRC/install.sh" > "$TMP/stdout" 2> "$TMP/stderr"
 status=$?
@@ -71,6 +76,15 @@ if [[ -e "$SRC/target" ]]; then
 fi
 if ! grep -q '安装完成' "$TMP/stdout"; then
     echo 'installer never reached its completion message' >&2
+    exit 1
+fi
+
+[[ -f "$TMP/home/.config/systemd/user/vellum-shortcuts.service" ]]
+[[ -f "$TMP/home/.local/share/dbus-1/services/ai.vellum.Shortcuts.service" ]]
+[[ -f "$TMP/home/.config/autostart/ai.vellum-shortcuts.desktop" ]]
+
+if grep -q 'shortcuts install' "$TMP/commands"; then
+    echo 'default installation must not write compositor bindings' >&2
     exit 1
 fi
 

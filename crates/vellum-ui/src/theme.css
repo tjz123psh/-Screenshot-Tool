@@ -1,0 +1,200 @@
+/* Smoked glass settings. Only the settings window is translucent. Image,
+   recorder, and text-result surfaces remain opaque; no desktop pixels are read. */
+@define-color vellum_paper #1f1f1e;
+@define-color vellum_surface #30302e;
+@define-color vellum_sidebar #20201f;
+@define-color vellum_ink #ded9cf;
+@define-color vellum_muted #b7b2a8;
+@define-color vellum_line #47443e;
+@define-color vellum_accent #b9a37d;
+@define-color vellum_accent_hover #c6b28d;
+@define-color vellum_dark #1c1c1b;
+@define-color vellum_raised #2b2b29;
+@define-color vellum_light_ink #e4dfd5;
+@define-color vellum_success #a4b196;
+@define-color vellum_warning #d1b888;
+@define-color vellum_error #da988c;
+
+.vellum-window, .vellum-card {
+  background-color: @vellum_dark; background-image: none; color: @vellum_light_ink;
+  font-family: sans-serif; font-size: 13px;
+}
+.vellum-window.vellum-glass {
+  background-color: rgba(24,24,23,0.88);
+  /* Static sub-percent grain prevents visible 8-bit gradient bands. */
+  background-image: url("data:image/png;base64,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"), linear-gradient(135deg,rgba(240,235,220,0.065),rgba(255,255,255,0.012) 42%,rgba(0,0,0,0.13));
+  background-repeat: repeat, no-repeat;
+  background-size: 64px 64px, auto;
+  color: @vellum_ink; border: 1px solid rgba(201,192,170,0.40);
+  border-bottom-color: rgba(140,125,96,0.58); border-radius: 11px;
+  box-shadow: inset 0 1px rgba(250,244,225,0.15), inset 0 -1px rgba(8,8,8,0.66);
+}
+/* Only a supported compositor request enables the clearer glass treatment.
+   Text remains contrast-safe even over a white wallpaper; unsupported systems
+   keep the denser 0.88-alpha fallback above. */
+.vellum-window.vellum-glass.vellum-compositor-blur { background-color: rgba(18,19,20,0.78); }
+.vellum-compositor-blur .vellum-caption, .vellum-compositor-blur .vellum-row-sub,
+.vellum-compositor-blur .vellum-section-hint, .vellum-compositor-blur .vellum-dim,
+.vellum-compositor-blur .vellum-status, .vellum-compositor-blur .vellum-status-line,
+.vellum-compositor-blur .vellum-general-label, .vellum-compositor-blur button.vellum-nav-item { color: #d4cec2; }
+.vellum-compositor-blur .vellum-error { color: #e9b1a7; }
+.vellum-compositor-blur .vellum-warning { color: #ead1a3; }
+.vellum-compositor-blur .vellum-success { color: #bccca6; }
+
+.vellum-glass .vellum-panel-shell {
+  margin: 4px; border: 1px solid rgba(235,231,213,0.12);
+  border-bottom-color: rgba(218,195,143,0.20); border-radius: 7px;
+  box-shadow: inset 0 1px rgba(255,249,230,0.045), inset 1px 0 rgba(255,249,230,0.035);
+}
+.vellum-window.vellum-glass { font-size: 13px; }
+.vellum-window.vellum-glass button, .vellum-window.vellum-glass entry, .vellum-window.vellum-glass spinbutton,
+.vellum-window.vellum-glass button.vellum-nav-item, .vellum-window.vellum-glass .vellum-mode-grid label { font-size: 13px; }
+.vellum-glass .vellum-caption, .vellum-glass .vellum-section-hint, .vellum-glass .vellum-row-sub { font-size: 12px; }
+.vellum-glass .vellum-general-row { min-height: 32px; }
+
+.vellum-transparent, .vellum-highlight-window, .vellum-highlight-edge {
+  background: transparent; border: none; box-shadow: none;
+}
+.vellum-card { border: 1px solid rgba(255,255,255,0.11); border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.28); }
+.vellum-card.vellum-micro { border-radius: 9px; box-shadow: none; }
+.vellum-micro-rail { min-width: 0; min-height: 0; }
+.vellum-micro button { padding: 3px 8px; min-height: 22px; border-radius: 5px; }
+
+button, entry, spinbutton, switch, checkbutton, menubutton {
+  transition: background-color 130ms ease-out, border-color 130ms ease-out, color 130ms ease-out, box-shadow 130ms ease-out;
+}
+.vellum-window button, .vellum-card button {
+  min-height: 20px; padding: 4px 9px; border-radius: 6px;
+  background-color: #30302e;
+  background-image: linear-gradient(165deg,rgba(255,252,241,0.21),rgba(255,255,255,0.025) 47%,rgba(0,0,0,0.26));
+  border: 1px solid rgba(220,211,187,0.16); border-bottom-color: rgba(0,0,0,0.70);
+  box-shadow: inset 0 1px rgba(255,249,225,0.20), inset 1px 0 rgba(255,249,225,0.045), 0 2px 3px rgba(0,0,0,0.38);
+  color: @vellum_light_ink; font-size: 12px; font-weight: 400;
+}
+.vellum-window button:hover, .vellum-card button:hover { background-color: #393834; border-color: rgba(226,210,173,0.32); }
+.vellum-window button:active, .vellum-card button:active { background-color: #242421; background-image: none; box-shadow: inset 0 1px 3px rgba(0,0,0,0.52); }
+.vellum-window button.vellum-primary, .vellum-window button.suggested-action, .vellum-card button.suggested-action {
+  background-color: #594f3d;
+  background-image: linear-gradient(180deg,rgba(246,225,181,0.12),rgba(196,170,119,0.05) 45%,rgba(55,41,18,0.18));
+  color: #eee6d5; border-color: rgba(236,219,181,0.35); border-bottom-color: #4e4331;
+  box-shadow: inset 0 1px rgba(255,242,210,0.42), 0 1px 3px rgba(0,0,0,0.35); font-weight: 600;
+}
+.vellum-window button.vellum-primary:hover, .vellum-window button.suggested-action:hover, .vellum-card button.suggested-action:hover { background-color: #665a43; }
+.vellum-window button.vellum-quiet, .vellum-card button.vellum-quiet { background: transparent; border-color: transparent; box-shadow: none; }
+.vellum-window button.vellum-quiet:hover, .vellum-card button.vellum-quiet:hover { background: rgba(238,229,208,0.075); }
+.vellum-window button.vellum-icon-button { min-width: 18px; }
+.vellum-window button:disabled, .vellum-card button:disabled, .vellum-window entry:disabled, .vellum-window spinbutton:disabled { opacity: 0.42; }
+
+.vellum-titlebar { background-color: @vellum_raised; border-bottom: 1px solid rgba(255,255,255,0.07); }
+.vellum-glass .vellum-titlebar {
+  background-color: rgba(59,59,56,0.44);
+  background-image: linear-gradient(180deg,rgba(255,255,247,0.10),rgba(0,0,0,0.06));
+  border-bottom: 1px solid rgba(231,225,205,0.10); box-shadow: 0 1px rgba(0,0,0,0.55);
+}
+.vellum-titlebar-inner { background: transparent; }
+.vellum-title { font-size: 13px; font-weight: 500; letter-spacing: 0.3px; color: #e5dcc6; text-shadow: 0 1px 2px rgba(0,0,0,0.7); }
+.vellum-titlebar-inner button { min-width: 17px; min-height: 18px; padding: 2px 6px; }
+.vellum-sidebar { background: linear-gradient(100deg,rgba(255,255,255,0.025),rgba(0,0,0,0.17)); padding: 7px 5px; border-right: 1px solid rgba(239,235,220,0.11); border-radius: 0; box-shadow: 1px 0 rgba(0,0,0,0.28); }
+.vellum-glass button.vellum-nav-item {
+  padding: 5px 8px; min-height: 24px; border: 1px solid transparent; border-radius: 5px;
+  background: transparent; box-shadow: none; color: #c4c0b7; font-size: 12px; font-weight: 400;
+}
+.vellum-glass button.vellum-nav-item:hover { background-color: rgba(255,255,255,0.035); color: #eee8dc; }
+.vellum-glass button.vellum-nav-item:checked {
+  background-color: rgba(15,15,14,0.40);
+  background-image: linear-gradient(180deg,rgba(252,244,216,0.018),rgba(0,0,0,0.10));
+  border-color: rgba(220,213,187,0.14); box-shadow: inset 0 1px 2px rgba(0,0,0,0.36);
+  color: #e7dfcd; font-weight: 500;
+}
+.vellum-nav-section { color: @vellum_muted; font-size: 11px; }
+.vellum-content-column, .vellum-page, .vellum-page-content, .vellum-rows { background: transparent; }
+.vellum-section-card { background: transparent; border: none; border-radius: 0; box-shadow: none; }
+.vellum-section-title { color: #e0dbce; font-size: 13px; font-weight: 500; }
+.vellum-section-hint, .vellum-row-sub, .vellum-caption { color: @vellum_muted; font-size: 11px; }
+.vellum-row-title { color: @vellum_ink; font-size: 12px; font-weight: 400; }
+.vellum-row, .vellum-row-stacked { padding: 4px 0; }
+.vellum-row-separator, .vellum-divider { min-height: 1px; background-color: rgba(211,205,184,0.07); }
+.vellum-footer { background: transparent; padding: 4px 2px; }
+.vellum-status-line, .vellum-status { font-size: 11px; color: @vellum_muted; }
+.vellum-dim { color: #aaa69c; font-size: 11px; }
+
+.vellum-window entry, .vellum-window spinbutton, .vellum-inset {
+  min-height: 22px; padding: 2px 7px; border-radius: 4px;
+  background-color: rgba(14,14,13,0.48); background-image: linear-gradient(180deg,rgba(0,0,0,0.12),transparent);
+  border: 1px solid rgba(230,218,187,0.13); border-top-color: rgba(0,0,0,0.5);
+  color: #e4ddd0; box-shadow: inset 0 1px 2px rgba(0,0,0,0.42), 0 1px rgba(242,231,203,0.035);
+}
+.vellum-window entry > text, .vellum-window spinbutton > text { background: transparent; color: inherit; }
+.vellum-window entry placeholder, .vellum-window spinbutton placeholder { color: #99968e; }
+.vellum-window entry:focus-within, .vellum-window spinbutton:focus-within, .vellum-inset:focus-within { border-color: #9a8865; box-shadow: inset 0 1px 2px rgba(0,0,0,0.35), 0 0 0 1px rgba(186,161,111,0.16); }
+.vellum-secret-entry { padding: 0; }
+.vellum-window button.vellum-input-action { min-width: 18px; padding: 3px 6px; background: transparent; border-color: transparent; box-shadow: none; color: #c2bba9; }
+.vellum-window button.vellum-input-action:hover { background: rgba(219,204,169,0.08); }
+.vellum-stepper { background: rgba(14,14,13,0.60); border: 1px solid rgba(231,221,193,0.13); border-radius: 5px; padding-right: 8px; box-shadow: inset 0 1px 2px rgba(0,0,0,0.35); }
+.vellum-stepper spinbutton { border: none; background: transparent; box-shadow: none; }
+.vellum-stepper spinbutton > button { min-width: 16px; padding: 2px 4px; border: none; background: transparent; box-shadow: none; }
+.vellum-unit { color: @vellum_muted; font-size: 11px; }
+
+.vellum-segmented { background: rgba(9,9,9,0.24); border: 1px solid rgba(222,212,184,0.09); border-radius: 6px; padding: 2px; }
+checkbutton.vellum-segment { padding: 4px 8px; border-radius: 4px; color: #bdb7ab; }
+checkbutton.vellum-segment:checked { background-image: linear-gradient(180deg,#48453d,#302e28); color: #e9dfc8; box-shadow: inset 0 1px rgba(255,246,215,0.08), 0 1px 2px rgba(0,0,0,0.36); }
+.vellum-glass checkbutton check, .vellum-glass checkbutton radio { min-width: 12px; min-height: 12px; padding: 0; -gtk-icon-size: 12px; border-radius: 3px; }
+.vellum-window checkbutton:checked radio, .vellum-window checkbutton:checked check { background-color: #b5a17a; border-color: #c9b891; color: #27241d; }
+.vellum-window switch { min-width: 35px; min-height: 18px; border: 1px solid rgba(218,210,188,0.12); border-radius: 14px; background: #3e3e39; box-shadow: inset 0 1px 2px rgba(0,0,0,0.32); }
+.vellum-window switch:checked { background-image: linear-gradient(180deg,#b7a583,#928164); }
+.vellum-window switch slider { min-width: 14px; min-height: 14px; margin: 2px; border-radius: 50%; background-image: linear-gradient(180deg,#eee9dd,#bbb8ae); border: 1px solid rgba(0,0,0,0.22); box-shadow: 0 1px 2px rgba(0,0,0,0.44); }
+
+.vellum-pill { padding: 4px 8px; border-radius: 6px; background: rgba(15,15,14,0.32); border: 1px solid rgba(215,204,171,0.08); }
+.vellum-pill-text { color: #c3bcad; font-size: 10px; font-weight: 400; }
+.vellum-dot { min-width: 5px; min-height: 5px; border-radius: 50%; background: #858078; }
+.vellum-dot-ready, .vellum-dot-ok, .vellum-pill.vellum-success .vellum-dot { background: @vellum_success; }
+.vellum-dot-missing, .vellum-pill.vellum-error .vellum-dot { background: @vellum_warning; }
+.vellum-dot-info { background: #858078; }
+.vellum-dot-error { background: @vellum_error; }
+.vellum-success { color: @vellum_success; }.vellum-error { color: @vellum_error; }.vellum-warning { color: @vellum_warning; }
+.vellum-status-chip { padding: 3px 7px; border-radius: 5px; background: rgba(200,178,134,0.12); color: #d6c3a0; font-size: 11px; font-weight: 500; }
+.vellum-status-copy { color: #bdb8ac; font-size: 12px; }
+.vellum-section-label { color: #aba599; font-size: 11px; }
+.vellum-motion-value { color: #d2c19f; font-size: 11px; }
+.vellum-progress-value { color: @vellum_light_ink; font-size: 13px; font-weight: 500; }
+.vellum-dot.vellum-live-dot { min-width: 6px; min-height: 6px; background: #cab489; }
+.vellum-live-dot { color: #cab489; }
+.vellum-preview, .vellum-seam-track { border-radius: 6px; }
+
+popover.vellum-popover > contents { background-image: linear-gradient(140deg,#30302e,#232321); border: 1px solid #615b4e; border-radius: 9px; box-shadow: inset 0 1px rgba(250,239,209,0.10), 0 8px 24px rgba(0,0,0,0.40); padding: 7px; color: @vellum_ink; }
+.vellum-picker-entry { background: #1c1c1a; color: @vellum_ink; }
+menubutton.vellum-picker-button { background-image: linear-gradient(180deg,#41413b,#292924); border: 1px solid rgba(220,210,180,0.16); border-radius: 5px; color: @vellum_muted; }
+menubutton.vellum-picker-button > button { min-width: 18px; border: none; background: transparent; box-shadow: none; }
+.vellum-popover-list { background: transparent; }
+label.vellum-popover-row { padding: 6px 9px; border-radius: 4px; color: @vellum_ink; }
+label.vellum-popover-row:hover { background: rgba(217,200,159,0.07); }
+label.vellum-popover-row:selected { background: rgba(182,160,115,0.18); color: #eee1c6; }
+
+.vellum-text-shell { background: #252523; border: 1px solid rgba(228,218,190,0.10); border-radius: 8px; }
+.vellum-textview, .vellum-textview text { background: transparent; color: @vellum_light_ink; padding: 12px; font-size: 14px; }
+scrollbar { background: transparent; border: none; }
+scrollbar slider { min-width: 5px; min-height: 5px; padding: 0; border: none; border-radius: 6px; background: rgba(180,172,154,0.24); margin: 2px; }
+scrollbar range, scrollbar trough { min-width: 5px; min-height: 5px; padding: 0; border: none; }
+scrollbar slider:hover { background: rgba(202,188,159,0.46); }
+
+.vellum-mode-grid button { min-width: 66px; min-height: 55px; padding: 7px 6px; border-radius: 7px; background-color: #323332; background-image: linear-gradient(155deg,rgba(255,253,241,0.30),rgba(255,255,255,0.035) 45%,rgba(0,0,0,0.30)); border-color: rgba(232,225,206,0.26); border-bottom-color: rgba(0,0,0,0.90); box-shadow: inset 0 1px rgba(255,249,225,0.32), inset 1px 0 rgba(255,255,245,0.08), inset 0 -1px rgba(0,0,0,0.36), 0 3px 4px rgba(0,0,0,0.46); text-shadow: 0 1px 2px rgba(0,0,0,0.9); }
+.vellum-mode-grid button:hover { background-color: #45453f; border-color: rgba(229,209,162,0.48); box-shadow: inset 0 1px rgba(255,249,225,0.4), 0 3px 6px rgba(0,0,0,0.5); }
+.vellum-mode-grid button:active { background-color: #262725; background-image: linear-gradient(180deg,rgba(0,0,0,0.2),rgba(255,255,255,0.035)); box-shadow: inset 0 2px 4px rgba(0,0,0,0.6), 0 1px rgba(255,249,225,0.1); }
+.vellum-mode-grid button image { color: #d3c7ae; }
+.vellum-general-label { min-width: 68px; color: #c2bcae; }
+.vellum-general-value { color: #ded8cb; }
+.vellum-shortcut-key { min-width: 106px; padding: 4px 10px; border: 1px solid rgba(221,210,182,0.13); border-top-color: rgba(0,0,0,0.36); border-radius: 4px; background: rgba(15,15,14,0.40); box-shadow: inset 0 1px 2px rgba(0,0,0,0.30); color: #ddd2b9; font-size: 12px; }
+.vellum-preview-header { padding: 11px 16px; border-bottom: 1px solid rgba(230,220,190,0.07); }
+.vellum-preview-toolbar { padding: 8px 12px; background: #242422; border-bottom: 1px solid rgba(230,220,190,0.06); }
+.vellum-preview-toolbar button { padding: 4px 8px; min-height: 24px; }
+.vellum-preview-stage { background: @vellum_dark; }.vellum-preview-minimap { background: #242422; }
+.vellum-preview-status { padding: 8px 14px; background: #242422; color: #aaa495; font-size: 11px; }
+
+/* Focus is deliberately LAST and independent of decorative shadows. */
+.vellum-window button:focus-visible, .vellum-card button:focus-visible,
+.vellum-window checkbutton:focus-visible, .vellum-window switch:focus-visible,
+.vellum-window menubutton:focus-visible, .vellum-window entry:focus-visible,
+.vellum-glass button.vellum-primary:focus-visible, .vellum-glass button.vellum-quiet:focus-visible,
+.vellum-glass button.vellum-input-action:focus-visible, .vellum-glass switch:checked:focus-visible {
+  outline: 2px solid @vellum_accent; outline-offset: 2px;
+}

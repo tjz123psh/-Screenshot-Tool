@@ -15,6 +15,11 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// directly instead of bouncing the request back into the daemon.
 pub const BYPASS_ENV: &str = "VELLUM_BYPASS_SERVICE";
 
+/// The capture ended, but save/copy/result delivery did not fully complete.
+/// This is neither successful output (0), cancellation (130), nor a failure
+/// to start capture. Shared with UI to keep daemon notices stage-correct.
+pub const OUTPUT_FAILED_EXIT_CODE: i32 = 3;
+
 /// Actions the daemon is allowed to launch on behalf of a hotkey.
 ///
 /// Keeping this a closed enum (rather than the Python string set) means an

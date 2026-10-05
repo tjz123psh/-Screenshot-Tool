@@ -652,6 +652,8 @@ fn a_damaged_fast_jump_can_reanchor_to_known_canvas_content() {
 
     for top in (100..=1000).step_by(20) {
         st.add(&viewport(&src, top, VIEW_H));
+        assert_eq!(st.last_shift, 20, "lost the recovered anchor at {top}");
+        assert_eq!(st.current_height(), height_before_jump.max(top + VIEW_H));
     }
     let result = st.result().expect("stitch succeeded");
     assert_eq!(result.image.height, 1000 + VIEW_H);

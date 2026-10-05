@@ -17,6 +17,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use cairo::{Filter, ImageSurface};
 use gtk4::gdk::ModifierType;
@@ -24,14 +25,16 @@ use gtk4::gio::{self, SimpleAction};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, DrawingArea, EventControllerKey, EventControllerScroll,
-    EventControllerScrollFlags, GestureClick, Overlay, PopoverMenu, PositionType,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, EventControllerKey,
+    EventControllerScroll, EventControllerScrollFlags, GestureClick, Label, Orientation, Overlay,
+    PopoverMenu, PositionType,
 };
 use vellum_core::Rgb8;
 
 use vellum_core::compositor;
 
-use crate::{imaging, theme};
+use crate::ui_job::JobState;
+use crate::{imaging, theme, ui_job};
 
 const MIN_SCALE: f64 = 0.1;
 const MAX_SCALE: f64 = 12.0;
@@ -51,7 +54,7 @@ const SAVE_PREFIX: &str = "vellum-pin";
 
 struct View {
     surface: ImageSurface,
-    image: Rgb8,
+    image: Arc<Rgb8>,
     scale: f64,
     offset: (f64, f64),
     win: (i32, i32),
@@ -95,6 +98,12 @@ pub struct PinWindow {
     /// `None` means "no compositor control", which is a supported degraded
     /// mode: the pin still works, it just cannot float or resize itself.
     handle: RefCell<Option<compositor::Window>>,
+    closed: Cell<bool>,
+    copy_job: RefCell<JobState>,
+    save_job: RefCell<JobState>,
+    io_status: Label,
+    copy_status: RefCell<String>,
+    save_status: RefCell<String>,
 }
 
 /// Runs the pin window for `image` until the user closes it.
@@ -106,29 +115,149 @@ pub fn run(image: Rgb8) -> i32 {
         .build();
 
     let image = RefCell::new(Some(image));
+    let failed = Rc::new(Cell::new(false));
+    let activation_failed = failed.clone();
     app.connect_activate(move |app| {
         let Some(image) = image.borrow_mut().take() else {
             return;
         };
         match PinWindow::new(app, image) {
             Ok(pin) => pin.present(),
-            Err(err) => eprintln!("[vellum] pin failed: {err}"),
+            Err(err) => {
+                activation_failed.set(true);
+                crate::handoff::reject_current("window");
+                eprintln!("[vellum] pin failed: {err}");
+            }
         }
     });
 
     let empty: [String; 0] = [];
-    i32::from(app.run_with_args(&empty).get())
+    let code = i32::from(app.run_with_args(&empty).get());
+    if code == 0 && failed.get() { 1 } else { code }
 }
 
 /// Runs the pin window on whatever image is currently in the clipboard.
 pub fn run_from_clipboard() -> i32 {
-    match vellum_core::io::paste_image() {
-        Some(image) => run(image),
-        None => {
-            eprintln!("[vellum] clipboard has no image");
-            1
-        }
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    let succeeded = Rc::new(Cell::new(false));
+    let outcome = Rc::clone(&succeeded);
+    app.connect_activate(move |app| {
+        theme::install_default();
+        let window = ApplicationWindow::builder()
+            .application(app)
+            .title("从剪贴板钉图")
+            .default_width(420)
+            .default_height(160)
+            .build();
+        window.add_css_class("vellum-window");
+        let content = GtkBox::new(Orientation::Vertical, 12);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+        let status = Label::new(Some("读取剪贴板中…"));
+        status.set_wrap(true);
+        let retry = Button::with_label("重试读取");
+        let close = Button::with_label("关闭");
+        content.append(&status);
+        content.append(&retry);
+        content.append(&close);
+        window.set_child(Some(&content));
+        let gate = Rc::new(RefCell::new(JobState::default()));
+        let closed_gate = gate.clone();
+        window.connect_close_request(move |_| {
+            closed_gate.borrow_mut().close();
+            glib::Propagation::Proceed
+        });
+        let weak = window.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(window) = weak.upgrade() {
+                window.close();
+            }
+        });
+        let weak = window.downgrade();
+        let retry_status = status.clone();
+        let retry_gate = gate.clone();
+        let app = app.clone();
+        let retried_app = app.clone();
+        let retried_outcome = outcome.clone();
+        retry.connect_clicked(move |button| {
+            if let Some(window) = weak.upgrade() {
+                read_clipboard(
+                    &retried_app,
+                    &window,
+                    &retry_status,
+                    button,
+                    &retry_gate,
+                    &retried_outcome,
+                );
+            }
+        });
+        window.present();
+        read_clipboard(&app, &window, &status, &retry, &gate, &outcome);
+    });
+    let empty: [String; 0] = [];
+    let code = i32::from(app.run_with_args(&empty).get());
+    if code == 0 && !succeeded.get() {
+        1
+    } else {
+        code
     }
+}
+
+fn read_clipboard(
+    app: &Application,
+    window: &ApplicationWindow,
+    status: &Label,
+    retry: &Button,
+    gate: &Rc<RefCell<JobState>>,
+    succeeded: &Rc<Cell<bool>>,
+) {
+    let Some(ticket) = gate.borrow_mut().begin() else {
+        return;
+    };
+    status.set_label("读取剪贴板中…");
+    retry.set_sensitive(false);
+    let current = gate.clone();
+    let complete_gate = gate.clone();
+    let window = window.downgrade();
+    let status = status.downgrade();
+    let retry = retry.downgrade();
+    let app = app.clone();
+    let succeeded = succeeded.clone();
+    ui_job::run(
+        vellum_core::io::paste_image_result,
+        move || current.borrow().is_current(ticket),
+        move |result| {
+            if !complete_gate.borrow_mut().finish(ticket) {
+                return;
+            }
+            let (Some(window), Some(status), Some(retry)) =
+                (window.upgrade(), status.upgrade(), retry.upgrade())
+            else {
+                return;
+            };
+            let result = result
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+                .and_then(|image| PinWindow::new(&app, image).map_err(|error| error.to_string()));
+            match result {
+                Ok(pin) => {
+                    pin.present();
+                    succeeded.set(true);
+                    window.close();
+                }
+                Err(error) => {
+                    status.set_label(&error);
+                    status.set_tooltip_text(Some(&error));
+                    retry.set_sensitive(true);
+                }
+            }
+        },
+    );
 }
 
 impl PinWindow {
@@ -168,12 +297,21 @@ impl PinWindow {
         let overlay = Overlay::new();
         overlay.set_child(Some(&handle));
         overlay.add_overlay(&menu);
+        let io_status = Label::new(None);
+        io_status.set_halign(Align::Start);
+        io_status.set_valign(Align::End);
+        io_status.set_margin_start(8);
+        io_status.set_margin_bottom(8);
+        io_status.set_wrap(true);
+        io_status.add_css_class("vellum-status-chip");
+        io_status.set_visible(false);
+        overlay.add_overlay(&io_status);
         window.set_child(Some(&overlay));
 
         let surface = imaging::to_surface(&image)?;
         let mut view = View {
             surface,
-            image,
+            image: Arc::new(image),
             scale,
             offset: (0.0, 0.0),
             win: (win_w, win_h),
@@ -188,6 +326,12 @@ impl PinWindow {
             view: RefCell::new(view),
             menu,
             handle: RefCell::new(None),
+            closed: Cell::new(false),
+            copy_job: RefCell::new(JobState::default()),
+            save_job: RefCell::new(JobState::default()),
+            io_status,
+            copy_status: RefCell::new(String::new()),
+            save_status: RefCell::new(String::new()),
         });
 
         pin.connect_draw();
@@ -195,6 +339,19 @@ impl PinWindow {
         pin.connect_keys();
         pin.connect_menu();
         pin.connect_map();
+        let weak = Rc::downgrade(&pin);
+        pin.window.connect_close_request(move |_| {
+            if let Some(pin) = weak.upgrade() {
+                pin.closed.set(true);
+                pin.copy_job.borrow_mut().close();
+                pin.save_job.borrow_mut().close();
+                if let Some(source) = pin.view.borrow_mut().toast_source.take() {
+                    source.remove();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        crate::handoff::connect_ready(&pin.window);
         Ok(pin)
     }
 
@@ -312,6 +469,9 @@ impl PinWindow {
                 // focused something else, and floating their window instead
                 // would be a visible, confusing side effect. Retried on the main
                 // loop because the compositor's client list can lag the map.
+                if this.closed.get() {
+                    return;
+                }
                 crate::own_window::float_own_window_soon();
                 *this.handle.borrow_mut() = compositor::window_for_pid(std::process::id());
             });
@@ -353,25 +513,91 @@ impl PinWindow {
     }
 
     fn copy(self: &Rc<Self>) {
-        let result = vellum_core::io::copy_image(&self.view.borrow().image);
-        match result {
-            Ok(()) => self.toast("已复制到剪贴板", false),
-            Err(err) => self.toast(&format!("复制失败：{err}"), true),
-        }
+        self.start_output(false);
     }
 
     fn save(self: &Rc<Self>) {
-        let result = vellum_core::io::save_image(&self.view.borrow().image, SAVE_PREFIX);
-        match result {
-            Ok(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.display().to_string());
-                self.toast(&format!("已保存  {name}"), false);
-            }
-            Err(err) => self.toast(&format!("保存失败：{err}"), true),
+        self.start_output(true);
+    }
+
+    fn output_job(&self, save: bool) -> &RefCell<JobState> {
+        if save { &self.save_job } else { &self.copy_job }
+    }
+
+    fn output_status(&self, save: bool, message: String) {
+        if self.closed.get() {
+            return;
         }
+        if save {
+            *self.save_status.borrow_mut() = message;
+        } else {
+            *self.copy_status.borrow_mut() = message;
+        }
+        let message = [
+            self.save_status.borrow().clone(),
+            self.copy_status.borrow().clone(),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+        self.io_status.set_label(&message);
+        self.io_status.set_tooltip_text(Some(&message));
+        self.io_status.set_visible(true);
+    }
+
+    fn start_output(self: &Rc<Self>, save: bool) {
+        let Some(ticket) = self.output_job(save).borrow_mut().begin() else {
+            return;
+        };
+        self.output_status(save, if save { "保存中…" } else { "复制中…" }.into());
+        // Arc cloning is constant-time; encoding and all blocking I/O run off GTK.
+        let image = Arc::clone(&self.view.borrow().image);
+        let weak = Rc::downgrade(self);
+        let completion = weak.clone();
+        ui_job::run(
+            move || -> Result<String, String> {
+                if save {
+                    match vellum_core::io::save_image(&image, SAVE_PREFIX) {
+                        Ok(path) => Ok(format!("已保存：{}", path.display())),
+                        Err(error) => match vellum_core::io::committed_save_path(&error) {
+                            Some(path) => Ok(format!(
+                                "已写入：{}；持久化未确认，请保留当前图片",
+                                path.display()
+                            )),
+                            None => Err(error.to_string()),
+                        },
+                    }
+                } else {
+                    vellum_core::io::copy_image(&image)
+                        .map(|()| "已复制到剪贴板".into())
+                        .map_err(|err| err.to_string())
+                }
+            },
+            move || {
+                weak.upgrade()
+                    .is_some_and(|pin| pin.output_job(save).borrow().is_current(ticket))
+            },
+            move |result| {
+                let Some(pin) = completion.upgrade() else {
+                    return;
+                };
+                if !pin.output_job(save).borrow_mut().finish(ticket) {
+                    return;
+                }
+                let result = result
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                let message = match result {
+                    Ok(message) => message,
+                    Err(error) => format!(
+                        "{}失败：{error}（可重试）",
+                        if save { "保存" } else { "复制" }
+                    ),
+                };
+                pin.output_status(save, message);
+            },
+        );
     }
 
     /// Shows a transient message at the bottom of the window.
@@ -531,7 +757,7 @@ mod tests {
     fn zooming_keeps_the_point_under_the_cursor() {
         let mut view = View {
             surface: ImageSurface::create(cairo::Format::ARgb32, 10, 10).unwrap(),
-            image: image(400, 400),
+            image: Arc::new(image(400, 400)),
             scale: 1.0,
             offset: (0.0, 0.0),
             win: (200, 200),
@@ -556,7 +782,7 @@ mod tests {
     fn zoom_is_clamped() {
         let mut view = View {
             surface: ImageSurface::create(cairo::Format::ARgb32, 10, 10).unwrap(),
-            image: image(40, 40),
+            image: Arc::new(image(40, 40)),
             scale: 1.0,
             offset: (0.0, 0.0),
             win: (200, 200),

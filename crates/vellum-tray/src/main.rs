@@ -49,6 +49,11 @@ enum Message {
     Quit,
 }
 
+enum OutputPreference {
+    Save,
+    Copy,
+}
+
 struct Tray {
     version: String,
     status: Response,
@@ -102,14 +107,8 @@ impl Tray {
     /// Runs a capture. The service owns the exclusion rules, so the tray only
     /// asks; when no service answers we start the action ourselves rather than
     /// telling the user to retry.
-    fn dispatch(&self, action: Action) {
-        // pin-last has nothing to save or copy differently: it re-pins whatever
-        // is on the clipboard, so the output flags do not apply.
-        let args = if action == Action::PinLast {
-            Vec::new()
-        } else {
-            self.prefs.args()
-        };
+    fn dispatch(&mut self, action: Action) {
+        let args = self.dispatch_args(action);
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             match client::route_action(action, &args) {
@@ -123,16 +122,38 @@ impl Tray {
         });
     }
 
-    fn toggle(&mut self, save: Option<bool>, copy: Option<bool>) {
-        if let Some(value) = save {
-            self.prefs.save = value;
+    fn refresh_preferences(&mut self) {
+        self.prefs = prefs::load();
+    }
+
+    fn refresh(&mut self, status: Response) {
+        self.status = status;
+        self.refresh_preferences();
+    }
+
+    /// Read at the dispatch boundary, even when a panel save happened after the
+    /// last poll. Kept separate from routing so flags can be tested without IPC.
+    fn dispatch_args(&mut self, action: Action) -> Vec<String> {
+        self.refresh_preferences();
+        // pin-last re-pins the clipboard; output flags do not apply.
+        if action == Action::PinLast {
+            Vec::new()
+        } else {
+            self.prefs.args()
         }
-        if let Some(value) = copy {
-            self.prefs.copy = value;
-        }
-        if let Err(err) = prefs::store(&self.prefs) {
-            // A toggle that forgets itself is a silent lie; surface it.
+    }
+
+    fn toggle(&mut self, preference: OutputPreference) {
+        let result = vellum_core::prefs::update(|prefs| match preference {
+            OutputPreference::Save => prefs.save = !prefs.save,
+            OutputPreference::Copy => prefs.copy = !prefs.copy,
+        });
+        if let Err(err) = result {
+            // Keep the checkmarks consistent with disk when saving fails.
+            self.refresh_preferences();
             vellum_core::io::notify("vellum", &format!("无法保存托盘偏好：{err}"), "critical");
+        } else if let Ok(prefs) = result {
+            self.prefs = prefs;
         }
     }
 
@@ -212,6 +233,10 @@ impl Tray {
 }
 
 impl ksni::Tray for Tray {
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.open_panel();
+    }
+
     fn id(&self) -> String {
         TRAY_ID.into()
     }
@@ -238,6 +263,12 @@ impl ksni::Tray for Tray {
         }
     }
 
+    fn menu_about_to_show(&mut self) {
+        // ksni publishes menu property changes after this hook returns. Polling
+        // still covers hosts that do not call AboutToShow.
+        self.refresh_preferences();
+    }
+
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let long_label = self.long_label();
         let state = self.presentation().1;
@@ -252,18 +283,26 @@ impl ksni::Tray for Tray {
             MenuItem::Separator,
             StandardItem {
                 label: "区域截图".into(),
+                icon_name: "camera-photo-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| tray.dispatch(Action::Region)),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: long_label.into(),
+                icon_name: if self.active_action() == Some(Action::Long) {
+                    "media-playback-stop-symbolic"
+                } else {
+                    "view-more-symbolic"
+                }
+                .into(),
                 activate: Box::new(|tray: &mut Self| tray.dispatch(Action::Long)),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: "钉住剪贴板".into(),
+                icon_name: "view-pin-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| tray.dispatch(Action::PinLast)),
                 ..Default::default()
             }
@@ -272,7 +311,8 @@ impl ksni::Tray for Tray {
             // The panel is where the API key lives, so it sits with the output
             // preferences it also carries rather than next to the capture items.
             StandardItem {
-                label: "设置面板".into(),
+                label: "打开工作台".into(),
+                icon_name: "preferences-system-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| tray.open_panel()),
                 ..Default::default()
             }
@@ -281,8 +321,7 @@ impl ksni::Tray for Tray {
                 label: "截图后保存".into(),
                 checked: self.prefs.save,
                 activate: Box::new(|tray: &mut Self| {
-                    let next = !tray.prefs.save;
-                    tray.toggle(Some(next), None);
+                    tray.toggle(OutputPreference::Save);
                 }),
                 ..Default::default()
             }
@@ -291,8 +330,7 @@ impl ksni::Tray for Tray {
                 label: "截图后复制".into(),
                 checked: self.prefs.copy,
                 activate: Box::new(|tray: &mut Self| {
-                    let next = !tray.prefs.copy;
-                    tray.toggle(None, Some(next));
+                    tray.toggle(OutputPreference::Copy);
                 }),
                 ..Default::default()
             }
@@ -300,12 +338,14 @@ impl ksni::Tray for Tray {
             MenuItem::Separator,
             StandardItem {
                 label: "运行诊断".into(),
+                icon_name: "dialog-information-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| tray.run_diagnostics()),
                 ..Default::default()
             }
             .into(),
             StandardItem {
                 label: "重启截图服务".into(),
+                icon_name: "view-refresh-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| tray.restart_service()),
                 ..Default::default()
             }
@@ -313,6 +353,7 @@ impl ksni::Tray for Tray {
             MenuItem::Separator,
             StandardItem {
                 label: "退出托盘".into(),
+                icon_name: "application-exit-symbolic".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.tx.send(Message::Quit);
                 }),
@@ -329,8 +370,18 @@ fn icon_theme_path() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VELLUM_ICON_PATH") {
         return Some(PathBuf::from(dir));
     }
-    let dir = vellum_core::paths::home().join(".local/share/icons/hicolor/scalable/apps");
+    let dir = status_icon_dir(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        vellum_core::paths::home(),
+    );
     dir.is_dir().then_some(dir)
+}
+
+fn status_icon_dir(data_home: Option<PathBuf>, home: PathBuf) -> PathBuf {
+    data_home
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local/share"))
+        .join("icons/hicolor/scalable/status")
 }
 
 /// Starts an action without the service. Used when no daemon answers: the tray
@@ -479,8 +530,10 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         }
         if Instant::now() >= next_poll {
             let status = client::status();
+            // Updating inside the handle lets ksni publish changed checkmarks
+            // even when the service status itself has not changed.
             if handle
-                .update(|tray: &mut Tray| tray.status = status)
+                .update(|tray: &mut Tray| tray.refresh(status))
                 .is_none()
             {
                 return Ok(0);
@@ -513,7 +566,234 @@ mod tests {
 
     fn tray() -> Tray {
         let (tx, _rx) = mpsc::channel();
-        Tray::new(tx)
+        Tray {
+            version: vellum_core::VERSION.to_string(),
+            status: Response::stopped(),
+            prefs: Preferences::default(),
+            tx,
+        }
+    }
+
+    // Each filesystem test re-executes only itself with a private HOME/XDG tree.
+    // No process-global env mutation, real preferences, IPC, or tray service.
+    fn with_isolated_preferences(name: &str, check: impl FnOnce()) {
+        const CHILD: &str = "VELLUM_TRAY_PREFS_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            let root = std::env::current_dir().unwrap();
+            assert!(
+                root.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("vellum-tray-prefs-test-")
+            );
+            assert_eq!(
+                vellum_core::prefs::path(),
+                root.join("config/vellum/tray.json")
+            );
+            check();
+            return;
+        }
+
+        struct TestDir(PathBuf);
+        impl Drop for TestDir {
+            fn drop(&mut self) {
+                // Only remove the exact, newly created fixture directory.
+                assert_eq!(self.0.canonicalize().unwrap(), self.0);
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::temp_dir().canonicalize().unwrap();
+        let root = loop {
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = base.join(format!(
+                "vellum-tray-prefs-test-{}-{id}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => break TestDir(path),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("create test directory: {err}"),
+            }
+        };
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{name}"), "--nocapture"])
+            .env_clear()
+            .env(CHILD, name)
+            .env("HOME", root.0.join("home"))
+            .env("XDG_CONFIG_HOME", root.0.join("config"))
+            .env("XDG_STATE_HOME", root.0.join("state"))
+            .env("XDG_RUNTIME_DIR", root.0.join("runtime"))
+            .env("PATH", root.0.join("no-executables"))
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null")
+            .current_dir(&root.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"),
+            "isolated {name} failed or did not run: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn checkmarks(tray: &Tray) -> Vec<(String, bool)> {
+        use ksni::Tray as _;
+        tray.menu()
+            .into_iter()
+            .filter_map(|item| match item {
+                MenuItem::Checkmark(item) => Some((item.label, item.checked)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn panel_save_is_used_by_dispatch_before_polling() {
+        with_isolated_preferences("panel_save_is_used_by_dispatch_before_polling", || {
+            // Exercise every output combination and both capture actions, with
+            // the same atomic store used by the panel after Tray::new.
+            for action in [Action::Region, Action::Long, Action::PinLast] {
+                for (save, copy) in [(true, true), (false, true), (true, false), (false, false)] {
+                    let initial = Preferences {
+                        save: !save,
+                        copy: !copy,
+                        ..Preferences::default()
+                    };
+                    prefs::store(&initial).unwrap();
+                    let (tx, _rx) = mpsc::channel();
+                    let mut tray = Tray::new(tx);
+                    let saved = Preferences {
+                        save,
+                        copy,
+                        ..Preferences::default()
+                    };
+                    vellum_core::prefs::store(&saved).unwrap();
+                    assert_eq!(tray.prefs, initial);
+
+                    let mut expected = Vec::new();
+                    if action != Action::PinLast {
+                        if !save {
+                            expected.push("--no-save".to_string());
+                        }
+                        if !copy {
+                            expected.push("--no-copy".to_string());
+                        }
+                    }
+                    assert_eq!(tray.dispatch_args(action), expected);
+                    assert_eq!(tray.prefs, saved);
+                    assert_eq!(
+                        prefs::load(),
+                        saved,
+                        "dispatch must not rewrite preferences"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn toggles_preserve_the_other_panel_saved_field() {
+        with_isolated_preferences("toggles_preserve_the_other_panel_saved_field", || {
+            use ksni::Tray as _;
+            for label in ["截图后保存", "截图后复制"] {
+                for (save, copy) in [(true, true), (false, true), (true, false), (false, false)] {
+                    let initial = Preferences {
+                        save: !save,
+                        copy: !copy,
+                        ..Preferences::default()
+                    };
+                    prefs::store(&initial).unwrap();
+                    let (tx, _rx) = mpsc::channel();
+                    let mut tray = Tray::new(tx);
+                    // Retain a callback from before the external save, just as
+                    // a host can retain a previously rendered menu.
+                    let checkbox = tray
+                        .menu()
+                        .into_iter()
+                        .find_map(|item| match item {
+                            MenuItem::Checkmark(item) if item.label == label => Some(item),
+                            _ => None,
+                        })
+                        .unwrap();
+                    vellum_core::prefs::store(&Preferences {
+                        save,
+                        copy,
+                        ..Preferences::default()
+                    })
+                    .unwrap();
+                    (checkbox.activate)(&mut tray);
+
+                    let expected = if label == "截图后保存" {
+                        Preferences {
+                            save: !save,
+                            copy,
+                            ..Preferences::default()
+                        }
+                    } else {
+                        Preferences {
+                            save,
+                            copy: !copy,
+                            ..Preferences::default()
+                        }
+                    };
+                    assert_eq!(prefs::load(), expected, "{label}: save={save}, copy={copy}");
+                    assert_eq!(tray.prefs, expected);
+                    assert_eq!(
+                        checkmarks(&tray),
+                        vec![
+                            ("截图后保存".into(), expected.save),
+                            ("截图后复制".into(), expected.copy),
+                        ]
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn polling_and_menu_open_refresh_panel_saved_checkmarks() {
+        with_isolated_preferences(
+            "polling_and_menu_open_refresh_panel_saved_checkmarks",
+            || {
+                use ksni::Tray as _;
+                prefs::store(&Preferences::default()).unwrap();
+                let (tx, _rx) = mpsc::channel();
+                let mut tray = Tray::new(tx);
+                let saved = Preferences {
+                    save: false,
+                    copy: false,
+                    ..Preferences::default()
+                };
+                vellum_core::prefs::store(&saved).unwrap();
+                // The status is unchanged: preferences alone must update the menu.
+                tray.refresh(Response::stopped());
+                assert_eq!(
+                    checkmarks(&tray),
+                    vec![("截图后保存".into(), false), ("截图后复制".into(), false),]
+                );
+                vellum_core::prefs::store(&Preferences::default()).unwrap();
+                tray.menu_about_to_show();
+                assert_eq!(
+                    checkmarks(&tray),
+                    vec![("截图后保存".into(), true), ("截图后复制".into(), true),]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn status_icon_location_matches_the_installer() {
+        assert_eq!(
+            status_icon_dir(Some(PathBuf::from("/data")), PathBuf::from("/home/test")),
+            PathBuf::from("/data/icons/hicolor/scalable/status")
+        );
+        assert_eq!(
+            status_icon_dir(None, PathBuf::from("/home/test")),
+            PathBuf::from("/home/test/.local/share/icons/hicolor/scalable/status")
+        );
     }
 
     #[test]
@@ -577,7 +857,7 @@ mod tests {
             })
             .collect();
         assert!(
-            labels.iter().any(|label| label == "设置面板"),
+            labels.iter().any(|label| label == "打开工作台"),
             "menu lost the panel entry: {labels:?}"
         );
     }

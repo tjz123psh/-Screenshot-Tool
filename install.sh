@@ -10,7 +10,7 @@
 #   2. Builds the release binaries with cargo
 #   3. Installs vellum / vellumctl / vellum-ui / vellum-tray into ~/.local/bin
 #   4. Installs the desktop entry and the application/status icons
-#   5. Tries to write the default shortcuts into the user's Niri keybinds.kdl
+#   5. Installs app-owned global shortcuts; compositor files are untouched by default
 #   6. Installs and starts the systemd user service and the tray
 #   7. Removes the cargo build tree — an end-user install never rebuilds, so
 #      the cache is pure waste; set VELLUM_SKIP_CLEANUP=1 to keep it
@@ -31,6 +31,8 @@ LAUNCHER="$BIN_DIR/vellum"
 TRAY_BIN="$BIN_DIR/vellum-tray"
 SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 APPLICATION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+DBUS_SERVICE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dbus-1/services"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 ICON_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
 ICON_APP_DIR="$ICON_ROOT/scalable/apps"
 ICON_STATUS_DIR="$ICON_ROOT/scalable/status"
@@ -50,7 +52,7 @@ die()   { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 # external tools vellum shells out to.  tesseract is used as a subprocess
 # rather than linked, so no leptonica development package is needed.
 REQUIRED_PACKAGES=(
-    rust pkgconf gtk4 gtk4-layer-shell
+    rust pkgconf gtk4 gtk4-layer-shell xdg-desktop-portal
     grim wl-clipboard libnotify
     tesseract tesseract-data-chi_sim tesseract-data-eng
 )
@@ -127,35 +129,23 @@ for bin in "${BINARIES[@]}"; do
 done
 ok "二进制已安装"
 
-# --- 3. Compositor shortcuts (degradable) ---------------------------------
-# Shortcuts live in the user's compositor config and must never be a hard
-# dependency of the install: on a conflict, a missing config or a failed
-# validation we print what `vellum shortcuts install` had to say, point at the
-# matching example, and carry on with the service and tray.
-#
-# `vellum shortcuts install` decides what is safe on its own (it writes niri KDL
-# and classic hyprland.conf, and only prints a snippet for a Lua Hyprland
-# config), so this step deliberately does not second-guess it by sniffing config
-# files here. Duplicating that policy in shell is how the two drift apart.
-if [[ "${VELLUM_SKIP_SHORTCUTS:-0}" == "1" ]]; then
-    info "已跳过快捷键自动配置（VELLUM_SKIP_SHORTCUTS=1）"
-else
-    shortcut_output=""
-    if shortcut_output=$("$LAUNCHER" shortcuts install 2>&1); then
-        printf '%s\n' "$shortcut_output"
-        ok "快捷键已配置或已存在"
-    else
-        shortcut_status=$?
-        printf '%s\n' "$shortcut_output"
-        warn "快捷键未自动写入（状态 $shortcut_status）；不影响 vellum 安装"
-        warn "niri 示例：$SRC_DIR/contrib/niri-vellum.kdl"
-        warn "Hyprland 示例：$SRC_DIR/contrib/hyprland-vellum.conf（Lua 配置见 hyprland-vellum.lua）"
+# --- 3. Global shortcuts --------------------------------------------------
+# Standard portal registration is the default. Never modify a compositor file
+# merely because the user installed a screenshot application.
+if [[ "${VELLUM_ENABLE_LEGACY_SHORTCUTS:-0}" == "1" && "${VELLUM_SKIP_SHORTCUTS:-0}" != "1" ]]; then
+    if ! "$LAUNCHER" shortcuts install; then
+        warn "旧版桌面绑定配置未完成；标准全局快捷键仍可在应用内启用"
     fi
+else
+    info "使用应用管理的全局快捷键，不修改 niri/Hyprland 配置；安装后请在应用内启用并授权"
 fi
 
 # --- 4. Service, tray, desktop entry, icons -------------------------------
 info "安装截图服务与系统托盘"
-mkdir -p "$SYSTEMD_DIR" "$APPLICATION_DIR" "$ICON_APP_DIR" "$ICON_STATUS_DIR"
+mkdir -p "$SYSTEMD_DIR" "$APPLICATION_DIR" "$ICON_APP_DIR" "$ICON_STATUS_DIR" "$DBUS_SERVICE_DIR" "$AUTOSTART_DIR"
+sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" "$SRC_DIR/contrib/vellum-shortcuts.service" > "$SYSTEMD_DIR/vellum-shortcuts.service"
+sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" "$SRC_DIR/contrib/ai.vellum.Shortcuts.service" > "$DBUS_SERVICE_DIR/ai.vellum.Shortcuts.service"
+sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" "$SRC_DIR/contrib/ai.vellum-shortcuts.desktop" > "$AUTOSTART_DIR/ai.vellum-shortcuts.desktop"
 sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" \
     "$SRC_DIR/contrib/vellum.service" > "$SYSTEMD_DIR/vellum.service"
 sed "s|@VELLUM_TRAY@|$TRAY_BIN|g" \
@@ -190,9 +180,9 @@ if command -v systemctl >/dev/null; then
     # `enable --now` will not replace an already-running daemon after an
     # upgrade.  `vellum restart` also shuts down an instance that a hotkey
     # spawned directly, before systemd starts the freshly installed code.
-    if systemctl --user enable vellum.service vellum-tray.service \
+    if systemctl --user enable vellum.service vellum-tray.service vellum-shortcuts.service \
         && "$LAUNCHER" restart \
-        && systemctl --user restart vellum-tray.service; then
+        && systemctl --user restart vellum-tray.service vellum-shortcuts.service; then
         ok "截图服务与系统托盘已启动，并将在登录后自动运行"
     else
         warn "截图服务暂未启动；快捷键调用时仍会自动拉起"

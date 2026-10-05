@@ -41,14 +41,10 @@ use crate::model_picker::ModelPicker;
 use crate::theme;
 
 const APP_ID: &str = "ai.vellum.panel";
-/// Wide enough for the 184 px sidebar plus the 640 px form column, and deep
-/// enough that the tallest page (OCR) scrolls only for its last row.
-const WIDTH: i32 = 900;
-/// Tall enough that the API page's model card sits above the fold: at 760 the
-/// second picker fell below it, and a primary action the user has to discover by
-/// scrolling is a defect, not a density win. The sidebar and the capped form
-/// column stay put; only the window grew.
-const HEIGHT: i32 = 840;
+/// Comfortable at 800×560 without turning settings into a full-screen dashboard.
+/// Smaller outputs are clamped by panel_size; each page scrolls independently.
+const WIDTH: i32 = 800;
+const HEIGHT: i32 = 560;
 /// Niri needs the window mapped before it can be floated; the same 60 ms the
 /// result window uses keeps both windows behaving alike.
 const FLOAT_DELAY: Duration = Duration::from_millis(60);
@@ -136,6 +132,9 @@ struct FormValues {
     api_timeout_s: u64,
     save_after_capture: bool,
     copy_after_capture: bool,
+    output_dir: String,
+    filename_template: String,
+    always_preview: bool,
 }
 
 impl FormValues {
@@ -160,6 +159,9 @@ impl FormValues {
             api_timeout_s: cfg.ocr.api_timeout_s,
             save_after_capture: prefs.save,
             copy_after_capture: prefs.copy,
+            output_dir: prefs.output_dir.clone(),
+            filename_template: prefs.filename_template.clone(),
+            always_preview: prefs.always_preview,
         }
     }
 
@@ -199,6 +201,9 @@ impl FormValues {
         Preferences {
             save: self.save_after_capture,
             copy: self.copy_after_capture,
+            output_dir: self.output_dir.clone(),
+            filename_template: self.filename_template.clone(),
+            always_preview: self.always_preview,
         }
     }
 }
@@ -360,6 +365,9 @@ struct FormWidgets {
     api_timeout: SpinButton,
     save_switch: Switch,
     copy_switch: Switch,
+    output_dir: Entry,
+    filename_template: Entry,
+    always_preview: Switch,
 }
 
 impl FormWidgets {
@@ -452,6 +460,19 @@ impl FormWidgets {
         let save_switch = Switch::builder().active(true).valign(Align::Center).build();
         let copy_switch = Switch::builder().active(true).valign(Align::Center).build();
 
+        let output_dir = Entry::builder()
+            .placeholder_text("留空使用 ~/Pictures/Screenshots")
+            .hexpand(true)
+            .build();
+        let filename_template = Entry::builder()
+            .text(prefs::DEFAULT_FILENAME_TEMPLATE)
+            .hexpand(true)
+            .build();
+        let always_preview = Switch::builder()
+            .active(false)
+            .valign(Align::Center)
+            .build();
+
         let form = Self {
             base_url,
             key,
@@ -471,6 +492,9 @@ impl FormWidgets {
             api_timeout,
             save_switch,
             copy_switch,
+            output_dir,
+            filename_template,
+            always_preview,
         };
 
         // The engine choice decides which half of the page matters; the wiring
@@ -509,6 +533,9 @@ impl FormWidgets {
             api_timeout_s: self.api_timeout.value().round() as u64,
             save_after_capture: self.save_switch.is_active(),
             copy_after_capture: self.copy_switch.is_active(),
+            output_dir: self.output_dir.text().to_string(),
+            filename_template: self.filename_template.text().to_string(),
+            always_preview: self.always_preview.is_active(),
         }
     }
 
@@ -533,6 +560,9 @@ impl FormWidgets {
         self.api_timeout.set_value(values.api_timeout_s as f64);
         self.save_switch.set_active(values.save_after_capture);
         self.copy_switch.set_active(values.copy_after_capture);
+        self.output_dir.set_text(&values.output_dir);
+        self.filename_template.set_text(&values.filename_template);
+        self.always_preview.set_active(values.always_preview);
         self.sync_engine();
     }
 
@@ -572,7 +602,7 @@ fn sync_engine_widgets(
 ///
 /// `show_page` matches a page name against this table to find the nav item that
 /// has to be checked, so the visible page and the highlight cannot drift apart.
-const PAGE_NAMES: [&str; 3] = ["api", "text", "capture"];
+const PAGE_NAMES: [&str; 5] = ["home", "shortcuts", "capture", "text", "api"];
 
 /// The widgets of the connection-test row.
 ///
@@ -595,6 +625,9 @@ struct Panel {
     /// The document as loaded, so saving preserves the sections the panel does
     /// not own (it edits three of the four).
     base: RefCell<Config>,
+    saved_values: RefCell<FormValues>,
+    /// Isolated showcase: never reads credentials, writes settings, or calls APIs.
+    demo: bool,
     /// The title-bar pill. Its inner label keeps the old chip semantics:
     /// `refresh_credentials` rewrites the text and swaps
     /// "vellum-success"/"vellum-error" as the key source changes.
@@ -625,8 +658,19 @@ impl Panel {
     fn new(app: &Application) -> Rc<Self> {
         theme::install_default();
 
-        let base = Config::load();
-        let prefs = prefs::load();
+        let demo = std::env::var("VELLUM_UI_DEMO").as_deref() == Ok("1");
+        let base = if demo {
+            Config::default()
+        } else {
+            Config::load()
+        };
+        let prefs = if demo {
+            Preferences::default()
+        } else {
+            prefs::load()
+        };
+        let saved_values = RefCell::new(FormValues::from_config(&base, &prefs));
+        let (width, height) = panel_size();
         let form = FormWidgets::build();
 
         // resizable(false) is not cosmetic: it is what makes the panel an
@@ -643,10 +687,10 @@ impl Panel {
         // blur).
         let window = ApplicationWindow::builder()
             .application(app)
-            .default_width(WIDTH)
-            .default_height(HEIGHT)
+            .default_width(width)
+            .default_height(height)
             .resizable(false)
-            .title("设置")
+            .title("Vellum · 截图设置")
             .build();
         window.add_css_class("vellum-window");
         // Panel-only glass hook: the compositor blurs whatever shows through, but
@@ -654,16 +698,19 @@ impl Panel {
         // with the long-shot panel, so translucency lives on a class only this
         // window carries.
         window.add_css_class("vellum-glass");
+        crate::background_blur::attach(&window);
 
         let root = GtkBox::new(Orientation::Vertical, 0);
+        root.add_css_class("vellum-panel-shell");
 
         // The title bar is ours rather than a compositor's: the target session
         // runs without server-side decorations, so without our own header there
         // would be no title and no way to move the window.
         // Only one title, no subtitle: the header states where we are, the
         // sidebar and the cards state what can be changed.
-        let title = Label::builder().label("设置").xalign(0.0).build();
+        let title = Label::builder().label("截图设置").xalign(0.5).build();
         title.add_css_class("vellum-title");
+        title.set_hexpand(true);
 
         let chip = controls::StatusPill::new("", "vellum-success");
 
@@ -677,13 +724,14 @@ impl Panel {
 
         let title_bar = GtkBox::new(Orientation::Horizontal, 12);
         title_bar.add_css_class("vellum-titlebar-inner");
-        title_bar.set_margin_top(12);
-        title_bar.set_margin_bottom(10);
-        title_bar.set_margin_start(18);
-        title_bar.set_margin_end(12);
+        title_bar.set_margin_top(5);
+        title_bar.set_margin_bottom(5);
+        title_bar.set_margin_start(10);
+        title_bar.set_margin_end(6);
+        title_bar.append(&controls::brand_mark(18));
         title_bar.append(&title);
         let bar_spacer = GtkBox::new(Orientation::Horizontal, 0);
-        bar_spacer.set_hexpand(true);
+        bar_spacer.set_hexpand(false);
         title_bar.append(&bar_spacer);
         title_bar.append(&chip.root);
         title_bar.append(&close);
@@ -699,29 +747,32 @@ impl Panel {
         // radio group spans both, so exactly one page is ever selected.
         let sidebar = GtkBox::new(Orientation::Vertical, 2);
         sidebar.add_css_class("vellum-sidebar");
-        sidebar.set_size_request(184, -1);
-        sidebar.set_margin_top(8);
-        sidebar.set_margin_bottom(8);
-        sidebar.set_margin_start(10);
-        sidebar.set_margin_end(6);
-        sidebar.append(&nav_section("接口与模型"));
-
-        let nav_api = nav_item("模型接入", "network-server-symbolic");
-        let nav_text = nav_item("翻译与 OCR", "accessories-dictionary-symbolic");
-        sidebar.append(&nav_api);
-        sidebar.append(&nav_text);
-        sidebar.append(&nav_section("截图"));
-        let nav_capture = nav_item("截图行为", "camera-photo-symbolic");
+        sidebar.set_size_request(148, -1);
+        sidebar.set_hexpand(false);
+        sidebar.set_margin_top(0);
+        sidebar.set_margin_bottom(0);
+        sidebar.set_margin_start(0);
+        sidebar.set_margin_end(0);
+        let nav_home = nav_item("通用", "preferences-system-symbolic");
+        sidebar.append(&nav_home);
+        let nav_shortcuts = nav_item("快捷键", "preferences-desktop-keyboard-shortcuts-symbolic");
+        nav_shortcuts.set_group(Some(&nav_home));
+        sidebar.append(&nav_shortcuts);
+        let nav_capture = nav_item("截图与输出", "camera-photo-symbolic");
+        let nav_text = nav_item("识别与翻译", "accessories-dictionary-symbolic");
+        let nav_api = nav_item("模型与接口", "network-server-symbolic");
         sidebar.append(&nav_capture);
-
-        nav_text.set_group(Some(&nav_api));
-        nav_capture.set_group(Some(&nav_api));
+        sidebar.append(&nav_text);
+        sidebar.append(&nav_api);
+        nav_api.set_group(Some(&nav_home));
+        nav_text.set_group(Some(&nav_home));
+        nav_capture.set_group(Some(&nav_home));
 
         let nav_spacer = GtkBox::new(Orientation::Vertical, 0);
         nav_spacer.set_vexpand(true);
         sidebar.append(&nav_spacer);
 
-        let nav_items = vec![nav_api, nav_text, nav_capture];
+        let nav_items = vec![nav_home, nav_shortcuts, nav_capture, nav_text, nav_api];
 
         // --- pages ------------------------------------------------------------
         // Page-local widgets first: the pages take them by reference.
@@ -752,16 +803,26 @@ impl Panel {
         fetch_button.set_tooltip_text(Some("请求接口的 /models 并填入下面的模型选择器"));
 
         let stack = Stack::builder()
-            .transition_type(StackTransitionType::SlideLeftRight)
+            .transition_type(StackTransitionType::Crossfade)
+            .transition_duration(160)
             .vexpand(true)
             .build();
+        let (home, mut launchers) = home_page(&form);
+        stack.add_titled(&home, Some("home"), "工作台");
+        stack.add_titled(
+            &crate::portal_shortcuts::settings_page(demo),
+            Some("shortcuts"),
+            "快捷键",
+        );
         stack.add_titled(
             &api_page(&form, &key_hint, &probe, &models_status, &fetch_button),
             Some("api"),
             "模型接入",
         );
         stack.add_titled(&text_page(&form), Some("text"), "翻译与 OCR");
-        stack.add_titled(&capture_page(&form), Some("capture"), "截图行为");
+        let (capture, choose_output) = capture_page(&form);
+        launchers.push((choose_output, "choose-output-folder"));
+        stack.add_titled(&capture, Some("capture"), "截图与输出");
 
         let content = GtkBox::new(Orientation::Vertical, 0);
         content.add_css_class("vellum-content-column");
@@ -790,10 +851,10 @@ impl Panel {
 
         let footer = GtkBox::new(Orientation::Horizontal, 12);
         footer.add_css_class("vellum-footer");
-        footer.set_margin_top(12);
-        footer.set_margin_bottom(14);
-        footer.set_margin_start(18);
-        footer.set_margin_end(18);
+        footer.set_margin_top(5);
+        footer.set_margin_bottom(5);
+        footer.set_margin_start(12);
+        footer.set_margin_end(10);
         footer.append(&status);
         footer.append(&reset_button);
         footer.append(&save_button);
@@ -807,6 +868,8 @@ impl Panel {
             stack: stack.clone(),
             nav_items,
             base: RefCell::new(base),
+            saved_values,
+            demo,
             chip,
             key_hint,
             status,
@@ -823,6 +886,14 @@ impl Panel {
 
         panel.form.populate(&panel.base.borrow(), &prefs);
         panel.refresh_credentials();
+        for (button, action) in launchers {
+            let weak = Rc::downgrade(&panel);
+            button.connect_clicked(move |_| {
+                if let Some(panel) = weak.upgrade() {
+                    panel.launch_capture(action);
+                }
+            });
+        }
 
         // Acceptance/screenshot aid, next to VELLUM_PANEL_OPEN_PICKER: open a
         // chosen page without driving the UI. It goes through `show_page`, so the
@@ -831,7 +902,9 @@ impl Panel {
         panel.show_page(match initial.as_str() {
             "text" => "text",
             "capture" => "capture",
-            _ => "api",
+            "shortcuts" => "shortcuts",
+            "api" => "api",
+            _ => "home",
         });
 
         // Acceptance aid, next to VELLUM_PANEL_PAGE: fetch the model list and
@@ -938,9 +1011,11 @@ impl Panel {
                 && let Some(this) = this.upgrade()
             {
                 let page = match key {
+                    Key::_0 | Key::KP_0 => Some("home"),
                     Key::_1 | Key::KP_1 => Some("api"),
                     Key::_2 | Key::KP_2 => Some("text"),
                     Key::_3 | Key::KP_3 => Some("capture"),
+                    Key::_4 | Key::KP_4 => Some("shortcuts"),
                     _ => None,
                 };
                 if let Some(page) = page {
@@ -989,6 +1064,21 @@ impl Panel {
             return;
         };
         self.stack.set_visible_child_name(name);
+        let form_page = name != "shortcuts";
+        self.save_button.set_visible(form_page);
+        self.reset_button.set_visible(form_page && name != "home");
+        self.chip.root.set_visible(name == "api");
+        if name == "home" {
+            self.status.set_label(if self.demo {
+                "界面演示 · 未读取真实配置"
+            } else {
+                "截图后保存与复制，始终遵循你的偏好设置"
+            });
+        } else if name == "shortcuts" {
+            self.status.set_label("以系统授权结果为准，无需另外保存");
+        } else {
+            self.status.set_label("设置仅在保存后生效");
+        }
         if let Some(item) = self.nav_items.get(index)
             && !item.is_active()
         {
@@ -998,8 +1088,197 @@ impl Panel {
         }
     }
 
+    fn launch_capture(self: &Rc<Self>, action: &'static str) {
+        if let Some(page) = action.strip_prefix("page.") {
+            self.show_page(page);
+            return;
+        }
+        if action == "choose-output-folder" {
+            if !self.demo {
+                self.choose_output_folder();
+            }
+            return;
+        }
+        if action == "open-image" {
+            if self.demo {
+                self.flash("演示模式 · 不读取真实图片", Flash::Info);
+                return;
+            }
+            self.open_image();
+            return;
+        }
+        if action == "open-folder" {
+            if self.demo {
+                self.flash("演示模式 · 不打开真实文件夹", Flash::Info);
+                return;
+            }
+            let dir = vellum_core::paths::screenshot_dir();
+            if !dir.is_dir() {
+                self.flash("保存第一张截图后会创建此文件夹", Flash::Info);
+                return;
+            }
+            if let Err(error) = gio::AppInfo::launch_default_for_uri(
+                &gio::File::for_path(dir).uri(),
+                None::<&gio::AppLaunchContext>,
+            ) {
+                self.flash(&format!("无法打开保存位置：{error}"), Flash::Error);
+            }
+            return;
+        }
+        if self.demo {
+            self.flash("演示模式 · 不启动截图，不读取剪贴板", Flash::Info);
+            return;
+        }
+        if self.form.values() != *self.saved_values.borrow() {
+            let dialog = gtk4::AlertDialog::builder()
+                .message("还有未保存的设置")
+                .detail("开始截图将关闭工作台。返回保存，或放弃本次修改并使用已保存的设置。")
+                .buttons(["返回修改", "放弃修改并截图"])
+                .default_button(0)
+                .cancel_button(0)
+                .build();
+            let weak = Rc::downgrade(self);
+            dialog.choose(
+                Some(&self.window),
+                None::<&gio::Cancellable>,
+                move |answer| {
+                    if answer == Ok(1)
+                        && let Some(panel) = weak.upgrade()
+                    {
+                        panel.start_capture(action);
+                    }
+                },
+            );
+        } else {
+            self.start_capture(action);
+        }
+    }
+
+    fn choose_output_folder(self: &Rc<Self>) {
+        let dialog = gtk4::FileDialog::builder()
+            .title("默认截图保存目录")
+            .build();
+        let weak = Rc::downgrade(self);
+        dialog.select_folder(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Some(panel) = weak.upgrade().filter(|p| !p.closed.get()) else {
+                    return;
+                };
+                let Ok(file) = result else {
+                    return;
+                }; // Cancelling leaves the form and disk unchanged.
+                let Some(path) = file.path() else {
+                    panel.flash("请选择本地文件夹", Flash::Error);
+                    return;
+                };
+                let Some(text) = path.to_str() else {
+                    panel.flash("目录名称包含无法保存的编码，原目录未改变", Flash::Error);
+                    return;
+                };
+                let mut proposed = panel.form.values().to_preferences();
+                proposed.output_dir = text.to_owned();
+                if let Err(error) = proposed.check_output_directory() {
+                    panel.flash(&error.to_string(), Flash::Error);
+                    return;
+                }
+                panel.form.output_dir.set_text(text);
+                panel.flash("目录已选择，点击保存后生效", Flash::Info);
+            },
+        );
+    }
+
+    fn open_image(self: &Rc<Self>) {
+        let dialog = gtk4::FileDialog::builder().title("查看图片").build();
+        let filter = gtk4::FileFilter::new();
+        filter.set_name(Some("图片（PNG、JPEG、WebP）"));
+        filter.add_mime_type("image/png");
+        filter.add_mime_type("image/jpeg");
+        filter.add_mime_type("image/webp");
+        let filters = gio::ListStore::new::<gtk4::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+        let weak = Rc::downgrade(self);
+        dialog.open(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Some(panel) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(file) => {
+                        let Some(path) = file.path() else {
+                            panel.flash("请选择本地 PNG 图片", Flash::Error);
+                            return;
+                        };
+                        use std::os::unix::process::CommandExt;
+                        let spawned = std::env::current_exe().and_then(|exe| {
+                            std::process::Command::new(exe)
+                                .arg("preview-file")
+                                .arg(path)
+                                .stdin(std::process::Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::inherit())
+                                .process_group(0)
+                                .spawn()
+                        });
+                        match spawned {
+                            Ok(child) => vellum_core::proc::reap_in_background(child),
+                            Err(error) => {
+                                panel.flash(&format!("无法打开查看器：{error}"), Flash::Error)
+                            }
+                        }
+                    }
+                    Err(error)
+                        if error.matches(gtk4::DialogError::Dismissed)
+                            || error.matches(gtk4::DialogError::Cancelled) => {}
+                    Err(error) => panel.flash(&format!("无法选择图片：{error}"), Flash::Error),
+                }
+            },
+        );
+    }
+
+    fn start_capture(&self, action: &'static str) {
+        let executable = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("vellum")))
+            .filter(|path| vellum_core::proc::is_executable(path))
+            .or_else(|| vellum_core::proc::which("vellum"));
+        let Some(executable) = executable else {
+            self.flash("未找到截图程序，请检查安装", Flash::Error);
+            return;
+        };
+        let Some(app) = self.window.application() else {
+            return;
+        };
+        let hold = app.hold();
+        self.window.close();
+        glib::timeout_add_local_once(Duration::from_millis(180), move || {
+            use std::os::unix::process::CommandExt;
+            let mut command = std::process::Command::new(executable);
+            command
+                .arg(action)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .process_group(0);
+            // Resolve saved defaults at dispatch, never from this panel's old form.
+            if action != "pin-last" {
+                command.args(prefs::load().args());
+            }
+            match command.spawn() {
+                Ok(child) => vellum_core::proc::reap_in_background(child),
+                Err(_) => vellum_core::io::notify("Vellum", "无法启动截图，请检查安装", "normal"),
+            }
+            drop(hold);
+        });
+    }
+
     fn present(self: &Rc<Self>) {
         self.window.present();
+        theme::snapshot_for_review(&self.window);
     }
 
     fn apply(self: &Rc<Self>, update: Update) {
@@ -1026,6 +1305,12 @@ impl Panel {
 
     /// Rewrites the title-bar pill and the key-source line from the live widgets.
     fn refresh_credentials(&self) {
+        if self.demo {
+            self.chip.set_state("界面演示", "vellum-success");
+            self.key_hint
+                .set_label("演示模式不读取密钥，也不会连接任何接口");
+            return;
+        }
         let api = self.api_config();
         let source = api.key_source();
         let loopback = api.targets_loopback();
@@ -1039,23 +1324,37 @@ impl Panel {
 
     fn save(self: &Rc<Self>) {
         let values = self.form.values();
+        if self.demo {
+            *self.saved_values.borrow_mut() = values;
+            self.flash("演示模式 · 未写入任何设置", Flash::Success);
+            return;
+        }
+        let preferences = values.to_preferences();
+        if let Err(error) = preferences.validate() {
+            self.flash(&error.to_string(), Flash::Error);
+            return;
+        }
+        if preferences.output_dir != self.saved_values.borrow().output_dir
+            && let Err(error) = preferences.check_output_directory()
+        {
+            self.flash(&error.to_string(), Flash::Error);
+            return;
+        }
         let config = values.to_config(&self.base.borrow());
-        match config.save() {
-            Ok(()) => {
-                let stored = prefs::store(&values.to_preferences());
+        let result = config.save_settings(
+            &self.base.borrow(),
+            &self.saved_values.borrow().to_preferences(),
+            &values.to_preferences(),
+        );
+        match result {
+            Ok((config, prefs)) => {
+                self.form.populate(&config, &prefs);
+                *self.saved_values.borrow_mut() = FormValues::from_config(&config, &prefs);
                 *self.base.borrow_mut() = config;
                 self.refresh_credentials();
-                match stored {
-                    Ok(()) => self.flash("已保存 · 下一次截图生效", Flash::Success),
-                    // The API settings did land; only the tray preferences did
-                    // not. Saying "保存失败" would be wrong.
-                    Err(err) => self.flash(
-                        &format!("接口设置已保存，但输出偏好写入失败：{err}"),
-                        Flash::Error,
-                    ),
-                }
+                self.flash("已保存 · 下一次截图生效", Flash::Success);
             }
-            Err(err) => self.flash(&format!("保存失败：{err}"), Flash::Error),
+            Err(err) => self.flash(&format!("保存未全部完成：{err}"), Flash::Error),
         }
     }
 
@@ -1067,6 +1366,10 @@ impl Panel {
     }
 
     fn test_connection(self: &Rc<Self>) {
+        if self.demo {
+            self.set_probe_status("演示模式 · 未发送网络请求", Flash::Info);
+            return;
+        }
         if self.probing.get() {
             return;
         }
@@ -1099,6 +1402,15 @@ impl Panel {
     /// the two model pickers — this is the whole point of the button: the
     /// endpoint is the only authority on its own model names.
     fn fetch_models(&self) {
+        if self.demo {
+            self.show_models(&Ok(vec![
+                "Vellum / Vision Pro".into(),
+                "Vellum / Translate".into(),
+                "Vellum / Local Model".into(),
+            ]));
+            self.models_status.set_label("演示模型 · 未连接真实接口");
+            return;
+        }
         if self.probing.get() {
             return;
         }
@@ -1206,23 +1518,126 @@ impl Panel {
     }
 }
 
-/// A sidebar group caption: quiet and wide-tracked, labelling the pages below it
-/// without competing with them.
-fn nav_section(text: &str) -> Label {
-    let label = Label::builder().label(text).xalign(0.0).build();
-    label.add_css_class("vellum-nav-section");
-    label.set_margin_top(8);
-    label.set_margin_bottom(2);
-    label.set_margin_start(10);
-    label
+fn panel_size() -> (i32, i32) {
+    let geometry = gtk4::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0))
+        .and_then(|m| m.downcast::<gtk4::gdk::Monitor>().ok())
+        .map(|m| m.geometry());
+    geometry
+        .map(|g| {
+            (
+                (g.width() - 64).clamp(480, WIDTH),
+                (g.height() - 80).clamp(360, HEIGHT),
+            )
+        })
+        .unwrap_or((WIDTH, HEIGHT))
+}
+
+fn home_page(form: &FormWidgets) -> (ScrolledWindow, Vec<(Button, &'static str)>) {
+    let content = page_box();
+    content.set_spacing(10);
+    let mut launchers = Vec::new();
+    let mode_row = GtkBox::new(Orientation::Horizontal, 10);
+    let mode_label = Label::new(Some("截图方式"));
+    mode_label.add_css_class("vellum-general-label");
+    mode_label.set_xalign(0.0);
+    mode_row.append(&mode_label);
+    let modes = GtkBox::new(Orientation::Horizontal, 8);
+    modes.set_homogeneous(true);
+    modes.add_css_class("vellum-mode-grid");
+    modes.set_hexpand(true);
+    for (action, label) in [
+        ("region", "区域截图"),
+        ("long", "滚动长图"),
+        ("pin-last", "钉住图片"),
+        ("open-image", "查看图片"),
+    ] {
+        let column = GtkBox::new(Orientation::Vertical, 7);
+        let image = controls::line_icon(action, 23);
+        image.set_pixel_size(23);
+        column.append(&image);
+        column.append(&Label::new(Some(label)));
+        let button = Button::new();
+        button.set_child(Some(&column));
+        button.set_tooltip_text(Some(label));
+        modes.append(&button);
+        launchers.push((button, action));
+    }
+    mode_row.append(&modes);
+    content.append(&mode_row);
+    for (label, value, action, button_text) in [
+        (
+            "快捷键",
+            "系统授权 · 查看实际绑定",
+            "page.shortcuts",
+            "设置…",
+        ),
+        ("已保存目录", "使用已保存的默认位置", "open-folder", "打开…"),
+        ("图像格式", "PNG   无损保存", "", ""),
+        ("长图查看", "滚轮浏览   Ctrl + 滚轮缩放", "", ""),
+    ] {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        row.add_css_class("vellum-row");
+        let name = Label::new(Some(label));
+        name.add_css_class("vellum-general-label");
+        name.set_xalign(0.0);
+        row.append(&name);
+        let value = Label::new(Some(value));
+        value.add_css_class("vellum-general-value");
+        value.set_xalign(0.0);
+        value.set_hexpand(true);
+        value.set_ellipsize(EllipsizeMode::Middle);
+        if action == "open-folder" || action == "page.shortcuts" {
+            value.add_css_class("vellum-shortcut-key");
+        }
+        row.append(&value);
+        if !action.is_empty() {
+            let button = controls::secondary_button(button_text, None);
+            row.append(&button);
+            launchers.push((button, action));
+        }
+        content.append(&row);
+    }
+    let outputs = GtkBox::new(Orientation::Horizontal, 10);
+    outputs.add_css_class("vellum-row");
+    let label = Label::new(Some("截图后操作"));
+    label.add_css_class("vellum-general-label");
+    label.set_xalign(0.0);
+    outputs.append(&label);
+    outputs.append(&controls::linked_preference(
+        "保存到文件",
+        &form.save_switch,
+    ));
+    outputs.append(&controls::linked_preference(
+        "复制到剪贴板",
+        &form.copy_switch,
+    ));
+    outputs.append(&controls::linked_preference(
+        "完成后预览",
+        &form.always_preview,
+    ));
+    content.append(&outputs);
+    let divider = gtk4::Separator::new(Orientation::Horizontal);
+    divider.add_css_class("vellum-divider");
+    divider.set_margin_top(5);
+    content.append(&divider);
+    let note = Label::new(Some(
+        "长图完成后自动预览，滚轮即可浏览。\n遇到滚动过快或内容未接上时，会保留已捕获画面并提示。",
+    ));
+    note.add_css_class("vellum-caption");
+    note.set_xalign(0.0);
+    note.set_wrap(true);
+    note.set_margin_top(3);
+    content.append(&note);
+    (page(&content), launchers)
 }
 
 /// One page entry in the sidebar. The caller puts them in a group, so exactly
 /// one is ever checked.
 fn nav_item(label: &str, icon: &str) -> ToggleButton {
     let content = GtkBox::new(Orientation::Horizontal, 10);
-    let image = Image::from_icon_name(icon);
-    image.set_pixel_size(15);
+    let image = controls::line_icon(icon, 16);
+    image.set_pixel_size(16);
     content.append(&image);
     content.append(&Label::new(Some(label)));
     let button = ToggleButton::builder()
@@ -1242,12 +1657,12 @@ fn nav_item(label: &str, icon: &str) -> ToggleButton {
 fn page_box() -> GtkBox {
     let content = GtkBox::new(Orientation::Vertical, 10);
     content.add_css_class("vellum-page-content");
-    content.set_halign(Align::Center);
-    content.set_size_request(640, -1);
-    content.set_margin_top(8);
-    content.set_margin_bottom(16);
-    content.set_margin_start(20);
-    content.set_margin_end(20);
+    content.set_halign(Align::Fill);
+    content.set_hexpand(true);
+    content.set_margin_top(16);
+    content.set_margin_bottom(10);
+    content.set_margin_start(22);
+    content.set_margin_end(22);
     content
 }
 
@@ -1493,7 +1908,7 @@ fn text_page(form: &FormWidgets) -> ScrolledWindow {
 
 /// The capture switches used to live at the bottom of the OCR page; they are
 /// their own page now, so the sidebar entry matches what the page contains.
-fn capture_page(form: &FormWidgets) -> ScrolledWindow {
+fn capture_page(form: &FormWidgets) -> (ScrolledWindow, Button) {
     let content = page_box();
 
     let (capture_card, capture_body, _) =
@@ -1503,7 +1918,7 @@ fn capture_page(form: &FormWidgets) -> ScrolledWindow {
         &capture_rows,
         &controls::action_row(
             "截图后保存",
-            Some("关闭后区域截图与长截图都不再写入文件"),
+            Some("关闭后不自动保存到默认目录；异常恢复副本仍按安全规则保留"),
             &form.save_switch,
         ),
     );
@@ -1515,10 +1930,36 @@ fn capture_page(form: &FormWidgets) -> ScrolledWindow {
             &form.copy_switch,
         ),
     );
+    controls::push_row(
+        &capture_rows,
+        &controls::action_row(
+            "区域截图后始终预览",
+            Some("长图始终预览；也可用 Ctrl+Enter 临时查看当前截图"),
+            &form.always_preview,
+        ),
+    );
     capture_body.append(&capture_rows);
     content.append(&capture_card);
-
-    page(&content)
+    let (output_card, output_body, _) = controls::card(
+        "保存位置与命名",
+        Some("区域截图、长图与钉图共用；另存为仅影响本次"),
+    );
+    let directory = GtkBox::new(Orientation::Horizontal, 8);
+    directory.append(&form.output_dir);
+    let choose = controls::secondary_button("选择…", None);
+    directory.append(&choose);
+    output_body.append(&controls::action_row_stacked(
+        "默认保存目录",
+        Some("留空使用原默认目录"),
+        &directory,
+    ));
+    output_body.append(&controls::action_row_stacked(
+        "文件名模板",
+        Some("{kind} 类型 · {date} 日期 · {time} 时间；自动附加微秒和 .png"),
+        &form.filename_template,
+    ));
+    content.append(&output_card);
+    (page(&content), choose)
 }
 
 /// Opens the settings panel and runs until the window is closed.
@@ -1542,6 +1983,10 @@ fn run(app: &Application) -> i32 {
     let empty: [String; 0] = [];
     i32::from(app.run_with_args(&empty).get())
 }
+
+#[cfg(test)]
+#[path = "panel_live_test.rs"]
+mod live_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1612,6 +2057,7 @@ mod tests {
             let prefs = Preferences {
                 save: false,
                 copy: true,
+                ..Preferences::default()
             };
 
             let form = FormWidgets::build();
@@ -1657,6 +2103,9 @@ mod tests {
         let prefs = Preferences {
             save: false,
             copy: true,
+            output_dir: "/tmp/panel-output-fixture".into(),
+            filename_template: "review-{kind}-{date}".into(),
+            always_preview: true,
         };
         let form = FormValues::from_config(&cfg, &prefs);
         assert_eq!(form.to_config(&Config::default()), cfg);

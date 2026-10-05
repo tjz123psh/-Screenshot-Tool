@@ -16,6 +16,12 @@ use serde::Deserialize;
 
 use crate::paths;
 
+#[path = "settings_lock.rs"]
+pub(crate) mod settings_lock;
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;
+
 pub const DEFAULT_MAX_DIFF: f32 = 9.0;
 pub const DEFAULT_MIN_SHIFT_PX: u32 = 4;
 
@@ -649,24 +655,72 @@ max_diff = {max_diff}
     }
 
     pub fn save_to(&self, path: &Path) -> io::Result<()> {
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "config path has no parent")
-        })?;
-        std::fs::create_dir_all(parent)?;
-        restrict(parent, 0o700);
-        let temporary = parent.join(".config.toml.tmp");
-        std::fs::write(&temporary, self.to_toml_string())?;
-        restrict(&temporary, 0o600);
-        std::fs::rename(&temporary, path)?;
-        Ok(())
+        let _lock = settings_lock::Lock::acquire(path)?;
+        if let Some(text) = settings_lock::read_optional(path)? {
+            Self::parse_for_write(&text)?;
+        }
+        settings_lock::atomic_write(path, self.to_toml_string().as_bytes())
     }
-}
 
-/// Best-effort permission tightening; a filesystem without POSIX modes must not
-/// make saving fail.
-fn restrict(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    /// Merge only edited leaf fields; reject conflicting edits without exposing values.
+    pub fn merge(base: &Self, edited: &Self, latest: &Self) -> io::Result<Self> {
+        let parse =
+            |c: &Self| toml::from_str::<toml::Value>(&c.to_toml_string()).expect("rendered config");
+        let base = parse(base);
+        let edited = parse(edited);
+        let mut latest = parse(latest);
+        for (section, fields) in edited.as_table().expect("config table") {
+            for (field, value) in fields.as_table().expect("section table") {
+                latest[section][field] = settings_lock::merge(
+                    &base[section][field],
+                    value,
+                    &latest[section][field],
+                    &format!("{section}.{field}"),
+                )?;
+            }
+        }
+        Ok(Self::from_toml_str(
+            &toml::to_string(&latest).expect("merged config"),
+        ))
+    }
+
+    /// Writes must not interpret a damaged document as defaults. Keep ordinary
+    /// screenshot loads lenient, but do not disclose parser errors (which quote keys).
+    fn parse_for_write(text: &str) -> io::Result<Self> {
+        toml::from_str::<RawConfig>(text).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "设置文件格式损坏，未覆盖原文件")
+        })?;
+        Ok(Self::from_toml_str(text))
+    }
+
+    /// Both conflicts are checked before writing; a second-file failure is explicit.
+    pub fn save_settings(
+        &self,
+        base: &Self,
+        base_prefs: &crate::prefs::Preferences,
+        edited_prefs: &crate::prefs::Preferences,
+    ) -> io::Result<(Self, crate::prefs::Preferences)> {
+        let path = paths::config_path();
+        let _lock = settings_lock::Lock::acquire(&path)?;
+        let latest = match settings_lock::read_optional(&path)? {
+            Some(text) => Self::parse_for_write(&text)?,
+            None => match settings_lock::read_optional(&paths::legacy_config_path())? {
+                Some(text) => Self::parse_for_write(&text)?,
+                None => Self::default(),
+            },
+        };
+        let merged = Self::merge(base, self, &latest)?;
+        let prefs = crate::prefs::merge(base_prefs, edited_prefs, &crate::prefs::load_checked()?)?;
+        prefs.validate()?;
+        settings_lock::atomic_write(&path, merged.to_toml_string().as_bytes())?;
+        crate::prefs::store_unlocked(&prefs).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("接口设置已保存，但输出偏好保存未全部完成：{e}"),
+            )
+        })?;
+        Ok((merged, prefs))
+    }
 }
 
 #[cfg(test)]
@@ -900,9 +954,42 @@ mod tests {
         // HTTPS_PROXY must not fail this test.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let saved = std::env::var("HTTPS_PROXY").ok();
-        // SAFETY: the lock above serialises the only test that writes this
-        // variable.
+        // The resolver checks all six standard names. Clearing only HTTPS_PROXY
+        // made the final "no proxy" assertion depend on the host's ALL_PROXY.
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.0 {
+                    // SAFETY: the test holds ENV_LOCK until this guard is dropped.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(name, value),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        let names = [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ];
+        let _restore = Restore(
+            names
+                .iter()
+                .map(|name| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        for name in names {
+            // SAFETY: same test-local serialized environment scope as below.
+            unsafe { std::env::remove_var(name) };
+        }
+        // SAFETY: the lock above serialises the only test that writes these
+        // variables; Restore also restores them on assertion failure.
         unsafe { std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:9999") };
         let api = ApiConfig {
             proxy: "http://127.0.0.1:7890".into(),
@@ -939,9 +1026,7 @@ mod tests {
         assert_eq!(Config::default().api.resolve_proxy(), None);
         assert_eq!(Config::default().api.proxy_source(), None);
 
-        if let Some(value) = saved {
-            unsafe { std::env::set_var("HTTPS_PROXY", value) };
-        }
+        // _restore reinstates every inherited proxy variable without logging it.
     }
 
     #[test]

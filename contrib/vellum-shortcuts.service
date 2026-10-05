@@ -1,0 +1,15 @@
+[Unit]
+Description=Vellum global keyboard shortcuts
+PartOf=graphical-session.target
+After=graphical-session.target xdg-desktop-portal.service
+
+[Service]
+Type=dbus
+BusName=ai.vellum.Shortcuts
+ExecStart=@VELLUM_LAUNCHER@ shortcuts run
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=3
+
+[Install]
+WantedBy=graphical-session.target

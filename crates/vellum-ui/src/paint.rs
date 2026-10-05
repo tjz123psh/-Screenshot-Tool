@@ -71,20 +71,20 @@ pub fn stroke_rounded(
     let _ = cr.stroke();
 }
 
-// --- Deep Obsidian Crystal material -----------------------------------------
+// --- Smoked graphite and softly lit metal -----------------------------------
 // The slab recipe is shared by the toolbar, the size chip, the popups and the
 // hint rails, so it lives here rather than in any one of them. Cairo RGBA,
 // 0.0..1.0.
 
-/// Slab body: aurora obsidian at the top, night-sediment at the base.
-pub const SLAB_TOP: Stop = Stop(0.0, 0.063, 0.078, 0.110, 0.97);
-pub const SLAB_BOTTOM: Stop = Stop(1.0, 0.043, 0.051, 0.075, 0.98);
-/// Specular edge: lit top facet, cold blue rim, dark inner base.
-pub const EDGE_TOP: Stop = Stop(0.0, 1.0, 1.0, 1.0, 0.22);
-pub const EDGE_MID: Stop = Stop(0.35, 0.65, 0.75, 0.95, 0.08);
-pub const EDGE_BASE: Stop = Stop(1.0, 0.0, 0.0, 0.0, 0.45);
+/// Neutral graphite body; no olive tint over white or saturated content.
+pub const SLAB_TOP: Stop = Stop(0.0, 0.18, 0.19, 0.20, 0.98);
+pub const SLAB_BOTTOM: Stop = Stop(1.0, 0.145, 0.153, 0.16, 0.98);
+/// Quiet hairline: no bevel or bright metallic perimeter.
+pub const EDGE_TOP: Stop = Stop(0.0, 1.0, 1.0, 1.0, 0.13);
+pub const EDGE_MID: Stop = Stop(0.35, 1.0, 1.0, 1.0, 0.075);
+pub const EDGE_BASE: Stop = Stop(1.0, 0.0, 0.0, 0.0, 0.22);
 /// Tight contact shadow, offset 2 px, reads as the slab resting on the desktop.
-pub const SHADOW_CONTACT: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.32);
+pub const SHADOW_CONTACT: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.13);
 /// Second shadow pass, offset further down than the contact one so the two
 /// overlapping shapes read as a soft falloff rather than one hard edge.
 ///
@@ -93,16 +93,12 @@ pub const SHADOW_CONTACT: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.32);
 /// visible below it, and this layer exists to thicken that fringe into a
 /// gradient. A real blur would need a mask or a gaussian and would change
 /// nothing the user can see.
-pub const SHADOW_AMBIENT: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.18);
+pub const SHADOW_AMBIENT: (f64, f64, f64, f64) = (0.0, 0.0, 0.0, 0.06);
 
-/// Paints the full crystal slab: both diffuse shadows, the gradient body, then
-/// the specular edge, in that order.
-///
-/// Order matters. The shadows go down first so the body stays genuinely
-/// translucent over the dimmed desktop, and the edge goes last so the lit top
-/// facet is not covered by the body fill. Layer-shell surfaces get no compositor
-/// shadow, so this is the only depth the slab has.
-pub fn crystal_slab(cr: &Context, b: Bounds, radius: f64) {
+/// Paints a low-contrast graphite panel with a quiet single rim. Layer-shell
+/// surfaces get no compositor shadow; the faint contact shadow supplies depth
+/// without the thick lower edge or double bevel of the former material.
+pub fn soft_panel(cr: &Context, b: Bounds, radius: f64) {
     fill_rounded(
         cr,
         Bounds::new(b.x, b.y + 2.0, b.w, b.h),
@@ -111,7 +107,7 @@ pub fn crystal_slab(cr: &Context, b: Bounds, radius: f64) {
     );
     fill_rounded(
         cr,
-        Bounds::new(b.x, b.y + 5.0, b.w, b.h + 1.0),
+        Bounds::new(b.x, b.y + 4.0, b.w, b.h),
         radius,
         SHADOW_AMBIENT,
     );

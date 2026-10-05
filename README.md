@@ -7,11 +7,12 @@
 ## 功能
 
 - 区域截图：拖拽框选、移动、缩放选区，保存并复制到剪贴板。
-- 标注：画笔、箭头、矩形、椭圆、文字、马赛克、模糊、取色、颜色、大小、撤销和重做。其中马赛克与模糊是**打码**工具，会读取原始截图而不是已标注的合成结果——被盖住的内容不能从结果里还原。**取色**（`i`）点一下即取该像素的颜色：色值以 `#RRGGBB` 进剪贴板，同时成为当前标注颜色，反馈就是「颜色」按钮上的色块当场变色；它同样取原始截图的像素，所以已经被画过的地方取到的仍是屏幕原来的颜色。
+- 标注：紧凑工具行与按需属性条；画笔、箭头、矩形、椭圆、文字、实色遮挡、马赛克、模糊、取色、颜色、大小、撤销和重做。**实色遮挡（H）**用置顶纯黑矩形覆盖像素，适合遮住敏感内容；仍需核对覆盖范围。其中马赛克与模糊读取原始截图而不是已标注的合成结果，但只提供**视觉弱化，不保证敏感内容无法辨认或推测**，不能代替不透明实色遮挡。**取色**（`i`）点一下即取该像素的颜色：色值以 `#RRGGBB` 进剪贴板，同时成为当前标注颜色，反馈就是「颜色」按钮上的色块当场变色；它同样取原始截图的像素，所以已经被画过的地方取到的仍是屏幕原来的颜色。
 - 长截图：用户手动滚动，vellum 用持久 Wayland screencopy 连续抓帧并自动拼接；支持完整画布重定位、固定页眉/页脚、局部动画、半透明背景和安全回退。
 - OCR：两种引擎二选一——**内置本地 Tesseract**（离线、简体中文+英文，会针对彩色干扰、等亮异色文字、暗淡字色、低对比度和明暗渐变自动选择预处理候选）或 **API 视觉模型**。
 - 翻译：只走 OpenAI 兼容的模型 API（OpenAI、DeepSeek、OpenRouter、Ollama、vLLM…），支持模型轮换。
-- 设置面板：托盘菜单「设置面板」或 `vellum panel` 打开，配置接口地址、密钥、模型、OCR 引擎与截图后保存/复制；深色界面，鼠标拖动标题栏即可移动。
+- 设置面板：托盘主点击、菜单「打开工作台」或 `vellum panel` 打开。按参考图整理为烟灰底、暖金细节、紧凑模式按钮和对齐设置行；包括全局快捷键授权入口，配置只在保存后写入。
+- 图片查看器：长截图完成后自动打开独立深色查看窗口，默认适应宽度并从顶部展示；滚轮浏览、缩放、全文导航、复制、另存为和钉图，不占用下一次截图。
 - 结果窗口：OCR / 翻译结果自带标题栏，可拖动、可编辑、可复制或再次翻译。
 - 钉图：无边框浮动窗口，支持移动、缩放、复制和保存。
 - 系统托盘：传统 StatusNotifierItem + dbusmenu，兼容 niri/QuickShell 等托盘宿主。
@@ -25,6 +26,14 @@
 | `vellumctl` | 快捷键使用的轻量客户端 |
 | `vellum-ui` | overlay、标注、长截图、钉图、结果窗口和设置面板 |
 | `vellum-tray` | D-Bus 系统托盘 |
+
+## 界面预览
+
+![Vellum 工作台 · 800×560](<docs/screenshots/compact-workbench.png>)
+
+[长图查看器](<docs/screenshots/preview.png>) · [快捷键设置](<docs/screenshots/native-shortcuts.png>) · [紧凑截图与标注工具栏](<docs/screenshots/compact-toolbars.png>) · [品牌图标](<contrib/icons/ai.vellum.svg>) · [功能完整性与最新界面验收](<docs/COMPACT_UI_AND_FEATURE_AUDIT.md>) · [长截图可靠性复查](<docs/REFINEMENT_REVIEW.md>) · [第一批可靠性修复](<docs/RELIABILITY_PHASE1.md>)
+
+设置窗口现在会自动探测标准 `ext-background-effect-v1`：支持的桌面直接由合成器模糊背景，无需手改窗口规则；不支持时保留更深的透明底。图片和录制区域仍不透明。已完成[真实高速采集与模糊量化验证](<docs/NATIVE_CAPTURE_AND_BLUR.md>)。
 
 ## 仓库结构
 
@@ -80,9 +89,9 @@ cd vellum
 1. 检查 Arch 依赖，只在缺包时请求安装；
 2. 执行 `cargo build --release`；
 3. 将四个二进制安装到 `~/.local/bin`；
-4. 尝试安全配置 niri/经典 Hyprland 快捷键；Hyprland Lua 配置只输出片段，不自动修改；
+4. 安装应用管理的标准全局快捷键服务；默认不修改 niri/Hyprland 配置；
 5. 安装用户级 systemd 服务、desktop 文件和图标；
-6. 启动 `vellum.service` 与 `vellum-tray.service`，最后运行诊断。
+6. 启动截图、托盘和全局快捷键用户服务，最后运行诊断；首次快捷键授权在应用内完成。
 
 不希望安装脚本处理系统包或快捷键时：
 
@@ -113,17 +122,22 @@ VELLUM_BIN_DIR="$HOME/bin" ./install.sh
 vellum region             # 区域截图
 vellum long               # 开始/完成长截图
 vellum pin-last           # 钉住剪贴板中的图片
-vellum panel              # 打开设置面板（模型接口、翻译、OCR）
+vellum panel              # 打开工作台与偏好设置
+vellum preview image.png  # 打开图片/长图查看器
+vellum recover list       # 列出交接失败后保留的恢复图片
+vellum recover open ID    # 按编号重新打开，仍保留恢复副本
+vellum recover discard ID # 明确删除指定恢复副本，不删除另存的图片
 vellum status             # 查看控制服务状态
 vellum doctor             # 完整环境诊断
-vellum shortcuts          # 查看检测到的快捷键
-vellum shortcuts install  # 安装默认快捷键（安全时才写入）
-vellum shortcuts remove   # 移除 vellum 管理的快捷键块
+vellum shortcuts          # 查看应用全局快捷键的实际状态
+vellum shortcuts enable   # 启用并申请系统授权
+vellum shortcuts disable  # 停用应用绑定，不动旧桌面配置
+vellum shortcuts configure # 打开系统快捷键配置（需要接口版本2）
 vellum restart            # 重启控制服务
 vellum logs               # 查看服务日志
 ```
 
-默认快捷键：
+建议组合键（实际以系统授权返回为准）：
 
 | 快捷键 | 动作 |
 | --- | --- |
@@ -131,7 +145,9 @@ vellum logs               # 查看服务日志
 | `Mod+Shift+Print` | 开始或完成长截图 |
 | `Mod+Ctrl+Print` | 钉住剪贴板图片 |
 
-快捷键由合成器注册，vellum 本身不监听全局键盘。安装器检测到冲突时不会写入一半配置；niri 修改前会备份并在写入后验证，失败则回滚。示例文件在 `contrib/`：
+Vellum 通过 XDG GlobalShortcuts 注册并处理全局按键，首次在应用“快捷键”页启用，系统可能要求授权。应用显示系统实际绑定的组合键，不把建议值当作已生效。**桌面后端必须支持此接口；仅能枚举接口不等于能成功绑定。** 本机 niri + GNOME portal 的真实绑定被拒绝，详见[兼容性与高速滚动记录](<docs/SHORTCUTS_AND_SPEED.md>)。
+
+旧配置不会自动删除。`vellum shortcuts legacy-list` 只读检查旧绑定；`install` / `remove` 子命令仅保留为显式传统兼容入口。安装器只有在明确设置 `VELLUM_ENABLE_LEGACY_SHORTCUTS=1` 时才尝试写旧配置。兼容示例在 `contrib/`：
 
 - `niri-vellum.kdl`
 - `hyprland-vellum.conf`
@@ -141,10 +157,11 @@ vellum logs               # 查看服务日志
 
 Wayland 普通应用无法安全合成全局滚轮事件，所以 vellum 不做自动滚动：
 
-1. 执行 `vellum long` 或按 `Mod+Shift+Print`；
+1. 执行 `vellum long`、点击工作台「滚动长图」，或使用已授权/配置的长截图快捷键；
 2. 框选目标区域；选择 overlay 会提前说明控制条会按选区外空间缩小，必要时隐藏；
 3. 手动垂直滚动目标窗口；
 4. 再次执行同一动作完成，或在控制面板聚焦时按 Enter；Esc 取消。
+5. 完成后按原有偏好保存/复制，并自动打开独立图片查看器。普通滚轮上下浏览，Ctrl+滚轮缩放，Shift+滚轮横移；`+`/`-` 缩放、`1` 原始大小、`Ctrl+0` 适应宽度，`Home`/`End` 与 `PageUp`/`PageDown` 导航。右侧全文概览可点击、拖动定位；复制和另存为始终输出完整图片，而非屏幕上可见的一部分。关闭查看器前可继续发起下一次截图。
 
 控制面板按选区外空间依次降级为完整面板、无预览 compact 面板、横向/纵向微型控制条；微型条仍保留采集状态、累计高度、取消和完成。只有连微型条都无法安全放置时才完全隐藏；正常由控制服务管理时再次按同一长截图快捷键仍可完成，direct 降级则会在采样前要求缩小选区。采样期间请保持选区和窗口尺寸不变。vellum 会处理短暂停顿、往返滚动、周期重复的列表页、突然跳回已捕获内容、固定页眉/页脚、局部动画和半透明窗口；控制面板与选区高亮不会进入结果图。长截图优先复用一条可中断的 `wlr-screencopy` 连接；协议不可用、选区跨输出或运行时失败时自动切到有 2 秒 deadline 的 `grim`，不会无限显示“采集中”却没有新帧。
 
@@ -174,12 +191,13 @@ VELLUM_LONGSHOT_TRACE=1 vellum long
 
 ### 设置面板
 
-托盘右键菜单里选「设置面板」，或者执行 `vellum panel`（桌面环境里也有「vellum Settings」入口）。面板分两页，`Ctrl+1` / `Ctrl+2` 切换，`Ctrl+S` 保存，`Esc` 关闭：
+托盘主点击或右键菜单选「打开工作台」，也可以执行 `vellum panel`。默认展示工作台，提供区域截图、长截图和钉图入口；设置分为截图输出、识别翻译、模型接口三个页面。`Ctrl+0` 返回工作台，保留 `Ctrl+1` 模型接口、`Ctrl+2` 识别翻译、`Ctrl+3` 截图输出；`Ctrl+S` 保存、`Esc` 关闭。从工作台开始截图前会先关闭窗口，有未保存更改时先询问，避免工作台入镜或默默丢失设置。
 
 - **模型接入**
   - 接口：根地址（`base_url`）、密钥、密钥所在的环境变量名、单次请求超时、HTTP 代理；「测试连接」会请求 `/models` 验证地址与密钥。密钥优先取这里填的值，其次取指定的环境变量，最后回退 `VELLUM_API_KEY` / `OPENAI_API_KEY`；本机地址（如 Ollama）可以完全不填密钥。
   - 模型：点「获取模型」从接口读回真实模型名，填进「翻译模型」和「OCR 视觉模型」两个选择器。选择器**既能点选也能手写**：右侧按钮展开可搜索的列表，点一行即填入；手写的名字如果不在获取到的列表里，面板会立刻标红提示（这是最常见的一类 404 来源）。
-- **翻译与 OCR**：目标语言、备用模型；OCR 引擎二选一（内置 Tesseract / API 视觉模型）、Tesseract 语言包、图像预处理、放大倍数、视觉模型超时；以及「截图后保存 / 复制」开关。两页内容较长时上下滚动即可。
+- **识别与翻译**：目标语言、备用模型；OCR 引擎二选一（内置 Tesseract / API 视觉模型）、Tesseract 语言包、图像预处理、放大倍数、视觉模型超时。
+- **截图与输出**：「截图后保存 / 复制」开关。较长页面可上下滚动，底部保存操作固定可达。
 
 代理那一项：接口在墙外（OpenAI、Google）时必须填，例如 `http://127.0.0.1:7890`；留空则依次读 `HTTPS_PROXY` / `ALL_PROXY` / `HTTP_PROXY`，填 `none` 表示强制直连。注意 systemd 启动的服务看不到你 shell 里 export 的变量，所以写进配置文件（面板）比依赖环境变量可靠。
 
@@ -240,7 +258,7 @@ bash tests/install-systemd-unreachable.sh
 python3 tools/ocr-regression.py
 ```
 
-当前实现包含 7 个 workspace crate、4 个安装二进制和 300 余项 Rust 测试（351 通过 + 2 项需 Wayland 真机显式运行）。101 帧、900×700 的长截图基准为 0.13~0.15 秒，Unix socket 的 ping/status 往返 p50 为 0.037~0.056 毫秒（2026-09-18 复测 6 次，见 [`PERFORMANCE.md`](PERFORMANCE.md)）。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
+当前实现包含 7 个 workspace crate、4 个安装二进制。产品化改版后全工作区 release 测试为 **505 通过、11 项默认忽略**（需显式图形场景/评审输出）。101 帧、900×700 的长截图基准为 0.13~0.15 秒，Unix socket 的 ping/status 往返 p50 为 0.037~0.056 毫秒（2026-09-18 复测 6 次，见 [`PERFORMANCE.md`](PERFORMANCE.md)）。架构和取舍见 [`DESIGN.md`](DESIGN.md)。
 
 ## 架构文档
 

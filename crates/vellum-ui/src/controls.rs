@@ -83,10 +83,10 @@ pub fn card(title: &str, subtitle: Option<&str>) -> (GtkBox, GtkBox, GtkBox) {
     card.add_css_class("vellum-section-card");
 
     let body = GtkBox::new(Orientation::Vertical, 10);
-    body.set_margin_top(14);
-    body.set_margin_bottom(15);
-    body.set_margin_start(16);
-    body.set_margin_end(16);
+    body.set_margin_top(6);
+    body.set_margin_bottom(8);
+    body.set_margin_start(4);
+    body.set_margin_end(4);
 
     let head = GtkBox::new(Orientation::Horizontal, 10);
     let titles = GtkBox::new(Orientation::Vertical, 3);
@@ -260,6 +260,77 @@ pub fn stepper(spin: &SpinButton, unit: &str) -> GtkBox {
     row
 }
 
+/// Embedded brand artwork also works in an uninstalled build tree.
+pub fn brand_mark(size: i32) -> Image {
+    let bytes =
+        gtk4::glib::Bytes::from_static(include_bytes!("../../../contrib/icons/ai.vellum.svg"));
+    let image = Image::from_gicon(&gtk4::gio::BytesIcon::new(&bytes));
+    image.set_pixel_size(size);
+    image
+}
+
+/// A single fine-line family: no dependency on the user's mixed icon theme.
+pub fn line_icon(action: &str, size: i32) -> Image {
+    let path = match action {
+        "region" => {
+            r#"<path d="M3 8V3h5m8 0h5v5m0 8v5h-5M8 21H3v-5"/><path stroke-dasharray="1.5 3" d="M8 3h8m5 5v8m-5 5H8m-5-5V8"/>"#
+        }
+        "long" => {
+            r#"<rect x="6" y="2.5" width="12" height="19" rx="2"/><path d="M9 7h6m-6 4h6m-6 4h6m-3 3v2m-2-2 2 2 2-2"/>"#
+        }
+        "pin-last" => r#"<path d="M8 3h8m-7 0v5l-3 4v2h12v-2l-3-4V3m-3 11v7"/>"#,
+        "open-image" => {
+            r#"<rect x="2.5" y="4" width="19" height="16" rx="1.5"/><path d="m3 16 5-5 4 4 4-6 5 6"/><circle cx="8" cy="8" r="1"/>"#
+        }
+        "preferences-system-symbolic" => {
+            r#"<path d="M10 3h4l.6 2.4 2 .9 2.2-.7 2 3.5-1.7 1.7v2.3l1.7 1.7-2 3.5-2.2-.7-2 .9L14 21h-4l-.6-2.4-2-.9-2.2.7-2-3.5 1.7-1.7v-2.3L3.2 9.2l2-3.5 2.2.7 2-.9z"/><circle cx="12" cy="12" r="3"/>"#
+        }
+        "preferences-desktop-keyboard-shortcuts-symbolic" => {
+            r#"<rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h1m3 0h1m3 0h1m3 0h1M6 12h1m3 0h1m3 0h1m3 0h1M7 16h10"/>"#
+        }
+        "camera-photo-symbolic" => r#"<path d="M3 7V5h6l2 2h10v13H3zM3 10h18"/>"#,
+        "accessories-dictionary-symbolic" => {
+            r#"<path d="M12 6c-3-2-6-2-9-1v14c3-1 6-1 9 1 3-2 6-2 9-1V5c-3-1-6-1-9 1v14"/>"#
+        }
+        "network-server-symbolic" => {
+            r#"<rect x="4" y="3" width="16" height="6" rx="1.5"/><rect x="4" y="11" width="16" height="6" rx="1.5"/><path d="M7 6h.1M7 14h.1M12 17v4m-5 0h10"/>"#
+        }
+        _ => return Image::from_icon_name("image-x-generic-symbolic"),
+    };
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="#d0c4ab" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">{path}</g></svg>"##
+    );
+    // Keep the SVG as an icon, not a 24px raster texture. GTK renders it at the
+    // actual output scale, including when this window moves between monitors.
+    let bytes = gtk4::glib::Bytes::from_owned(svg.into_bytes());
+    let image = Image::from_gicon(&gtk4::gio::BytesIcon::new(&bytes));
+    image.set_pixel_size(size);
+    image
+}
+
+/// Mirror a preference in another page without duplicating its value or ownership.
+pub fn linked_preference(label: &str, original: &gtk4::Switch) -> gtk4::CheckButton {
+    let check = gtk4::CheckButton::with_label(label);
+    check.set_active(original.is_active());
+    let weak = original.downgrade();
+    check.connect_toggled(move |check| {
+        if let Some(original) = weak.upgrade()
+            && original.is_active() != check.is_active()
+        {
+            original.set_active(check.is_active());
+        }
+    });
+    let weak = check.downgrade();
+    original.connect_active_notify(move |original| {
+        if let Some(check) = weak.upgrade()
+            && check.is_active() != original.is_active()
+        {
+            check.set_active(original.is_active());
+        }
+    });
+    check
+}
+
 /// A secondary action: translucent fill, hairline border, gentle hover.
 pub fn secondary_button(label: &str, icon: Option<&str>) -> Button {
     let button = Button::builder().tooltip_text(label).build();
@@ -340,4 +411,31 @@ pub fn segmented(children: &[&impl IsA<gtk4::Widget>]) -> GtkBox {
         segmented.append(*child);
     }
     segmented
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::*;
+    #[test]
+    fn linked_preference_tracks_both_pages_without_owning_the_other() {
+        let ran = crate::test_support::with_gtk(|| {
+            let original = gtk4::Switch::builder().active(true).build();
+            let linked = linked_preference("保存", &original);
+            assert!(linked.is_active());
+            original.set_active(false);
+            assert!(!linked.is_active());
+            linked.set_active(true);
+            assert!(original.is_active());
+            let weak = linked.downgrade();
+            drop(linked);
+            assert!(
+                weak.upgrade().is_none(),
+                "the hidden page must not retain the mirror"
+            );
+            original.set_active(false);
+        });
+        if !ran {
+            eprintln!("GTK unavailable: preference mirror not exercised");
+        }
+    }
 }

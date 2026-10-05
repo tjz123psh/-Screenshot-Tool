@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use vellum_core::image::Rgb8;
+use vellum_core::image_limits::{CAPTURE_FRAME_LIMITS, CAPTURE_LIMITS, ImageLimits};
 
 use crate::canvas::{Canvas, Side};
 use crate::fixed_regions::FixedRegionDetector;
@@ -32,6 +33,11 @@ use crate::signature::{
 };
 
 /// How many recently accepted frames stay available for re-matching.
+pub const INCOMPLETE_WARNING: &str =
+    "部分画面未能可靠拼接，结果可能缺少末尾内容。请检查长图，并放慢速度重新截取。";
+
+pub const RESOURCE_LIMIT_WARNING: &str =
+    "长截图已达到安全资源上限，已停止追加并保留已可靠拼接的内容；请分段截取剩余区域。";
 const HISTORY_LEN: usize = 6;
 /// A full-canvas miss first ranks every position with this small deterministic
 /// fingerprint, then pays viewport-height scoring for only the best candidates.
@@ -130,6 +136,8 @@ pub struct Stitcher {
     pub min_shift_px: u32,
 
     canvas: Canvas,
+    limits: ImageLimits,
+    resource_limited: bool,
     last_cols: Option<Arc<Cols>>,
     last_pixels: Option<Arc<Sparse>>,
     last_signature: Option<Arc<Vec<u8>>>,
@@ -180,10 +188,29 @@ impl Stitcher {
         preview: bool,
         keyframe_memory_limit: usize,
     ) -> Self {
+        Self::with_resource_limits(
+            max_diff,
+            min_shift_px,
+            preview,
+            keyframe_memory_limit,
+            CAPTURE_LIMITS,
+        )
+    }
+
+    pub fn with_resource_limits(
+        max_diff: f32,
+        min_shift_px: u32,
+        preview: bool,
+        keyframe_memory_limit: usize,
+        limits: ImageLimits,
+    ) -> Self {
+        let keyframe_memory_limit = keyframe_memory_limit.min(KEYFRAME_MEMORY_LIMIT);
         Self {
             max_diff,
             min_shift_px,
-            canvas: Canvas::new(preview),
+            canvas: Canvas::with_limits(preview, limits),
+            limits,
+            resource_limited: false,
             last_cols: None,
             last_pixels: None,
             last_signature: None,
@@ -210,6 +237,23 @@ impl Stitcher {
         }
     }
 
+    pub fn resource_limited(&self) -> bool {
+        self.resource_limited
+    }
+
+    /// Sticky stop: later queued frames cannot silently resume a truncated shot.
+    pub fn stop_at_resource_limit(&mut self) {
+        if !self.resource_limited {
+            self.warnings.push(RESOURCE_LIMIT_WARNING.to_string());
+        }
+        self.resource_limited = true;
+        self.last_decision = Some(StitchDecision::Rejected);
+        self.last_added = 0;
+        self.last_shift = 0;
+        self.last_diff = f32::INFINITY;
+        self.disable_offline_rebuild();
+    }
+
     pub fn current_height(&self) -> usize {
         self.canvas.height()
     }
@@ -225,7 +269,22 @@ impl Stitcher {
     /// Add a frame. Returns the overlap diff (LOWER is better; 0.0 for the
     /// first frame). A value above `max_diff` means the frame was not appended.
     pub fn add(&mut self, frame: &Rgb8) -> f32 {
-        self.sequence += 1;
+        let frame_bytes = CAPTURE_FRAME_LIMITS.check(frame.width, frame.height, 3);
+        let fitted_width = if self.canvas.is_empty() {
+            frame.width
+        } else {
+            self.canvas.width()
+        };
+        if self.resource_limited
+            || frame_bytes != Ok(frame.data.len())
+            || CAPTURE_FRAME_LIMITS
+                .check(fitted_width, frame.height, 3)
+                .is_err()
+        {
+            self.stop_at_resource_limit();
+            return f32::INFINITY;
+        }
+        self.sequence = self.sequence.saturating_add(1);
 
         if self.canvas.is_empty() {
             return self.seed(frame);
@@ -274,28 +333,22 @@ impl Stitcher {
             let predict = if index == 0 { self.last_offset } else { 0 };
             let tracked_match_cols = matching_cols(&tracked.cols, &tracked.pixels, columns);
 
-            let (mut shift, mut diff) = self.find_shift_for(
-                &tracked_match_cols,
-                &current_match_cols,
+            let matched = find_match(
+                (&tracked_match_cols, &tracked.pixels),
+                (&current_match_cols, &pixels),
                 predict,
-                false,
-                rows,
+                self.max_diff,
+                &Mask { rows, columns },
             );
-            let mut robust = false;
-            if diff > self.max_diff {
-                let (robust_shift, robust_diff) = self.find_shift_for(
-                    &tracked_match_cols,
-                    &current_match_cols,
-                    predict,
-                    true,
-                    rows,
-                );
-                if robust_diff < diff {
-                    shift = robust_shift;
-                    diff = robust_diff;
-                    robust = robust_diff <= self.max_diff;
-                }
-            }
+            let ScoredShift {
+                shift,
+                diff,
+                robust,
+                changed,
+                aligned,
+                false_motion,
+                ..
+            } = matched;
 
             // With a single history entry there is nothing else to consult, so
             // record the failure and stop instead of paying for pixel checks.
@@ -313,21 +366,6 @@ impl Stitcher {
                 });
                 continue;
             }
-
-            let mask = Mask { rows, columns };
-            let changed = pixel_change_fraction(&tracked.pixels, &pixels, &mask);
-            let (aligned, stationary) = if robust {
-                (
-                    robust_pixel_overlap_diff(&tracked.pixels, &pixels, shift, &mask),
-                    robust_pixel_overlap_diff(&tracked.pixels, &pixels, 0, &mask),
-                )
-            } else {
-                (
-                    pixel_overlap_diff(&tracked.pixels, &pixels, shift, &mask),
-                    pixel_overlap_diff(&tracked.pixels, &pixels, 0, &mask),
-                )
-            };
-            let false_motion = is_false_motion(aligned, stationary, changed, robust);
 
             let candidate_position = tracked.position + i64::from(shift);
             let candidate_motion = candidate_position - self.anchor_pos;
@@ -480,6 +518,7 @@ impl Stitcher {
             if motion.unsigned_abs() >= self.min_shift_px && changed >= MIN_CHANGED_FRACTION {
                 self.observe_fixed_regions(&pixels);
             }
+            self.note_failure(arr, &cols, &pixels, &sig);
             self.last_shift = 0;
             self.last_diff = diff;
             self.last_decision = Some(StitchDecision::Rejected);
@@ -491,7 +530,10 @@ impl Stitcher {
         // restores that warm-up span. Only an unmasked discontinuity makes the
         // temporal reconstruction unsafe.
         self.temporal_discontinuity |= discontinuity && rows.is_none() && columns.is_none();
-        self.extend_canvas(arr, new_pos);
+        if !self.extend_canvas(arr, new_pos) {
+            self.stop_at_resource_limit();
+            return f32::INFINITY;
+        }
 
         self.last_cols = Some(Arc::clone(&cols));
         self.last_pixels = Some(Arc::clone(&pixels));
@@ -578,9 +620,6 @@ impl Stitcher {
                 .history
                 .iter()
                 .any(|tracked| tracked.position.abs_diff(position as i64) <= recent_reach);
-            if covered_by_history {
-                continue;
-            }
             let (row_score, pixel_score) = coarse_canvas_scores(
                 search.canvas_cols,
                 search.canvas_probe_pixels,
@@ -589,6 +628,21 @@ impl Stitcher {
                 position,
                 &probe_rows,
             );
+            // A damaged recent frame can hide an otherwise exact stored view.
+            // Permit a covered position ONLY with whole sparse-view equality,
+            // unmasked, never merely a good trimmed score. This cannot bypass
+            // the motion gate using a footer that matches only at one offset.
+            if covered_by_history
+                && (row_score != 0.0
+                    || pixel_score != 0.0
+                    || self
+                        .canvas
+                        .matching_pixels_window(position, search.current_pixels.height)
+                        .as_ref()
+                        != Some(search.current_pixels))
+            {
+                continue;
+            }
             ranked.push(CanvasRank {
                 row_score,
                 pixel_score,
@@ -721,6 +775,10 @@ impl Stitcher {
     }
 
     fn seed(&mut self, frame: &Rgb8) -> f32 {
+        if self.canvas.check_append(frame.width, frame.height).is_err() {
+            self.stop_at_resource_limit();
+            return f32::INFINITY;
+        }
         self.canvas.set_width(frame.width);
         self.canvas.push(frame.clone(), Side::Bottom);
 
@@ -771,11 +829,28 @@ impl Stitcher {
 
     /// Blit the frame at `new_pos` (its top row in canvas coordinates), growing
     /// whichever edge it overhangs. Both directions are O(rows added).
-    fn extend_canvas(&mut self, arr: &Rgb8, new_pos: i64) {
+    fn extend_canvas(&mut self, arr: &Rgb8, new_pos: i64) -> bool {
         let h = arr.height as i64;
         let canvas_h = self.canvas.height() as i64;
 
-        let over_bottom = (new_pos + h) - canvas_h;
+        let Some(end) = new_pos.checked_add(h) else {
+            return false;
+        };
+        let Some(top) = new_pos.checked_neg() else {
+            return false;
+        };
+        let over_bottom = end - canvas_h;
+        let added_bottom = over_bottom.max(0) as usize;
+        let added_top = top.max(0) as usize;
+        let Some(added) = added_bottom.checked_add(added_top) else {
+            return false;
+        };
+        if added_bottom > arr.height
+            || added_top > arr.height
+            || self.canvas.check_append(arr.width, added).is_err()
+        {
+            return false;
+        }
         if over_bottom > 0 {
             let start = (h - over_bottom) as usize;
             self.canvas
@@ -805,6 +880,7 @@ impl Stitcher {
         } else {
             self.anchor_pos = new_pos;
         }
+        true
     }
 
     fn push_history(&mut self, tracked: Tracked) {
@@ -815,17 +891,6 @@ impl Stitcher {
     }
 
     /// Signed relative scroll between two signature sequences and its diff.
-    fn find_shift_for(
-        &self,
-        last: &Cols,
-        cols: &Cols,
-        predict: i32,
-        robust: bool,
-        rows: Option<&[bool]>,
-    ) -> (i32, f32) {
-        find_shift_for(last, cols, predict, robust, &Mask::rows_only(rows))
-    }
-
     /// Feed one frame pair to the fixed-region detector.
     ///
     /// The pair is always "newest tracked frame" against `pixels`, so the
@@ -969,7 +1034,13 @@ impl Stitcher {
         if self.offline_disabled {
             return;
         }
-        if self.keyframes.iter().any(|kf| kf.sequence == sequence) {
+        if let Some(existing) = self.keyframes.iter_mut().find(|kf| kf.sequence == sequence) {
+            // A frame may already be stored as ordinary motion when a later
+            // reversal reveals that it was the furthest captured position.
+            // Keep its pixels, but promote the extremum so trimming protects it.
+            if reason.priority() > existing.reason.priority() {
+                existing.reason = reason;
+            }
             return;
         }
         let keyframe = Keyframe {
@@ -1011,7 +1082,13 @@ impl Stitcher {
     /// Finish the capture. Flattens the block canvas exactly once, then tries
     /// the offline rebuild and prefers it when it validates a complete path.
     pub fn result(&mut self) -> Result<StitchResult, &'static str> {
-        let online = self.canvas.flatten().ok_or("no frames added")?;
+        if self.canvas.is_empty() {
+            return Err(if self.resource_limited {
+                RESOURCE_LIMIT_WARNING
+            } else {
+                "no frames added"
+            });
+        }
         let mut warnings = self.warnings.clone();
 
         if let Some(pending) = self.pending_motion.take() {
@@ -1026,15 +1103,21 @@ impl Stitcher {
             );
         }
 
+        if !self.offline_disabled && !self.offline_budget_allows() {
+            warnings.push("离线重建超过安全像素预算，保留已可靠拼接的在线结果。".to_string());
+        }
         let rebuilt = self.offline_rebuild();
-        if rebuilt.is_none() && !self.temporal_discontinuity {
+        if rebuilt.is_none() && self.last_decision == Some(StitchDecision::Rejected) {
+            warnings.push(INCOMPLETE_WARNING.to_string());
+        }
+        if rebuilt.is_none() && !self.temporal_discontinuity && !self.resource_limited {
             if self.offline_disabled {
                 warnings.push(
                     "offline reconstruction skipped: keyframe memory limit reached; \
                      kept online result"
                         .to_string(),
                 );
-            } else if self.keyframes.len() >= 2 {
+            } else if self.keyframes.len() >= 2 && self.offline_budget_allows() {
                 warnings.push(
                     "offline reconstruction could not validate a complete path; \
                      kept online result"
@@ -1047,8 +1130,23 @@ impl Stitcher {
             frames_used: self.frames_used,
             warnings,
             rebuilt: rebuilt.is_some(),
-            image: rebuilt.unwrap_or(online),
+            // Flatten only if the rebuilt image is unavailable. A successful
+            // rebuild does not need a second full-height fallback allocation.
+            image: match rebuilt {
+                Some(image) => image,
+                None => self.canvas.flatten().ok_or("no frames added")?,
+            },
         })
+    }
+
+    fn offline_budget_allows(&self) -> bool {
+        // Every temporal edge shifts less than one viewport. Sum of all frame
+        // heights bounds any path span before the offline module allocates it.
+        let rows = self
+            .keyframes
+            .iter()
+            .try_fold(0usize, |n, frame| n.checked_add(frame.height));
+        rows.is_some_and(|height| self.limits.check(self.canvas.width(), height, 3).is_ok())
     }
 
     fn offline_rebuild(&self) -> Option<Rgb8> {
@@ -1057,7 +1155,32 @@ impl Stitcher {
         // with no temporal overlap, so forcing that sequence through the graph
         // can duplicate the revisited span. The online canvas is authoritative
         // after the spatial re-anchor.
-        if self.offline_disabled || self.temporal_discontinuity || self.keyframes.len() < 2 {
+        if self.offline_disabled
+            || self.temporal_discontinuity
+            || self.keyframes.len() < 2
+            || !self.offline_budget_allows()
+        {
+            return None;
+        }
+        // Budget eviction must not erase a captured extremum. Check represented
+        // positions, not output height: a valid offline correction may be shorter
+        // when it removes a mistaken online bridge, while still containing both
+        // ends of all captured content.
+        let first = self
+            .keyframes
+            .iter()
+            .filter_map(|frame| frame.online_position)
+            .min();
+        let last = self
+            .keyframes
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .online_position
+                    .map(|position| position + frame.height as i64)
+            })
+            .max();
+        if first != Some(0) || last != Some(self.canvas.height() as i64) {
             return None;
         }
         let row_mask = self.fixed_row_mask();
@@ -1090,50 +1213,158 @@ fn clamp_shift(value: i64) -> i32 {
     })
 }
 
-/// Signed relative scroll between two row-signature sequences, plus its diff.
-///
-/// Both sequences normally have the same height, so the offset is a plain
-/// relative scroll distance: positive means the content moved down, negative up.
-/// Candidates are probed outward from `predict`, and a near-perfect score exits
-/// early, which is what keeps a steady scroll at one or two probes per frame.
-///
-/// Shared with the offline graph so the live and rebuild paths can never drift
-/// apart in how they measure a shift.
-pub(crate) fn find_shift_for(
-    last: &Cols,
-    cols: &Cols,
+/// A candidate retains both scores: row statistics alone cannot disambiguate
+/// repeated text/cards, even when their difference is exactly zero.
+#[derive(Clone, Copy)]
+pub(crate) struct ScoredShift {
+    pub shift: i32,
+    pub diff: f32,
+    pub aligned: f32,
+    pub changed: f32,
+    pub false_motion: bool,
+    pub robust: bool,
+    ambiguous: bool,
+}
+
+impl ScoredShift {
+    fn valid(self, max_diff: f32) -> bool {
+        self.diff <= max_diff && (!self.false_motion || (self.shift == 0 && self.aligned == 0.0))
+    }
+
+    // Near-perfect row scores are ambiguous, not proof of a unique offset.
+    // Let RGB disambiguate that existing 0.25 band; outside it preserve row
+    // ordering so a fixed band cannot promote a worse, spurious moving match.
+    fn row_rank(self) -> f32 {
+        if self.diff < 0.25 { 0.0 } else { self.diff }
+    }
+
+    fn rank(self) -> (f32, f32) {
+        (self.row_rank(), self.aligned)
+    }
+}
+
+/// Shared by live tracking and offline reconstruction. Retry the robust path
+/// when either ordinary gate fails, not only when the row score is too high.
+/// Preserve a credible zero-offset explanation (and low-change pauses) rather
+/// than forcing a moving match while fixed-region detection is warming up.
+pub(crate) fn find_match(
+    previous: (&Cols, &Sparse),
+    current: (&Cols, &Sparse),
     predict: i32,
-    robust: bool,
+    max_diff: f32,
     mask: &Mask<'_>,
-) -> (i32, f32) {
-    let h = last.height;
-    let min_overlap = effective_min_overlap(h);
-    let max_offset = h.saturating_sub(min_overlap) as i32;
-    let score = |offset: i32| {
+) -> ScoredShift {
+    let changed = pixel_change_fraction(previous.1, current.1, mask);
+    let normal = find_shift_for(previous, current, predict, max_diff, mask, changed, false);
+    if normal.ambiguous
+        || normal.valid(max_diff)
+        || (normal.shift == 0 && normal.diff <= max_diff)
+        || changed < MIN_CHANGED_FRACTION
+    {
+        return normal;
+    }
+    let robust = find_shift_for(previous, current, predict, max_diff, mask, changed, true);
+    if robust.valid(max_diff) || robust.diff < normal.diff {
+        robust
+    } else {
+        normal
+    }
+}
+
+fn find_shift_for(
+    previous: (&Cols, &Sparse),
+    current: (&Cols, &Sparse),
+    predict: i32,
+    max_diff: f32,
+    mask: &Mask<'_>,
+    changed: f32,
+    robust: bool,
+) -> ScoredShift {
+    let (last, last_pixels) = previous;
+    let (cols, pixels) = current;
+    let min_overlap = effective_min_overlap(last.height);
+    let max_offset = last.height.saturating_sub(min_overlap) as i32;
+    let pixel_score = |offset| {
         if robust {
+            robust_pixel_overlap_diff(last_pixels, pixels, offset, mask)
+        } else {
+            pixel_overlap_diff(last_pixels, pixels, offset, mask)
+        }
+    };
+    let stationary = pixel_score(0);
+    let mut fallback = ScoredShift {
+        shift: 0,
+        diff: f32::INFINITY,
+        aligned: stationary,
+        changed,
+        false_motion: true,
+        robust,
+        ambiguous: false,
+    };
+    let mut best: Option<ScoredShift> = None;
+    let mut plausible = Vec::new();
+    for offset in offset_candidates(max_offset, predict) {
+        let diff = if robust {
             robust_col_diff(last, cols, offset, min_overlap, mask)
         } else {
             col_diff(last, cols, offset, min_overlap, mask)
+        };
+        let improves_fallback = diff < fallback.diff;
+        // Only the near-perfect row-score band is tied for RGB refinement.
+        if !improves_fallback && (diff > max_diff || best.is_some_and(|b| diff > b.diff + 0.25)) {
+            continue;
         }
-    };
-
-    if max_offset == 0 {
-        return (0, score(0));
-    }
-
-    let mut best_off = 0;
-    let mut best_diff = f32::INFINITY;
-    for offset in offset_candidates(max_offset, predict) {
-        let d = score(offset);
-        if d < best_diff {
-            best_diff = d;
-            best_off = offset;
-            if best_diff < 0.25 {
-                break; // essentially perfect
+        let aligned = if offset == 0 {
+            stationary
+        } else if diff <= max_diff {
+            pixel_score(offset)
+        } else {
+            f32::INFINITY
+        };
+        let candidate = ScoredShift {
+            shift: offset,
+            diff,
+            aligned,
+            changed,
+            false_motion: is_false_motion(aligned, stationary, changed, robust),
+            robust,
+            ambiguous: false,
+        };
+        if improves_fallback {
+            fallback = candidate;
+        }
+        // Rank stationary/false-motion candidates too. If they explain the
+        // pixels better, rejecting the frame is safer than selecting a worse
+        // moving candidate just because it narrowly passes the motion gate.
+        if diff > max_diff {
+            continue;
+        }
+        plausible.push(candidate);
+        if best.is_none_or(|b| candidate.rank() < b.rank()) {
+            best = Some(candidate);
+            // Only exact RGB agreement may short-circuit. A near-zero row
+            // score is common at the WRONG offset on text and repeating lists.
+            if diff < 0.25 && aligned == 0.0 {
+                break;
             }
         }
     }
-    (best_off, best_diff)
+    let mut selected = best.unwrap_or(fallback);
+    if selected.aligned > 0.0
+        && selected.aligned.is_finite()
+        && plausible.iter().any(|other| {
+            other.diff <= selected.diff + 0.25
+                && other.shift.abs_diff(selected.shift) >= 4
+                && other.aligned <= selected.aligned * 1.5
+        })
+    {
+        // Repeating cards with no unique pixel agreement are not a safe bridge.
+        // Do not let trimming discard the distinguishing badge/text afterwards.
+        selected.ambiguous = true;
+        selected.false_motion = true;
+        selected.diff = f32::INFINITY;
+    }
+    selected
 }
 
 #[derive(Clone, Copy)]

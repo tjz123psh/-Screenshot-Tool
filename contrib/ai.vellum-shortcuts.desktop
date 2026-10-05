@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Vellum Shortcuts
+Comment=Restore Vellum global shortcuts after desktop login
+Exec=@VELLUM_LAUNCHER@ shortcuts run
+TryExec=@VELLUM_LAUNCHER@
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

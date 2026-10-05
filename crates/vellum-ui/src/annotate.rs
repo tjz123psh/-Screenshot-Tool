@@ -4,14 +4,16 @@
 //! itself:
 //!
 //! * Every stroke is stored in *screen* coordinates, the same space the selector
-//!   works in, so a selection move never has to rewrite stroke geometry. Only
-//!   baking subtracts the crop origin.
+//!   works in, so a selection move never has to rewrite stroke geometry. Cache
+//!   and bake contexts translate by the negative crop origin; stroke points and
+//!   screenshot sampling stay in screen coordinates.
 //! * Finished strokes are rasterised once into a cache surface. Replaying a few
 //!   hundred pen points every frame makes the overlay progressively slower the
 //!   more the user draws, which is exactly when responsiveness matters most.
 
 use cairo::{Context, Format, ImageSurface};
 use pango::FontDescription;
+use serde::{Deserialize, Serialize};
 use vellum_core::geom::Rect;
 
 /// Palette indices are the popup order, so the numbers are part of the UI.
@@ -47,18 +49,16 @@ const MIN_DRAG: f64 = 2.0;
 /// the widest gave 44 px.
 const TEXT_SIZE_PER_WIDTH: f64 = 4.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tool {
     Pen,
     Arrow,
     Rect,
     Ellipse,
     Text,
-    /// Pixelates what it covers, destroying the pixels underneath.
-    ///
-    /// A redaction tool rather than a decoration: the point is that the original
-    /// content cannot be recovered from the result, which is why it samples the
-    /// screenshot instead of the annotated composite.
+    /// Pixelates the original screenshot, not the annotated composite. This
+    /// reduces detail but does NOT guarantee sensitive content is unreadable;
+    /// only opaque replacement can provide that guarantee for covered pixels.
     Mosaic,
     /// Softens what it covers, for the cases where blocks would be uglier than
     /// the content merely being unreadable.
@@ -69,9 +69,28 @@ pub enum Tool {
     /// stays out of the undo history by construction: there is nothing to undo,
     /// and a pick must not discard the redo branch either.
     Pick,
+    /// Opaque black replacement, kept above all sampled effects on output.
+    Cover,
 }
 
 impl Tool {
+    /// Whether strokes use the selected palette or picked colour.
+    pub fn supports_color(self) -> bool {
+        matches!(
+            self,
+            Self::Pen | Self::Arrow | Self::Rect | Self::Ellipse | Self::Text
+        )
+    }
+
+    /// Whether the size control applies to this tool. Redaction intensity is
+    /// fixed, and the picker has no stroke size.
+    pub fn supports_size(self) -> bool {
+        matches!(
+            self,
+            Self::Pen | Self::Arrow | Self::Rect | Self::Ellipse | Self::Text
+        )
+    }
+
     /// Maps a toolbar button id such as `tool.pen` onto a tool.
     pub fn from_button(id: &str) -> Option<Self> {
         match id {
@@ -83,6 +102,7 @@ impl Tool {
             "tool.mosaic" => Some(Tool::Mosaic),
             "tool.blur" => Some(Tool::Blur),
             "tool.pick" => Some(Tool::Pick),
+            "tool.cover" => Some(Tool::Cover),
             _ => None,
         }
     }
@@ -97,18 +117,20 @@ impl Tool {
             Tool::Mosaic => "tool.mosaic",
             Tool::Blur => "tool.blur",
             Tool::Pick => "tool.pick",
+            Tool::Cover => "tool.cover",
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct Stroke {
-    tool: Tool,
-    color: (f64, f64, f64),
-    width: f64,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Stroke {
+    pub(crate) tool: Tool,
+    pub(crate) color: (f64, f64, f64),
+    pub(crate) width: f64,
     /// Pen: every sampled point. Arrow/rect: start and end. Text: the anchor.
-    points: Vec<(f64, f64)>,
-    text: String,
+    pub(crate) points: Vec<(f64, f64)>,
+    pub(crate) text: String,
     /// Text only: the label's font size, in pixels, captured when the label was
     /// started.
     ///
@@ -116,7 +138,7 @@ struct Stroke {
     /// changing the size afterwards does not silently resize labels that are
     /// already placed — which would otherwise also happen on every cache replay
     /// after an undo.
-    size: f64,
+    pub(crate) size: f64,
 }
 
 /// In-progress text entry. Kept separate from `strokes` so undo can discard the
@@ -157,8 +179,11 @@ pub struct Annotator {
     /// drawing after an undo discards the branch that was undone.
     redo: Vec<Stroke>,
     active: Option<Stroke>,
+    active_point_limit: usize,
+    limit_notice: Option<String>,
     editing: Option<TextEdit>,
     cache: Option<ImageSurface>,
+    cache_stale: bool,
     cache_origin: (f64, f64),
     /// The screenshot being annotated, in screen coordinates.
     ///
@@ -186,8 +211,11 @@ impl Annotator {
             strokes: Vec::new(),
             redo: Vec::new(),
             active: None,
+            active_point_limit: crate::document::MAX_POINTS_PER_OBJECT,
+            limit_notice: None,
             editing: None,
             cache: None,
+            cache_stale: false,
             cache_origin: (0.0, 0.0),
             base: None,
         }
@@ -255,8 +283,12 @@ impl Annotator {
         }
     }
 
-    /// Sets the active tool's size.
+    /// Sets the active tool's size, without altering future pen or text settings
+    /// when the current tool has no adjustable size.
     pub fn set_size(&mut self, value: f64) {
+        if !self.tool.supports_size() {
+            return;
+        }
         if self.tool == Tool::Text {
             self.set_text_size(value);
         } else {
@@ -281,6 +313,9 @@ impl Annotator {
 
     /// Moves the slider by a fraction of its range. This is what the wheel does.
     pub fn nudge_size(&mut self, delta: f64) {
+        if !self.tool.supports_size() {
+            return;
+        }
         self.set_size_fraction(self.size_fraction() + delta);
     }
 
@@ -384,6 +419,23 @@ impl Annotator {
     }
 
     pub fn press(&mut self, px: f64, py: f64) {
+        if self.tool == Tool::Text {
+            self.commit_text();
+        }
+        let used = self
+            .strokes
+            .iter()
+            .map(|stroke| stroke.points.len())
+            .sum::<usize>();
+        self.active_point_limit = crate::document::MAX_TOTAL_POINTS
+            .saturating_sub(used)
+            .min(crate::document::MAX_POINTS_PER_OBJECT);
+        if self.tool != Tool::Pick
+            && (self.strokes.len() >= crate::document::MAX_OBJECTS || self.active_point_limit < 2)
+        {
+            self.limit_notice = Some("标注数量或点数已达上限，请删除部分对象后重试".into());
+            return;
+        }
         let stroke = Stroke {
             tool: self.tool,
             color: self.color(),
@@ -408,7 +460,7 @@ impl Annotator {
             // deliberately no early return above it, so this arm is the single
             // place that decision is made.
             Tool::Pick => {}
-            Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur => {
+            Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur | Tool::Cover => {
                 // Two points so far: motion updates the second, so the shape
                 // follows the pointer from the first pixel of the drag.
                 let mut stroke = stroke;
@@ -430,9 +482,13 @@ impl Annotator {
                         return;
                     }
                 }
+                if active.points.len() >= self.active_point_limit {
+                    self.limit_notice = Some("当前笔画已达点数上限，请分段绘制".into());
+                    return;
+                }
                 active.points.push((px, py));
             }
-            Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur => {
+            Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur | Tool::Cover => {
                 if active.points.len() >= 2 {
                     active.points[1] = (px, py);
                 }
@@ -451,7 +507,7 @@ impl Annotator {
                     self.record(active);
                 }
             }
-            Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur => {
+            Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Blur | Tool::Cover => {
                 if let Some(slot) = active.points.get_mut(1) {
                     *slot = (px, py);
                 }
@@ -470,8 +526,23 @@ impl Annotator {
     /// a word at once: fcitx5 hands over "你好", not "你" followed by "好".
     pub fn type_str(&mut self, text: &str) {
         if let Some(edit) = self.editing.as_mut() {
+            if edit.stroke.text.len().saturating_add(text.len()) > crate::document::MAX_TEXT_BYTES {
+                self.limit_notice = Some("单个文字标注超过16KiB限制".into());
+                return;
+            }
             edit.stroke.text.push_str(text);
             // A commit ends whatever composition produced it.
+            edit.preedit.clear();
+        }
+    }
+
+    pub(crate) fn replace_editing_text(&mut self, text: &str) {
+        if text.len() > crate::document::MAX_TEXT_BYTES {
+            return;
+        }
+        if let Some(edit) = self.editing.as_mut() {
+            edit.stroke.text.clear();
+            edit.stroke.text.push_str(text);
             edit.preedit.clear();
         }
     }
@@ -483,6 +554,9 @@ impl Annotator {
 
     /// Replaces the composition the input method is showing but has not committed.
     pub fn set_preedit(&mut self, text: &str) {
+        if text.len() > crate::document::MAX_TEXT_BYTES {
+            return;
+        }
         if let Some(edit) = self.editing.as_mut() {
             edit.preedit.clear();
             edit.preedit.push_str(text);
@@ -527,6 +601,12 @@ impl Annotator {
         }
     }
 
+    /// Whether undo would cancel a label (even an empty one) or remove a
+    /// committed stroke. An active pointer drag is not handled by undo.
+    pub fn can_undo(&self) -> bool {
+        self.editing.is_some() || !self.strokes.is_empty()
+    }
+
     /// Drops the newest thing the user made. An in-progress label counts as the
     /// newest thing, so undo cancels it instead of deleting a finished stroke.
     pub fn undo(&mut self) {
@@ -549,7 +629,8 @@ impl Annotator {
         self.append_stroke(stroke);
     }
 
-    /// True when there is anything on the redo stack.
+    /// Whether redo would restore a stroke. Text editing and active pointer
+    /// drags do not block the existing redo operation.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty()
@@ -563,34 +644,19 @@ impl Annotator {
     }
 
     fn append_stroke(&mut self, stroke: Stroke) {
-        if let Some(cache) = self.cache.as_ref()
+        if let Some(cache) = self.cache.as_ref().filter(|_| !self.cache_stale)
             && let Ok(cr) = Context::new(cache)
         {
             cr.translate(-self.cache_origin.0, -self.cache_origin.1);
             // Only committed strokes reach the cache; a composition is never
             // baked, so there is no preedit to pass.
-            draw_stroke(&cr, &stroke, false, "", self.redaction_source(true));
+            draw_stroke(&cr, &stroke, false, "", self.base.as_ref());
         }
         self.strokes.push(stroke);
     }
 
-    /// Where a redaction stroke should read the screenshot from.
-    ///
-    /// The annotator draws in two coordinate spaces: screen coordinates when
-    /// painting the overlay, and crop coordinates when baking into the cache. The
-    /// screenshot is always in screen coordinates, so the offset travels with it.
-    fn redaction_source(&self, in_cache: bool) -> RedactionSource<'_> {
-        RedactionSource {
-            base: self.base.as_ref(),
-            origin: if in_cache {
-                self.cache_origin
-            } else {
-                (0.0, 0.0)
-            },
-        }
-    }
-
     fn rebuild_cache(&mut self) {
+        self.cache_stale = true;
         let Some(cache) = self.cache.as_ref() else {
             return;
         };
@@ -601,32 +667,99 @@ impl Annotator {
         let _ = cr.paint();
         cr.set_operator(cairo::Operator::Over);
         cr.translate(-self.cache_origin.0, -self.cache_origin.1);
-        let source = self.redaction_source(true);
+        let source = self.base.as_ref();
         for stroke in &self.strokes {
             draw_stroke(&cr, stroke, false, "", source);
+        }
+        self.cache_stale = false;
+    }
+
+    /// Copy only annotation metadata, rebased onto the captured source region.
+    /// Current visible ink is included; caret, selection and IME preedit are not.
+    pub(crate) fn snapshot_objects(&self, rect: Rect) -> Vec<Stroke> {
+        let mut objects: Vec<_> = self
+            .strokes
+            .iter()
+            .chain(self.active.iter())
+            .cloned()
+            .collect();
+        if let Some(edit) = &self.editing
+            && !edit.stroke.text.is_empty()
+        {
+            objects.push(edit.stroke.clone());
+        }
+        for object in &mut objects {
+            for (x, y) in &mut object.points {
+                *x -= f64::from(rect.x);
+                *y -= f64::from(rect.y);
+            }
+        }
+        objects
+    }
+
+    pub(crate) fn replace_objects(&mut self, objects: Vec<Stroke>) {
+        self.strokes = objects;
+        self.active = None;
+        self.editing = None;
+        self.redo.clear();
+        self.rebuild_cache();
+    }
+
+    pub(crate) fn objects(&self) -> &[Stroke] {
+        &self.strokes
+    }
+
+    pub(crate) fn take_limit_notice(&mut self) -> Option<String> {
+        self.limit_notice.take()
+    }
+
+    pub(crate) fn replace_object(&mut self, index: usize, object: Stroke) {
+        if let Some(slot) = self.strokes.get_mut(index)
+            && *slot != object
+        {
+            *slot = object;
+            // Editing/dragging must not clear or reallocate a full screenshot
+            // cache on every motion. Draw authoritative objects directly until
+            // replace_objects commits the gesture and rebuilds once.
+            self.cache_stale = true;
         }
     }
 
     /// Draws finished strokes plus whatever is in flight, in screen coordinates.
     /// The caller is expected to have clipped to the selection.
     pub fn draw(&self, cr: &Context) {
-        if let Some(cache) = self.cache.as_ref() {
+        if let Some(cache) = self.cache.as_ref().filter(|_| !self.cache_stale) {
             let _ = cr.set_source_surface(cache, self.cache_origin.0, self.cache_origin.1);
             let _ = cr.paint();
             cr.set_source_rgb(0.0, 0.0, 0.0);
         } else {
-            let source = self.redaction_source(false);
+            let source = self.base.as_ref();
             for stroke in &self.strokes {
                 draw_stroke(cr, stroke, false, "", source);
             }
         }
         // In flight, so still in screen coordinates whichever branch ran above.
-        let source = self.redaction_source(false);
+        let source = self.base.as_ref();
         if let Some(active) = self.active.as_ref() {
             draw_stroke(cr, active, false, "", source);
         }
         if let Some(edit) = self.editing.as_ref() {
             draw_stroke(cr, &edit.stroke, true, &edit.preedit, source);
+        }
+        self.draw_opaque_covers(cr);
+    }
+
+    /// Sampled blur/mosaic must not reintroduce original pixels over an opaque
+    /// cover. Keep this protection above all ink, including an in-flight cover
+    /// when the user confirms before releasing the pointer.
+    fn draw_opaque_covers(&self, cr: &Context) {
+        for stroke in self
+            .strokes
+            .iter()
+            .chain(self.active.iter())
+            .filter(|stroke| stroke.tool == Tool::Cover)
+        {
+            draw_stroke(cr, stroke, false, "", None);
         }
     }
 
@@ -639,37 +772,30 @@ impl Annotator {
         let _ = cr.paint();
         cr.set_source_rgb(0.0, 0.0, 0.0);
 
-        if let Some(cache) = self.cache.as_ref() {
+        if let Some(cache) = self.cache.as_ref().filter(|_| !self.cache_stale) {
             let dx = self.cache_origin.0 - f64::from(rect.x);
             let dy = self.cache_origin.1 - f64::from(rect.y);
             let _ = cr.set_source_surface(cache, dx, dy);
             let _ = cr.paint();
         } else {
             cr.translate(-f64::from(rect.x), -f64::from(rect.y));
-            // The base handed to `bake` is authoritative here, and the translate
-            // above puts this space's origin at the crop's top-left.
-            let source = RedactionSource {
-                base: Some(base),
-                origin: (f64::from(rect.x), f64::from(rect.y)),
-            };
+            // The base handed to `bake` is authoritative here. The CTM maps
+            // screen-coordinate strokes to crop pixels, not to new source points.
+            let source = Some(base);
             for stroke in &self.strokes {
                 draw_stroke(&cr, stroke, false, "", source);
             }
         }
+        if let Some(active) = &self.active {
+            let active_cr = Context::new(&surface).ok()?;
+            active_cr.translate(-f64::from(rect.x), -f64::from(rect.y));
+            draw_stroke(&active_cr, active, false, "", Some(base));
+        }
+        let cover_cr = Context::new(&surface).ok()?;
+        cover_cr.translate(-f64::from(rect.x), -f64::from(rect.y));
+        self.draw_opaque_covers(&cover_cr);
         Some(surface)
     }
-}
-
-/// The screenshot a redaction stroke samples, and where the current coordinate
-/// space sits inside it.
-///
-/// Mosaic and blur have to read the original pixels, and the annotator draws in
-/// two different spaces (screen coordinates for the overlay, crop coordinates for
-/// the cache), so the offset travels with the surface rather than being assumed.
-#[derive(Clone, Copy)]
-struct RedactionSource<'a> {
-    base: Option<&'a ImageSurface>,
-    origin: (f64, f64),
 }
 
 /// Cell size of a mosaic block, in pixels. Big enough that the result is
@@ -680,7 +806,15 @@ const BLUR_CELL: f64 = 5.0;
 
 /// `preedit` is the input method's uncommitted composition, drawn after the
 /// text and underlined; pass `""` for anything that is not being typed.
-fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str, source: RedactionSource) {
+/// `base` and stroke points are always in screen coordinates, regardless of
+/// the destination context's translation.
+pub(crate) fn draw_stroke(
+    cr: &Context,
+    stroke: &Stroke,
+    caret: bool,
+    preedit: &str,
+    base: Option<&ImageSurface>,
+) {
     let (r, g, b) = stroke.color;
     cr.set_source_rgb(r, g, b);
     cr.set_line_width(stroke.width);
@@ -725,7 +859,25 @@ fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str, source
                 }
             }
         }
-        Tool::Mosaic | Tool::Blur => draw_redaction(cr, stroke, source),
+        Tool::Cover => {
+            if let (Some(&(x1, y1)), Some(&(x2, y2))) =
+                (stroke.points.first(), stroke.points.get(1))
+                && x1 != x2
+                && y1 != y2
+            {
+                // Cover every intersected pixel, including fractional edges; no
+                // antialiased fringe is allowed to mix back the source image.
+                let (x, y) = (x1.min(x2).floor(), y1.min(y2).floor());
+                cr.save().ok();
+                cr.set_antialias(cairo::Antialias::None);
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+                cr.new_path();
+                cr.rectangle(x, y, x1.max(x2).ceil() - x, y1.max(y2).ceil() - y);
+                let _ = cr.fill();
+                cr.restore().ok();
+            }
+        }
+        Tool::Mosaic | Tool::Blur => draw_redaction(cr, stroke, base),
         Tool::Text => draw_text_stroke(cr, stroke, caret, preedit),
         // A pick never becomes a stroke, so there is nothing to draw. The arm
         // exists only because the tool is part of the same enum.
@@ -739,10 +891,10 @@ fn draw_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str, source
 /// own filters do the work, and the two-step is exactly what produces the two
 /// effects — nearest-neighbour on the way back up gives hard mosaic blocks, a
 /// smooth filter both ways gives a soft blur. Sampling the screenshot rather than
-/// the composited target is the point of a redaction: what is under it must not
-/// be recoverable from the result.
-fn draw_redaction(cr: &Context, stroke: &Stroke, source: RedactionSource) {
-    let Some(base) = source.base else {
+/// the composited target keeps the effect consistent after overlapping marks.
+/// Blur and pixelation retain information; neither is secure opaque redaction.
+fn draw_redaction(cr: &Context, stroke: &Stroke, base: Option<&ImageSurface>) {
+    let Some(base) = base else {
         return;
     };
     let (Some(&(x1, y1)), Some(&(x2, y2))) = (stroke.points.first(), stroke.points.get(1)) else {
@@ -766,9 +918,10 @@ fn draw_redaction(cr: &Context, stroke: &Stroke, source: RedactionSource) {
             return;
         };
         scr.scale(f64::from(bw) / w, f64::from(bh) / h);
-        // The region's top-left in the screenshot's own coordinates.
-        let (bx, by) = (x + source.origin.0, y + source.origin.1);
-        if scr.set_source_surface(base, -bx, -by).is_err() {
+        // Stroke points already locate the region in the full screenshot. The
+        // destination CTM handles the crop offset only when painting below; adding
+        // it here would sample another region (or transparency past the screen).
+        if scr.set_source_surface(base, -x, -y).is_err() {
             return;
         }
         let _ = scr.paint();
@@ -869,6 +1022,10 @@ fn draw_text_stroke(cr: &Context, stroke: &Stroke, caret: bool, preedit: &str) {
     cr.move_to(x, y);
     pangocairo::functions::show_layout(cr, &layout);
 }
+
+#[cfg(test)]
+#[path = "opaque_cover_tests.rs"]
+mod opaque_cover_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1185,22 +1342,79 @@ mod tests {
         assert_eq!(a.size_fraction(), 1.0);
     }
 
-    /// The wheel steers the same slider, so it is no longer text-only.
+    /// The wheel steers the same slider for every size-capable tool.
     #[test]
-    fn the_wheel_moves_the_slider_for_any_tool() {
+    fn the_wheel_moves_the_slider_for_supported_tools() {
         let mut a = annotator();
-        a.set_tool(Tool::Rect);
-        let before = a.width();
-        a.nudge_size(0.1);
-        assert!(
-            a.width() > before,
-            "the wheel did not widen the rectangle pen"
-        );
+        for tool in [Tool::Pen, Tool::Arrow, Tool::Rect, Tool::Ellipse] {
+            a.set_tool(tool);
+            a.set_size(DEFAULT_WIDTH);
+            let before = a.width();
+            a.nudge_size(0.1);
+            assert!(a.width() > before, "the wheel did not widen {tool:?}");
+        }
 
         a.set_tool(Tool::Text);
         let before = a.text_size();
         a.nudge_size(0.1);
         assert!(a.text_size() > before, "the wheel did not grow the label");
+    }
+
+    #[test]
+    fn tool_capabilities_match_the_controls_they_use() {
+        for (tool, supported) in [
+            (Tool::Pen, true),
+            (Tool::Arrow, true),
+            (Tool::Rect, true),
+            (Tool::Ellipse, true),
+            (Tool::Text, true),
+            (Tool::Mosaic, false),
+            (Tool::Blur, false),
+            (Tool::Pick, false),
+        ] {
+            assert_eq!(tool.supports_color(), supported, "{tool:?} colour");
+            assert_eq!(tool.supports_size(), supported, "{tool:?} size");
+        }
+    }
+
+    #[test]
+    fn unsupported_tools_cannot_change_future_pen_or_text_sizes() {
+        for tool in [Tool::Mosaic, Tool::Blur, Tool::Pick, Tool::Cover] {
+            for text_size in [None, Some(58.0)] {
+                let mut a = annotator();
+                a.set_size(9.5);
+                if let Some(size) = text_size {
+                    a.set_tool(Tool::Text);
+                    a.set_size(size);
+                }
+                let before = (a.width(), a.text_size, a.text_size());
+                a.set_tool(tool);
+                a.set_size(24.0);
+                assert_eq!(
+                    (a.width(), a.text_size, a.text_size()),
+                    before,
+                    "{tool:?}: direct size"
+                );
+                a.set_size_fraction(1.0);
+                assert_eq!(
+                    (a.width(), a.text_size, a.text_size()),
+                    before,
+                    "{tool:?}: slider"
+                );
+                for delta in [-0.2, 0.1, 2.0] {
+                    a.nudge_size(delta);
+                    assert_eq!(
+                        (a.width(), a.text_size, a.text_size()),
+                        before,
+                        "{tool:?}: wheel {delta}"
+                    );
+                }
+                a.set_tool(Tool::Pen);
+                assert_eq!(a.size(), before.0, "future pen width changed");
+                a.set_tool(Tool::Text);
+                assert_eq!(a.size(), before.2, "future label size changed");
+            }
+        }
     }
 
     /// The stroke width is continuous now, not one of four presets.
@@ -1294,16 +1508,7 @@ mod tests {
         let surface = ImageSurface::create(Format::ARgb32, 400, 300).expect("surface");
         {
             let cr = Context::new(&surface).expect("cairo context");
-            draw_stroke(
-                &cr,
-                stroke,
-                false,
-                "",
-                RedactionSource {
-                    base: None,
-                    origin: (0.0, 0.0),
-                },
-            );
+            draw_stroke(&cr, stroke, false, "", None);
         }
         surface.flush();
         surface
@@ -1473,6 +1678,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn history_availability_matches_existing_operations() {
+        let mut a = annotator();
+        assert!(!a.can_undo());
+        assert!(!a.can_redo());
+        a.undo();
+        a.redo();
+        assert!(!a.can_undo());
+        assert!(!a.can_redo());
+
+        a.press(20.0, 30.0);
+        a.motion(60.0, 70.0);
+        assert!(!a.can_undo(), "undo does not cancel an active drag");
+        a.undo();
+        assert!(a.active.is_some());
+        a.release(60.0, 70.0);
+        assert!(a.can_undo());
+        assert!(!a.can_redo());
+        a.undo();
+        assert!(!a.can_undo());
+        assert!(a.can_redo());
+
+        a.set_tool(Tool::Text);
+        a.press(60.0, 60.0);
+        assert!(a.can_undo(), "even an empty label can be cancelled");
+        assert!(a.can_redo(), "editing does not block redo");
+        a.redo();
+        assert!(a.is_editing_text(), "redo must not cancel text editing");
+        assert!(a.can_undo());
+        assert!(!a.can_redo());
+        a.undo();
+        assert!(!a.is_editing_text());
+        assert_eq!(a.stroke_count(), 1, "undo cancels the label first");
+        assert!(a.can_undo());
+        a.undo();
+        assert!(!a.can_undo());
+        assert!(a.can_redo());
+
+        // Neither a dropped click nor a pick creates undo work or removes redo.
+        a.set_tool(Tool::Rect);
+        a.press(40.0, 40.0);
+        a.release(40.0, 40.0);
+        assert!(!a.can_undo());
+        assert!(a.can_redo());
+        a.set_tool(Tool::Pick);
+        a.press(30.0, 40.0);
+        a.release(30.0, 40.0);
+        assert!(a.pick(30.0, 40.0).is_some());
+        assert!(!a.can_undo());
+        assert!(a.can_redo());
+
+        a.set_tool(Tool::Pen);
+        a.press(30.0, 40.0);
+        a.motion(70.0, 80.0);
+        assert!(!a.can_undo());
+        assert!(a.can_redo(), "active drag does not block redo");
+        a.redo();
+        assert!(a.active.is_some());
+        assert!(a.can_undo());
+        assert!(!a.can_redo());
+        a.release(70.0, 80.0);
+        assert_eq!(a.stroke_count(), 2);
+    }
+
+    #[test]
+    fn cancelling_any_uncommitted_label_preserves_redo() {
+        for (text, preedit) in [("", ""), ("typed", ""), ("", "ni")] {
+            let mut a = annotator();
+            a.press(20.0, 30.0);
+            a.motion(60.0, 70.0);
+            a.release(60.0, 70.0);
+            a.undo();
+            a.set_tool(Tool::Text);
+            a.press(60.0, 60.0);
+            a.type_str(text);
+            a.set_preedit(preedit);
+            assert!(a.can_undo());
+            assert!(a.can_redo());
+            a.undo();
+            assert!(!a.can_undo());
+            assert!(a.can_redo());
+            assert!(!a.is_editing_text());
+            a.redo();
+            assert!(a.can_undo());
+            assert!(!a.can_redo());
+            assert_eq!(a.stroke_count(), 1);
+        }
+    }
+
     /// Redo puts back what undo removed.
     #[test]
     fn redo_restores_the_newest_undone_stroke() {
@@ -1529,36 +1823,282 @@ mod tests {
         assert_eq!(a.strokes.len(), 1, "redo brought back a discarded stroke");
     }
 
-    /// The redaction source has to report where the drawing space sits inside the
-    /// screenshot: screen coordinates for the overlay, crop coordinates for the
-    /// cache.
-    ///
-    /// Pinned directly rather than through pixels. The alternating-columns test
-    /// cannot see an offset error, because a period-2 pattern looks identical when
-    /// shifted by one, and mutation testing proved exactly that: forcing the cache
-    /// offset to zero left every pixel assertion passing.
-    #[test]
-    fn the_redaction_source_tracks_the_coordinate_space() {
-        let a = annotator();
-        let overlay = a.redaction_source(false);
-        assert_eq!(
-            overlay.origin,
-            (0.0, 0.0),
-            "the overlay draws in screen coordinates, so there is no offset"
-        );
-        assert!(overlay.base.is_some(), "the screenshot was not recorded");
+    /// A red striped patch on blue: an origin error reads a different colour (or
+    /// transparent pixels past the screenshot), not the same repeating pattern.
+    fn redaction_base(region: Rect) -> ImageSurface {
+        let surface = ImageSurface::create(Format::ARgb32, 400, 300).expect("base");
+        {
+            let cr = Context::new(&surface).expect("context");
+            cr.set_source_rgb(0.0, 0.0, 1.0);
+            cr.paint().expect("blue background");
+            for x in region.x..region.x + region.w {
+                cr.set_source_rgb(if x % 2 == 0 { 1.0 } else { 0.2 }, 0.0, 0.0);
+                cr.rectangle(f64::from(x), f64::from(region.y), 1.0, f64::from(region.h));
+                cr.fill().expect("red stripe");
+            }
+        }
+        surface
+    }
 
-        let cache = a.redaction_source(true);
+    fn crop_surface(base: &ImageSurface, rect: Rect) -> ImageSurface {
+        let surface = ImageSurface::create(Format::ARgb32, rect.w, rect.h).expect("crop");
+        {
+            let cr = Context::new(&surface).expect("context");
+            cr.set_source_surface(base, -f64::from(rect.x), -f64::from(rect.y))
+                .expect("crop source");
+            cr.paint().expect("crop paint");
+        }
+        surface
+    }
+
+    /// Exercise the actual overlay path in screen coordinates, then crop its
+    /// pixels for comparison with bake. Do not simulate a preview using bake.
+    fn preview_crop(a: &Annotator, base: &ImageSurface, rect: Rect) -> ImageSurface {
+        let screen = crop_surface(base, Rect::new(0, 0, base.width(), base.height()));
+        {
+            let cr = Context::new(&screen).expect("context");
+            cr.rectangle(
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.w),
+                f64::from(rect.h),
+            );
+            cr.clip();
+            a.draw(&cr);
+        }
+        crop_surface(&screen, rect)
+    }
+
+    fn pixels(surface: &ImageSurface) -> Vec<[u8; 4]> {
+        let mut pixels = Vec::new();
+        surface
+            .with_data(|data| {
+                for y in 0..surface.height() as usize {
+                    for x in 0..surface.width() as usize {
+                        let offset = y * surface.stride() as usize + x * 4;
+                        pixels.push(data[offset..offset + 4].try_into().expect("ARGB pixel"));
+                    }
+                }
+            })
+            .expect("pixels");
+        pixels
+    }
+
+    /// Cairo can round bilinear RGB interpolation by one byte differently after
+    /// an integer destination translation. Allow that only when comparing a blur
+    /// preview with the cache; mosaic, alpha, and exact replay comparisons have no
+    /// tolerance. Every pixel is checked, so an unredacted edge cannot hide in an
+    /// image-wide average.
+    fn assert_pixels_match(
+        actual: &ImageSurface,
+        expected: &ImageSurface,
+        rgb_tolerance: u8,
+        stage: &str,
+    ) {
         assert_eq!(
-            cache.origin, a.cache_origin,
-            "the cache draws in crop coordinates, so sampling has to be offset by the \
-             crop's origin"
+            (actual.width(), actual.height()),
+            (expected.width(), expected.height())
         );
-        assert_ne!(
-            cache.origin,
-            (0.0, 0.0),
-            "the canvas starts at a non-zero origin, so this assertion is meaningful"
-        );
+        for (i, (actual_pixel, expected_pixel)) in
+            pixels(actual).iter().zip(pixels(expected)).enumerate()
+        {
+            for channel in 0..4 {
+                let tolerance = if channel == 3 { 0 } else { rgb_tolerance };
+                assert!(
+                    actual_pixel[channel].abs_diff(expected_pixel[channel]) <= tolerance,
+                    "{stage}: pixel ({}, {}), channel {channel}: {actual_pixel:?} != {expected_pixel:?} (tolerance {tolerance})",
+                    i % actual.width() as usize,
+                    i / actual.width() as usize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_preview_matches_commit_bake_and_history() {
+        for tool in [Tool::Mosaic, Tool::Blur] {
+            for (crop, region) in [
+                (Rect::new(0, 0, 200, 150), Rect::new(20, 20, 48, 48)),
+                (Rect::new(100, 80, 200, 150), Rect::new(120, 100, 48, 48)),
+                (Rect::new(300, 80, 100, 150), Rect::new(350, 100, 50, 48)),
+                (Rect::new(100, 220, 200, 80), Rect::new(120, 252, 48, 48)),
+                (Rect::new(300, 220, 100, 80), Rect::new(349, 251, 51, 49)),
+            ] {
+                for reverse in [false, true] {
+                    let base = redaction_base(region);
+                    let original = crop_surface(&base, crop);
+                    let mut a = Annotator::new();
+                    a.begin_canvas(crop, &base);
+                    a.set_tool(tool);
+                    let mut start = (f64::from(region.x), f64::from(region.y));
+                    let mut end = (
+                        f64::from(region.x + region.w),
+                        f64::from(region.y + region.h),
+                    );
+                    if reverse {
+                        std::mem::swap(&mut start, &mut end);
+                    }
+                    a.press(start.0, start.1);
+                    a.motion(end.0, end.1);
+                    let preview = preview_crop(&a, &base, crop);
+                    let label = format!("{tool:?} crop {crop:?}, reverse={reverse}");
+                    let rgb_tolerance = u8::from(tool == Tool::Blur);
+                    assert!(
+                        pixels(&preview) != pixels(&original),
+                        "{label}: preview must redact the stripes"
+                    );
+                    let cx = (region.x - crop.x + region.w / 2) as usize;
+                    let cy = (region.y - crop.y + region.h / 2) as usize;
+                    let center = pixels(&preview)[cy * crop.w as usize + cx];
+                    assert_eq!(
+                        center[0], 0,
+                        "{label}: preview sampled blue outside the red patch"
+                    );
+                    assert!(center[2] > 0, "{label}: preview lost the red patch");
+                    assert_eq!(center[3], 255, "{label}: preview must remain opaque");
+
+                    a.release(end.0, end.1);
+                    assert_eq!(a.stroke_count(), 1);
+                    assert_pixels_match(
+                        &preview_crop(&a, &base, crop),
+                        &preview,
+                        rgb_tolerance,
+                        &format!("{label}: commit"),
+                    );
+                    let committed = a.bake(&base, crop).expect("bake");
+                    assert_pixels_match(
+                        &committed,
+                        &preview,
+                        rgb_tolerance,
+                        &format!("{label}: bake"),
+                    );
+
+                    // Undoing another stroke must rebuild the surviving redaction,
+                    // not merely clear and later append it again.
+                    a.set_tool(Tool::Pen);
+                    a.press(f64::from(crop.x + 5), f64::from(crop.y + 5));
+                    a.motion(f64::from(crop.x + 15), f64::from(crop.y + 10));
+                    a.release(f64::from(crop.x + 15), f64::from(crop.y + 10));
+                    a.undo();
+                    assert_pixels_match(
+                        &a.bake(&base, crop).expect("rebuild"),
+                        &committed,
+                        0,
+                        &format!("{label}: survivor rebuild"),
+                    );
+                    a.undo();
+                    assert_pixels_match(
+                        &a.bake(&base, crop).expect("undo"),
+                        &original,
+                        0,
+                        &format!("{label}: undo"),
+                    );
+                    a.redo();
+                    assert_pixels_match(
+                        &a.bake(&base, crop).expect("redo"),
+                        &committed,
+                        0,
+                        &format!("{label}: redo"),
+                    );
+                    assert_pixels_match(
+                        &preview_crop(&a, &base, crop),
+                        &committed,
+                        0,
+                        &format!("{label}: redo overlay"),
+                    );
+
+                    a.begin_canvas(crop, &base);
+                    assert_pixels_match(
+                        &a.bake(&base, crop).expect("new canvas"),
+                        &committed,
+                        0,
+                        &format!("{label}: canvas rebuild"),
+                    );
+                    // Exercise the allocation-fallback paths as well. Their CTM
+                    // translation must not turn screen points into crop points.
+                    a.cache = None;
+                    assert_pixels_match(
+                        &preview_crop(&a, &base, crop),
+                        &preview,
+                        0,
+                        &format!("{label}: uncached overlay"),
+                    );
+                    assert_pixels_match(
+                        &a.bake(&base, crop).expect("uncached bake"),
+                        &preview,
+                        rgb_tolerance,
+                        &format!("{label}: uncached bake"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_samples_the_original_under_ink_and_other_redactions() {
+        let crop = Rect::new(100, 80, 200, 150);
+        let region = Rect::new(120, 100, 48, 48);
+        let base = redaction_base(region);
+        for tool in [Tool::Mosaic, Tool::Blur] {
+            let mut a = Annotator::new();
+            a.begin_canvas(crop, &base);
+            a.set_tool(tool);
+            a.press(120.0, 100.0);
+            a.motion(168.0, 148.0);
+            let expected = preview_crop(&a, &base, crop);
+            a.release(168.0, 148.0);
+
+            a.set_tool(Tool::Pen);
+            a.set_color_index(2);
+            a.set_width(8.0);
+            a.press(136.0, 124.0);
+            a.motion(152.0, 124.0);
+            a.release(152.0, 124.0);
+            assert!(
+                pixels(&preview_crop(&a, &base, crop)) != pixels(&expected),
+                "ink must change the covered pixels"
+            );
+
+            let other = if tool == Tool::Mosaic {
+                Tool::Blur
+            } else {
+                Tool::Mosaic
+            };
+            for next in [other, tool] {
+                a.set_tool(next);
+                a.press(120.0, 100.0);
+                a.motion(168.0, 148.0);
+                let preview = preview_crop(&a, &base, crop);
+                a.release(168.0, 148.0);
+                assert_pixels_match(
+                    &a.bake(&base, crop).expect("layered bake"),
+                    &preview,
+                    u8::from(next == Tool::Blur),
+                    "layered commit",
+                );
+            }
+            assert_pixels_match(
+                &a.bake(&base, crop).expect("bake"),
+                &expected,
+                u8::from(tool == Tool::Blur),
+                "redaction must sample the original, not earlier ink or redactions",
+            );
+            a.undo();
+            let undone = preview_crop(&a, &base, crop);
+            assert_pixels_match(
+                &a.bake(&base, crop).expect("undo"),
+                &undone,
+                0,
+                "layered undo",
+            );
+            a.redo();
+            assert_pixels_match(
+                &a.bake(&base, crop).expect("redo"),
+                &expected,
+                u8::from(tool == Tool::Blur),
+                "layered redo",
+            );
+        }
     }
 
     #[test]

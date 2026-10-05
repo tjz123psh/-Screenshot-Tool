@@ -18,7 +18,7 @@ pub const TRAY_BINARY: &str = "vellum-tray";
 
 /// Look next to the running executable first so a build tree or a staged
 /// install directory stays self-consistent, and only then fall back to PATH.
-fn locate(program: &str) -> Option<PathBuf> {
+pub(crate) fn locate(program: &str) -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {

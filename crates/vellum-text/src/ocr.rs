@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use vellum_core::Rgb8;
 use vellum_core::config::{ApiConfig, LlmConfig, OCR_ENGINE_API, OCR_ENGINE_BUILTIN, OcrConfig};
 
-use crate::api::{self, ApiError};
+use crate::api::{self, ApiError, RequestControl};
 use crate::prep;
 
 /// Invariants for the vision engine, in a system message.
@@ -88,24 +88,67 @@ pub fn recognize(
     ocr: &OcrConfig,
     llm: &LlmConfig,
 ) -> Result<Recognized, OcrError> {
-    // An API failure is deliberately swallowed: a weaker local result beats an
-    // empty one, and the returned engine tells the caller which path answered.
-    if ocr.uses_api()
-        && let Ok(text) = recognize_api(image, api, ocr, llm)
-    {
-        return Ok(Recognized {
-            text,
-            engine: OCR_ENGINE_API,
-        });
+    let budget = if ocr.uses_api() {
+        Duration::from_secs(ocr.api_timeout_s.max(1))
+    } else {
+        TESSERACT_TIMEOUT
+    };
+    recognize_with_control(image, api, ocr, llm, &RequestControl::new(budget))
+}
+
+/// Recognize with a shared total deadline and cooperative cancellation. No
+/// local fallback is launched after cancellation/deadline. In-flight blocking
+/// API/Tesseract work is not instantly interrupted: it retains only the current
+/// remaining budget (local OCR additionally caps it at 30s). Local preparation,
+/// OS scheduling and process reaping are not hard-real-time bounded.
+pub fn recognize_with_control(
+    image: &Rgb8,
+    api: &ApiConfig,
+    ocr: &OcrConfig,
+    llm: &LlmConfig,
+    control: &RequestControl,
+) -> Result<Recognized, OcrError> {
+    recognize_using(
+        ocr.uses_api(),
+        control,
+        || recognize_api_with_control(image, api, ocr, llm, control),
+        || recognize_tesseract(image, ocr, control),
+    )
+}
+
+fn recognize_using(
+    uses_api: bool,
+    control: &RequestControl,
+    remote: impl FnOnce() -> Result<String, OcrError>,
+    local: impl FnOnce() -> Result<String, OcrError>,
+) -> Result<Recognized, OcrError> {
+    control.check().map_err(api_ocr_error)?;
+    if uses_api {
+        let result = remote();
+        control.check().map_err(api_ocr_error)?;
+        if let Ok(text) = result {
+            return Ok(Recognized {
+                text,
+                engine: OCR_ENGINE_API,
+            });
+        }
     }
-    recognize_tesseract(image, ocr).map(|text| Recognized {
+    control.check().map_err(api_ocr_error)?;
+    let result = local();
+    control.check().map_err(api_ocr_error)?;
+    result.map(|text| Recognized {
         text,
         engine: OCR_ENGINE_BUILTIN,
     })
 }
 
-fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError> {
-    let deadline = Instant::now() + TESSERACT_TIMEOUT;
+fn recognize_tesseract(
+    image: &Rgb8,
+    cfg: &OcrConfig,
+    control: &RequestControl,
+) -> Result<String, OcrError> {
+    let deadline =
+        Instant::now() + TESSERACT_TIMEOUT.min(control.remaining().map_err(api_ocr_error)?);
     let preparation = cfg
         .preprocess
         .then(|| prep::Preparation::new(image, cfg.upscale));
@@ -128,6 +171,7 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
     let mut first_error = None;
 
     for kind in kinds {
+        control.check().map_err(api_ocr_error)?;
         if deadline.checked_duration_since(Instant::now()).is_none() {
             break;
         }
@@ -138,6 +182,7 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
         if deadline.checked_duration_since(Instant::now()).is_none() {
             break;
         }
+        control.check().map_err(api_ocr_error)?;
         let payload = prepared
             .to_png()
             .map_err(|e| OcrError::Failed(format!("failed to encode image for OCR: {e}")))?;
@@ -148,31 +193,33 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
         let alternate_langs = (kind == prep::CandidateKind::LocalContrast)
             .then(|| alternate_language_order(&cfg.langs))
             .flatten();
-        let (primary, primary_elapsed, alternate_language) =
-            if let Some(alternate_langs) = alternate_langs.as_deref() {
-                std::thread::scope(|scope| {
-                    let alternate = scope.spawn(|| {
-                        let started = Instant::now();
-                        let result = run_tesseract(&payload, alternate_langs, psm, timeout);
-                        (result, started.elapsed())
-                    });
+        let (primary, primary_elapsed, alternate_language) = if let Some(alternate_langs) =
+            alternate_langs.as_deref()
+        {
+            std::thread::scope(|scope| {
+                let alternate = scope.spawn(|| {
                     let started = Instant::now();
-                    let primary = run_tesseract(&payload, &cfg.langs, psm, timeout);
-                    let primary_elapsed = started.elapsed();
-                    let alternate = Some(match alternate.join() {
-                        Ok(result) => result,
-                        Err(panic) => std::panic::resume_unwind(panic),
-                    });
-                    (primary, primary_elapsed, alternate)
-                })
-            } else {
+                    let result = run_tesseract(&payload, alternate_langs, psm, timeout, control);
+                    (result, started.elapsed())
+                });
                 let started = Instant::now();
-                (
-                    run_tesseract(&payload, &cfg.langs, psm, timeout),
-                    started.elapsed(),
-                    None,
-                )
-            };
+                let primary = run_tesseract(&payload, &cfg.langs, psm, timeout, control);
+                let primary_elapsed = started.elapsed();
+                let alternate = Some(match alternate.join() {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                });
+                (primary, primary_elapsed, alternate)
+            })
+        } else {
+            let started = Instant::now();
+            (
+                run_tesseract(&payload, &cfg.langs, psm, timeout, control),
+                started.elapsed(),
+                None,
+            )
+        };
+        control.check().map_err(api_ocr_error)?;
         let mut attempt = match primary {
             Ok(attempt) => attempt,
             Err(err @ OcrError::Missing(_)) => return Err(err),
@@ -198,11 +245,13 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
         // Sparse mode is easily distracted by colored rules and wallpaper;
         // block mode is the useful second opinion. Conversely an actual sparse
         // crop can rescue a low-confidence block result.
+        control.check().map_err(api_ocr_error)?;
         if should_retry_layout(&attempt, psm) {
             let alternate = if psm == 6 { 11 } else { 6 };
             if let Some(timeout) = deadline.checked_duration_since(Instant::now()) {
                 let alternate_started = Instant::now();
-                if let Ok(other) = run_tesseract(&payload, &cfg.langs, alternate, timeout) {
+                if let Ok(other) = run_tesseract(&payload, &cfg.langs, alternate, timeout, control)
+                {
                     if trace {
                         eprintln!(
                             "[vellum-ocr] kind={kind:?} alternate_psm={alternate} tess_ms={} conf={:.1} chars={}",
@@ -218,6 +267,7 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
             }
         }
 
+        control.check().map_err(api_ocr_error)?;
         // Combined Tesseract models are order-sensitive. On faded mixed-script
         // text the secondary model can recover a glyph that the nominal primary
         // model is confidently wrong about. It runs beside the primary local-
@@ -274,6 +324,7 @@ fn recognize_tesseract(image: &Rgb8, cfg: &OcrConfig) -> Result<String, OcrError
             trace_started.elapsed().as_millis()
         );
     }
+    control.check().map_err(api_ocr_error)?;
     match best {
         Some((_, result)) if !result.text.trim().is_empty() => Ok(cleanup(&result.text)),
         Some(_) => Err(OcrError::Empty("tesseract returned no text".into())),
@@ -317,7 +368,10 @@ fn run_tesseract(
     langs: &str,
     psm: u8,
     timeout: Duration,
+    control: &RequestControl,
 ) -> Result<TesseractResult, OcrError> {
+    let timeout = timeout.min(control.remaining().map_err(api_ocr_error)?);
+    let deadline = Instant::now() + timeout;
     let child = vellum_core::proc::command("tesseract")
         .args([
             "stdin",
@@ -336,14 +390,23 @@ fn run_tesseract(
             std::io::ErrorKind::NotFound => {
                 OcrError::Missing("tesseract not found; install tesseract".into())
             }
-            _ => OcrError::Failed(format!("tesseract failed to start: {e}")),
+            _ => OcrError::Failed("tesseract failed to start".into()),
         })?;
 
-    let output = vellum_core::proc::wait_with_input(child, png.to_vec(), timeout)
-        .ok_or_else(|| OcrError::Timeout("tesseract timed out".into()))?;
+    // Once spawned, always hand the child to the reaper, even if cancellation
+    // arrived during spawn. A zero timeout terminates the isolated process group.
+    let remaining = control
+        .remaining()
+        .unwrap_or(Duration::ZERO)
+        .min(deadline.saturating_duration_since(Instant::now()));
+    let output = vellum_core::proc::wait_with_input(child, png.to_vec(), remaining);
+    control.check().map_err(api_ocr_error)?;
+    let output = output.ok_or_else(|| OcrError::Timeout("tesseract timed out".into()))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(OcrError::Failed(format!("tesseract failed: {stderr}")));
+        return Err(OcrError::Failed(format!(
+            "tesseract failed (exit code {:?})",
+            output.status.code()
+        )));
     }
     parse_tsv(&String::from_utf8_lossy(&output.stdout), psm)
         .ok_or_else(|| OcrError::Failed("unexpected tesseract TSV output".into()))
@@ -783,12 +846,25 @@ fn text_row_bands(image: &Rgb8) -> usize {
 /// The crop travels as a PNG data URL inside a normal chat message: that is the
 /// shape every vision-capable provider accepts, and it reuses the same key and
 /// base URL as translation instead of inventing a second configuration.
+#[cfg(test)]
 fn recognize_api(
     image: &Rgb8,
     api: &ApiConfig,
     ocr: &OcrConfig,
     llm: &LlmConfig,
 ) -> Result<String, OcrError> {
+    let control = RequestControl::new(Duration::from_secs(ocr.api_timeout_s.max(1)));
+    recognize_api_with_control(image, api, ocr, llm, &control)
+}
+
+fn recognize_api_with_control(
+    image: &Rgb8,
+    api: &ApiConfig,
+    ocr: &OcrConfig,
+    llm: &LlmConfig,
+    control: &RequestControl,
+) -> Result<String, OcrError> {
+    control.check().map_err(api_ocr_error)?;
     let model = ocr.effective_api_model(llm);
     if model.trim().is_empty() {
         return Err(OcrError::Missing(
@@ -818,11 +894,13 @@ fn recognize_api(
         },
     ]);
 
-    let timeout = Duration::from_secs(ocr.api_timeout_s.max(1));
     // Zero temperature: OCR is a transcription, not a generation, and a model
     // that paraphrases an invoice line is worse than one that fails.
-    let text = api::chat_at(api, model, messages, 0.0, timeout).map_err(api_ocr_error)?;
+    control.check().map_err(api_ocr_error)?;
+    let text =
+        api::chat_at_with_control(api, model, messages, 0.0, control).map_err(api_ocr_error)?;
     let text = cleanup(&text);
+    control.check().map_err(api_ocr_error)?;
     if text.is_empty() {
         return Err(OcrError::Empty("API OCR 未返回文字".into()));
     }
@@ -835,6 +913,7 @@ fn api_ocr_error(err: ApiError) -> OcrError {
     let message = err.to_string();
     match err {
         ApiError::MissingKey => OcrError::Missing(message),
+        ApiError::DeadlineExceeded => OcrError::Timeout(message),
         _ => OcrError::Failed(message),
     }
 }
@@ -1183,6 +1262,7 @@ mod tests {
         ApiConfig {
             base_url,
             api_key: "sk-test".into(),
+            proxy: "none".into(),
             ..ApiConfig::default()
         }
     }
@@ -1333,9 +1413,15 @@ mod tests {
             engine: OCR_ENGINE_BUILTIN.into(),
             ..OcrConfig::default()
         };
-        // Tesseract may not be installed here; either outcome is fine, the
-        // assertion is that the API was never consulted.
-        let _ = recognize(&image(8, 8), &api, &ocr, &LlmConfig::default());
+        let control = RequestControl::new(TESSERACT_TIMEOUT);
+        let result = recognize_using(
+            ocr.uses_api(),
+            &control,
+            || recognize_api(&image(8, 8), &api, &ocr, &LlmConfig::default()),
+            || Ok("synthetic local text".into()),
+        )
+        .unwrap();
+        assert_eq!(result.engine, OCR_ENGINE_BUILTIN);
         assert!(server.requests().is_empty());
     }
 
@@ -1359,15 +1445,16 @@ mod tests {
             engine: OCR_ENGINE_API.into(),
             ..OcrConfig::default()
         };
-        match recognize(&image(16, 16), &api, &ocr, &LlmConfig::default()) {
-            Ok(recognized) => {
-                assert_eq!(recognized.engine, OCR_ENGINE_BUILTIN);
-                assert_ne!(recognized.text, "第一行", "the partial answer was accepted");
-            }
-            // No tesseract here: the local failure surfaces instead, which is
-            // still proof the partial answer was not returned.
-            Err(err) => assert!(err.to_string().contains("tesseract"), "{err}"),
-        }
+        let control = RequestControl::new(TESSERACT_TIMEOUT);
+        let recognized = recognize_using(
+            ocr.uses_api(),
+            &control,
+            || recognize_api(&image(16, 16), &api, &ocr, &LlmConfig::default()),
+            || Ok("synthetic local fallback".into()),
+        )
+        .unwrap();
+        assert_eq!(recognized.engine, OCR_ENGINE_BUILTIN);
+        assert_eq!(recognized.text, "synthetic local fallback");
     }
 
     /// A failed API call falls back to the local engine, and the engine label
@@ -1380,12 +1467,111 @@ mod tests {
             engine: OCR_ENGINE_API.into(),
             ..OcrConfig::default()
         };
-        match recognize(&image(16, 16), &api, &ocr, &LlmConfig::default()) {
-            Ok(recognized) => assert_eq!(recognized.engine, OCR_ENGINE_BUILTIN),
-            // No tesseract here: the failure that surfaces is the local one, not
-            // the API refusal the fallback was supposed to hide.
-            Err(err) => assert!(err.to_string().contains("tesseract"), "{err}"),
-        }
+        let control = RequestControl::new(TESSERACT_TIMEOUT);
+        let recognized = recognize_using(
+            ocr.uses_api(),
+            &control,
+            || recognize_api(&image(16, 16), &api, &ocr, &LlmConfig::default()),
+            || Ok("synthetic local fallback".into()),
+        )
+        .unwrap();
+        assert_eq!(recognized.engine, OCR_ENGINE_BUILTIN);
         assert_eq!(server.requests().len(), 1, "the API is tried exactly once");
+    }
+
+    #[test]
+    fn cancellation_or_expiry_after_api_failure_does_not_start_local_ocr() {
+        for cancelled in [true, false] {
+            let control = RequestControl::with_test_clock(Duration::from_secs(5));
+            let error = recognize_using(
+                true,
+                &control,
+                || {
+                    if cancelled {
+                        control.cancel();
+                    } else {
+                        control.advance(Duration::from_secs(5));
+                    }
+                    Err(OcrError::Failed("synthetic upstream failure".into()))
+                },
+                || panic!("cancelled/expired API request must not fall back locally"),
+            )
+            .unwrap_err();
+            let expected = if cancelled {
+                ApiError::Cancelled
+            } else {
+                ApiError::DeadlineExceeded
+            };
+            assert_eq!(error.to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn cancelled_control_rejects_local_and_remote_work_before_starting() {
+        for uses_api in [false, true] {
+            let control = RequestControl::new(TESSERACT_TIMEOUT);
+            control.cancel();
+            let error = recognize_using(
+                uses_api,
+                &control,
+                || panic!("must not start remote OCR"),
+                || panic!("must not start local OCR"),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), ApiError::Cancelled.to_string());
+            let cfg = OcrConfig {
+                engine: if uses_api {
+                    OCR_ENGINE_API
+                } else {
+                    OCR_ENGINE_BUILTIN
+                }
+                .into(),
+                ..OcrConfig::default()
+            };
+            let error = recognize_with_control(
+                &image(8, 8),
+                &api("http://127.0.0.1:1/v1".into()),
+                &cfg,
+                &LlmConfig::default(),
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), ApiError::Cancelled.to_string());
+        }
+    }
+
+    #[test]
+    fn local_fallback_receives_only_the_budget_left_after_api() {
+        let control = RequestControl::with_test_clock(Duration::from_secs(10));
+        let result = recognize_using(
+            true,
+            &control,
+            || {
+                control.advance(Duration::from_secs(7));
+                Err(OcrError::Failed("synthetic refusal".into()))
+            },
+            || {
+                assert_eq!(control.remaining(), Ok(Duration::from_secs(3)));
+                Ok("synthetic local text".into())
+            },
+        )
+        .unwrap();
+        assert_eq!(result.engine, OCR_ENGINE_BUILTIN);
+    }
+
+    #[test]
+    fn late_local_success_is_not_published_after_cancellation() {
+        let control = RequestControl::new(TESSERACT_TIMEOUT);
+        let error = recognize_using(
+            false,
+            &control,
+            || panic!("local only"),
+            || {
+                control.cancel();
+                Ok("late local text".into())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), ApiError::Cancelled.to_string());
     }
 }

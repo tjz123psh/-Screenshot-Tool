@@ -51,6 +51,32 @@ keyframe 内存 2.2 MiB 远低于 48 MiB 硬上限，`_trim_keyframes` 在该规
 
 口径与主表一致：101 帧全部使用、输出 900x2700、keyframe 2.2 MiB、走 offline rebuild。相对 2026-08-01 主表（151.5/135.1 ms），不透明方向更快、半透明基本持平；两次测量之间没有做逐提交归因，只记录区间，匹配阈值与验收门限未改动。
 
+### 本次修复：行统计歧义与页边误裁
+
+[歧义回归](crates/vellum-stitch/tests/ambiguous_rows.rs)先在旧实现复现：不同字形位置有相同的行均值、对比度和边缘能量，实际向上/向下滚动 20 px 都被判成 stationary，240 px 画布没有增长到 260 px。修复后在线输出、默认离线重建和没有在线位置提示的独立离线重建均按完整跨度校验；另覆盖微小像素噪声与静止局部动画。校验阈值未放宽。
+
+[浏览器文字回归](crates/vellum-stitch/tests/browser_text.rs)使用本项目生成的[中英文列表页](crates/vellum-stitch/tests/fixtures/browser-list.html)和[Chromium 栅格图](crates/vellum-stitch/tests/fixtures/browser-list.png)，不包含用户页面。栅格图由 Chromium 153.0.8010.47 在 viewport 700×480、DPR 1 下等待字体加载后执行 fullPage screenshot 得到（700×1932）。测试不依赖 CI 字体或浏览器安装。该样本还复现了离线侧栏边界跨进正文和纯色页边被黑字拖染的问题，现按真实像素收缩裁剪边界，并保留纯色页边背景。
+
+此外，本次用 Chromium 实际滚动到 20 个不同位置并逐个抓取 700×480 viewport PNG，再按 39 次变速前进/回滚/继续前进序列回放。在线与**明确断言已执行重建**的离线结果均与参考页的 700×1860 已观察跨度逐字节相同。默认测试为 67 项通过、1 项需显式帧目录的测试忽略；该忽略测试本次另行执行通过。
+
+```sh
+cargo test --locked --release -p vellum-stitch
+# 显式帧目录内的文件为 0.png、20.png、44.png…1380.png；必须从同一测试页实际抓取。
+VELLUM_BROWSER_FRAMES="$PWD/target/longshot-browser-frames" \
+  cargo test --locked --release -p vellum-stitch --test browser_text -- --ignored
+cargo clippy --locked -p vellum-stitch --all-targets -- -D warnings
+cargo check --locked --workspace
+```
+
+同机 release 基准，仍是 101 帧 900×700 → 900×2700、全部帧使用、2.2 MiB 关键帧与离线重建：
+
+| 场景 | 修改前 total / add / finish | 最终实现 total / add / finish |
+|---|---|---|
+| 不透明 | 134.1 / 89.1 / 45.0 ms | 148.9 / 102.0 / 46.9 ms |
+| 半透明 | 128.4 / 85.8 / 42.5 ms | 144.7 / 98.8 / 45.9 ms |
+
+这是单轮前后测量，不作严格性能归因；最终在线均值约 1 ms/帧，总开销增加约 15 ms/101 帧。离线位置预测已精确匹配时不再从零重复搜索。新增检查不是免费，但保留普通滚动的快速路径。真实浏览器回放不等于 Wayland 采集器/完整 GUI 手动滚动验收；本次未覆盖已安装程序，也没有据此宣称所有真实页面都已修复。
+
 ### 超长画布失配恢复
 
 完整画布重定位不能对每个候选位置再比较一个完整 viewport，否则一次 miss 是 O(canvas height × viewport height)，而且 robust 路径会在每个位置创建并分区行分数。用 release 临时压力探针预先构造 **50,000 行 canvas、700 行 viewport**，再送入一帧确定不匹配的画面；构造阶段不计入 miss：

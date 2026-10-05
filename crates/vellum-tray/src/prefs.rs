@@ -4,4 +4,6 @@
 //! share one file and one validation path; this module keeps the tray's original
 //! import surface.
 
-pub use vellum_core::prefs::{Preferences, load, store};
+#[cfg(test)]
+pub use vellum_core::prefs::store;
+pub use vellum_core::prefs::{Preferences, load};

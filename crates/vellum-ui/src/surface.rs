@@ -43,7 +43,7 @@ use crate::imaging;
 use crate::paint::{self, Bounds};
 use crate::recorder::{SelectionPanelNotice, selection_panel_notice};
 use crate::selector::{Mode, Selector};
-use crate::toolbar::{ANNOTATE_BUTTONS, BUTTONS, Toolbar};
+use crate::toolbar::{ANNOTATE_BUTTONS, ANNOTATE_TOOLS, BUTTONS, Toolbar, annotation_properties};
 
 /// Layer-shell namespace. Distinct from the Python build so both can be mapped
 /// at once during development without the compositor's rules colliding.
@@ -63,21 +63,11 @@ const FOCUS_GRACE_MS: u32 = 10_000;
 const SIZE_WHEEL_STEP: f64 = 0.02;
 
 const DIM: (f64, f64, f64, f64) = (0.025, 0.03, 0.045, 0.56);
-/// Selection accent: indigo #4F46E5, the token the design system names.
-///
-/// The spec also wrote this as `(0.31, 0.36, 0.92)`, but those two forms are not
-/// the same colour — the triple resolves to `(79, 92, 235)`, a bluer hue than
-/// the named token's `(79, 70, 229)`. The hex wins because it is the precise,
-/// named value; the toolbar's primary button keeps the triple it was given, so
-/// the two accents stay one hue family rather than two.
-const ACCENT: (f64, f64, f64, f64) = (
-    0x4f as f64 / 255.0,
-    0x46 as f64 / 255.0,
-    0xe5 as f64 / 255.0,
-    1.0,
-);
+/// Warm champagne outline shared with the smoked-metal toolbar. The dark
+/// backing below keeps the fine edge visible over white screenshots.
+const ACCENT: (f64, f64, f64, f64) = (0.78, 0.69, 0.51, 1.0);
 /// Dark backing line drawn just outside the accent frame. Without it the bright
-/// indigo frame disappears over a light screenshot (a white page, a document),
+/// warm frame disappears over a light screenshot (a white page, a document),
 /// which is exactly where users select most often.
 const FRAME_BACKING: (f64, f64, f64, f64) = (0.02, 0.03, 0.06, 0.55);
 /// Handle geometry: a flat capsule rather than a bulky circle.
@@ -95,6 +85,8 @@ const DIRECT_LONGSHOT_START_HINT: &str = "拖动框选 · 松手开始 · 请使
 pub struct Outcome {
     pub action: String,
     pub cropped: Option<Rgb8>,
+    /// Private, session-only edit state. Never encode this into the shared PNG.
+    pub document: Option<crate::document::Document>,
     pub rect: Rect,
 }
 
@@ -125,6 +117,7 @@ struct State {
     selector: Selector,
     toolbar: Toolbar,
     anno_toolbar: Toolbar,
+    property_toolbar: Toolbar,
     annotator: Annotator,
     annotating: bool,
     popup: Option<Popup>,
@@ -141,6 +134,21 @@ struct State {
 }
 
 impl State {
+    fn annotation_button(&self, x: f64, y: f64) -> Option<&crate::toolbar::Button> {
+        self.anno_toolbar
+            .hit(x, y)
+            .or_else(|| self.property_toolbar.hit(x, y))
+    }
+
+    fn annotation_chrome_contains(&self, x: f64, y: f64) -> bool {
+        self.anno_toolbar.contains(x, y) || self.property_toolbar.contains(x, y)
+    }
+
+    fn dismiss_popup(&mut self) {
+        self.popup = None;
+        self.slider = false;
+    }
+
     /// Records real input activity and cancels a pending focus-loss cancel.
     ///
     /// A focus event that is immediately followed by input was a compositor
@@ -169,7 +177,8 @@ pub fn present(
         screen_h,
         selector: Selector::new(screen_w, screen_h),
         toolbar: Toolbar::new(BUTTONS),
-        anno_toolbar: Toolbar::new(ANNOTATE_BUTTONS),
+        anno_toolbar: Toolbar::new(ANNOTATE_TOOLS),
+        property_toolbar: Toolbar::new(&annotation_properties(Tool::Pen)),
         annotator: Annotator::new(),
         annotating: false,
         popup: None,
@@ -249,7 +258,13 @@ impl Emitter {
 
     /// Delivers `outcome` unless a previous call already did. Also drops the
     /// focus grace timer so a queued cancel cannot fire after a real result.
-    fn emit(&self, action: &str, cropped: Option<Rgb8>, rect: Rect) {
+    fn emit(
+        &self,
+        action: &str,
+        cropped: Option<Rgb8>,
+        rect: Rect,
+        document: Option<crate::document::Document>,
+    ) {
         {
             let mut state = self.state.borrow_mut();
             if state.finished {
@@ -263,17 +278,18 @@ impl Emitter {
         (self.handler)(Outcome {
             action: action.to_string(),
             cropped,
+            document,
             rect,
         });
     }
 
     fn cancel(&self) {
-        self.emit("cancel", None, Rect::default());
+        self.emit("cancel", None, Rect::default(), None);
     }
 
     /// Runs a toolbar action, cropping first when the action consumes pixels.
     fn invoke(&self, action: &str) {
-        let (rect, cropped) = {
+        let (rect, cropped, document) = {
             let mut state = self.state.borrow_mut();
             let rect = state.selector.rect;
             if !rect.valid() {
@@ -282,17 +298,35 @@ impl Emitter {
             // `long` never needs pixels from the overlay: the recorder grabs its
             // own frames once this surface is gone.
             if action == "long" {
-                (rect, None)
+                (rect, None, None)
             } else {
-                let bg = state.bg.clone();
-                let cropped = state
-                    .annotator
-                    .bake(&bg, rect)
-                    .and_then(|mut surface| imaging::from_surface(&mut surface).ok());
-                (rect, cropped)
+                let document = if action == "pin" {
+                    None
+                } else {
+                    selection_document(&state).ok()
+                };
+                if let Some(document) = document {
+                    if let Ok(snapshot) = document.snapshot() {
+                        (rect, Some((*snapshot.image).clone()), Some(document))
+                    } else {
+                        let bg = state.bg.clone();
+                        let cropped = state
+                            .annotator
+                            .bake(&bg, rect)
+                            .and_then(|mut image| imaging::from_surface(&mut image).ok());
+                        (rect, cropped, None)
+                    }
+                } else {
+                    let bg = state.bg.clone();
+                    let cropped = state
+                        .annotator
+                        .bake(&bg, rect)
+                        .and_then(|mut surface| imaging::from_surface(&mut surface).ok());
+                    (rect, cropped, None)
+                }
             }
         };
-        self.emit(action, cropped, rect);
+        self.emit(action, cropped, rect, document);
     }
 
     fn queue_draw(&self) {
@@ -300,6 +334,48 @@ impl Emitter {
             child.queue_draw();
         }
     }
+}
+
+/// Copy only the original selected pixels; a session must not retain the rest
+/// of the desktop merely to make a few annotations editable later.
+fn original_selection(bg: &ImageSurface, rect: Rect) -> Result<Rgb8, String> {
+    if !rect.valid()
+        || rect.x < 0
+        || rect.y < 0
+        || i64::from(rect.x) + i64::from(rect.w) > i64::from(bg.width())
+        || i64::from(rect.y) + i64::from(rect.h) > i64::from(bg.height())
+        || bg.format() != cairo::Format::ARgb32
+    {
+        return Err("选区超出原图范围".into());
+    }
+    vellum_core::image_limits::EDIT_LIMITS
+        .check(rect.w as usize, rect.h as usize, 4)
+        .map_err(|e| e.to_string())?;
+    let width = rect.w as usize;
+    let height = rect.h as usize;
+    let mut out = Vec::with_capacity(width * height * 3);
+    let stride = bg.stride() as usize;
+    bg.with_data(|bytes| {
+        for y in rect.y as usize..rect.y as usize + height {
+            let row = &bytes[y * stride + rect.x as usize * 4..][..width * 4];
+            for p in row.chunks_exact(4) {
+                let inv = 255u16 - u16::from(p[3]);
+                for c in [p[2], p[1], p[0]] {
+                    out.push((u16::from(c) + inv).min(255) as u8);
+                }
+            }
+        }
+    })
+    .map_err(|_| "无法读取原始选区".to_string())?;
+    Ok(Rgb8::from_raw(width, height, out))
+}
+
+fn selection_document(state: &State) -> Result<crate::document::Document, String> {
+    let rect = state.selector.rect;
+    crate::document::Document::from_selection(
+        original_selection(&state.bg, rect)?,
+        state.annotator.snapshot_objects(rect),
+    )
 }
 
 /// Wheel over the canvas adjusts the label's font size while the text tool is
@@ -366,6 +442,7 @@ fn connect_pointer(
                     .flatten();
                 match hit {
                     Some(id) => action = Some(id),
+                    None if state.toolbar.contains(x, y) => {}
                     None => state.selector.press(x, y),
                 }
             }
@@ -426,7 +503,7 @@ fn connect_pointer(
                     state.annotator.set_size_fraction(fraction);
                 }
             } else if state.annotating {
-                state.hover = state.anno_toolbar.hit(x, y).map(|b| b.id().to_string());
+                state.hover = state.annotation_button(x, y).map(|b| b.id().to_string());
                 state.annotator.motion(x, y);
             } else {
                 state.hover = state.toolbar.hit(x, y).map(|b| b.id().to_string());
@@ -451,6 +528,10 @@ fn annotate_press(
     y: f64,
     copy: &dyn Fn(&str) -> Result<(), ClipboardError>,
 ) -> Option<String> {
+    // Secondary buttons must never activate a control or capture a slider drag.
+    if button != 1 {
+        return None;
+    }
     if let Some(popup) = state.popup {
         // No re-layout here: hit testing reuses the bounds the draw handler
         // computed. A popup only exists because the user already clicked a
@@ -473,15 +554,21 @@ fn annotate_press(
             }
             return None;
         }
-        if let Some(button) = state.anno_toolbar.hit(x, y) {
+        if popup_layout(state, popup).is_some_and(|layout| layout.bar.contains(x, y)) {
+            return None; // popup padding/value labels are inert, not click-through
+        }
+        if let Some(button) = state.annotation_button(x, y) {
             return Some(button.id().to_string());
         }
-        state.popup = None;
+        state.dismiss_popup();
         return None;
     }
 
-    if let Some(button) = state.anno_toolbar.hit(x, y) {
+    if let Some(button) = state.annotation_button(x, y) {
         return Some(button.id().to_string());
+    }
+    if state.annotation_chrome_contains(x, y) {
+        return None;
     }
     if button == 1 && state.selector.rect.contains(x, y) {
         if state.annotator.tool() == Tool::Pick {
@@ -537,6 +624,7 @@ struct Im {
     context: IMMulticontext,
     keys: EventControllerKey,
     focused: Cell<bool>,
+    anchor: Cell<Option<(f64, f64)>>,
 }
 
 impl Im {
@@ -545,6 +633,7 @@ impl Im {
             context: IMMulticontext::new(),
             keys,
             focused: Cell::new(false),
+            anchor: Cell::new(None),
         }
     }
 
@@ -558,16 +647,21 @@ impl Im {
                 state.annotator.caret_anchor(),
             )
         };
-        if editing == self.focused.get() {
-            return;
-        }
+        let moved = self.anchor.replace(anchor) != anchor;
         if editing {
-            // Without a cursor location fcitx5 pops its candidate list in the
-            // corner of the output rather than next to the caret.
+            // A second label leaves editing=true but changes its anchor.
+            if moved && self.focused.get() {
+                self.context.reset();
+            }
             if let Some((x, y)) = anchor {
                 self.context
                     .set_cursor_location(&Rectangle::new(x as i32, y as i32, 1, 24));
             }
+        }
+        if editing == self.focused.get() {
+            return;
+        }
+        if editing {
             // Attach before focusing: GTK only routes keys to a context that is
             // on the controller, and focusing it is what enables fcitx5.
             self.keys.set_im_context(Some(&self.context));
@@ -622,7 +716,7 @@ fn connect_keys(
             if state.annotating {
                 handled = annotate_key(&mut state, key, modifiers, &mut action);
             } else {
-                handled = plain_key(&mut state, key, &mut action);
+                handled = plain_key_with_modifiers(&mut state, key, modifiers, &mut action);
             }
         }
         if let Some(action) = action {
@@ -640,6 +734,26 @@ fn connect_keys(
         }
     });
     window.add_controller(keys.clone());
+}
+
+fn preview_shortcut(key: Key, modifiers: ModifierType) -> bool {
+    matches!(key, Key::Return | Key::KP_Enter) && modifiers.contains(ModifierType::CONTROL_MASK)
+}
+
+fn plain_key_with_modifiers(
+    state: &mut State,
+    key: Key,
+    modifiers: ModifierType,
+    action: &mut Option<String>,
+) -> bool {
+    if preview_shortcut(key, modifiers) {
+        if !state.selector.rect.valid() {
+            return false;
+        }
+        *action = Some("preview".into());
+        return true;
+    }
+    plain_key(state, key, action)
 }
 
 fn plain_key(state: &mut State, key: Key, action: &mut Option<String>) -> bool {
@@ -673,6 +787,30 @@ fn annotate_key(
     modifiers: ModifierType,
     action: &mut Option<String>,
 ) -> bool {
+    if preview_shortcut(key, modifiers) {
+        if !state.selector.rect.valid() {
+            return false;
+        }
+        state.annotator.commit_text();
+        *action = Some("preview".into());
+        return true;
+    }
+    // Editing still owns printable characters, but Ctrl+Z/Y are editing
+    // commands, not literal letters appended to the text.
+    if modifiers.contains(ModifierType::CONTROL_MASK) {
+        if key == Key::z || key == Key::Z {
+            if modifiers.contains(ModifierType::SHIFT_MASK) {
+                state.annotator.redo();
+            } else {
+                state.annotator.undo();
+            }
+            return true;
+        }
+        if key == Key::y || key == Key::Y {
+            state.annotator.redo();
+            return true;
+        }
+    }
     if state.annotator.is_editing_text() {
         if key == Key::Escape || key == Key::Return || key == Key::KP_Enter {
             state.annotator.commit_text();
@@ -687,8 +825,10 @@ fn annotate_key(
     }
 
     if key == Key::Escape {
-        if state.popup.take().is_none() {
-            *action = Some("anno.exit".to_string());
+        let had_popup = state.popup.is_some();
+        state.dismiss_popup();
+        if !had_popup {
+            *action = Some("anno.back".to_string());
         }
         return true;
     }
@@ -716,13 +856,65 @@ fn annotate_key(
     }
     if let Some(ch) = key.to_unicode() {
         let pressed = ch.to_lowercase().to_string();
-        if let Some(button) = state.anno_toolbar.by_hotkey(&pressed) {
-            *action = Some(button.id().to_string());
+        if let Some(button) = ANNOTATE_BUTTONS
+            .iter()
+            .find(|b| b.hotkey.eq_ignore_ascii_case(&pressed))
+            && match button.id {
+                "anno.color" => state.annotator.tool().supports_color(),
+                "anno.width" => state.annotator.tool().supports_size(),
+                _ => true,
+            }
+        {
+            *action = Some(button.id.to_string());
         }
     }
     // Swallow everything else: stray keys must not leak to the compositor while
     // an exclusive keyboard grab is active.
     true
+}
+
+fn return_to_selection(state: &mut State) {
+    state.annotator.commit_text();
+    state.annotating = false;
+    state.dismiss_popup();
+    state.hover = None;
+}
+
+/// Places tool and property rows together, never independently on opposite sides.
+fn layout_annotation(state: &mut State, cr: &Context) {
+    let rect = state.selector.rect;
+    let tool = state.annotator.tool();
+    state
+        .property_toolbar
+        .set_specs(&annotation_properties(tool));
+    state.property_toolbar.set_enabled("anno.current", false);
+    state.property_toolbar.set_enabled("anno.guide", false);
+    state
+        .anno_toolbar
+        .set_enabled("anno.undo", state.annotator.can_undo());
+    state
+        .anno_toolbar
+        .set_enabled("anno.redo", state.annotator.can_redo());
+    state
+        .anno_toolbar
+        .layout(cr, rect, state.screen_w, state.screen_h);
+    state
+        .property_toolbar
+        .layout(cr, rect, state.screen_w, state.screen_h);
+    let tool_h = state.anno_toolbar.bar().h;
+    let height = tool_h + 6.0 + state.property_toolbar.bar().h;
+    let below = f64::from(rect.y2()) + 10.0;
+    let above = f64::from(rect.y) - 10.0 - height;
+    let y = if below + height <= f64::from(state.screen_h) - 4.0 {
+        below
+    } else if above >= 4.0 {
+        above
+    } else {
+        (f64::from(rect.y2()) - height - 4.0)
+            .clamp(4.0, (f64::from(state.screen_h) - height - 4.0).max(4.0))
+    };
+    state.anno_toolbar.move_y(y);
+    state.property_toolbar.move_y(y + tool_h + 6.0);
 }
 
 /// Applies a button id, either locally (annotate mode changes) or by emitting.
@@ -747,10 +939,15 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
             }
             return;
         }
+        "anno.back" => {
+            let mut state = state.borrow_mut();
+            return_to_selection(&mut state);
+            return;
+        }
         "anno.exit" => {
             let mut state = state.borrow_mut();
             state.annotating = false;
-            state.popup = None;
+            state.dismiss_popup();
             state.annotator = Annotator::new();
             return;
         }
@@ -760,7 +957,7 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
             // not to accept a crop they have not confirmed yet.
             let drew_something = {
                 let mut state = state.borrow_mut();
-                state.popup = None;
+                state.dismiss_popup();
                 state.annotator.commit_text();
                 state.annotating = false;
                 state.hover = None;
@@ -783,12 +980,18 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
         }
         "anno.color" => {
             let mut state = state.borrow_mut();
-            state.popup = (state.popup != Some(Popup::Color)).then_some(Popup::Color);
+            if state.annotator.tool().supports_color() {
+                state.slider = false;
+                state.popup = (state.popup != Some(Popup::Color)).then_some(Popup::Color);
+            }
             return;
         }
         "anno.width" => {
             let mut state = state.borrow_mut();
-            state.popup = (state.popup != Some(Popup::Size)).then_some(Popup::Size);
+            if state.annotator.tool().supports_size() {
+                state.slider = false;
+                state.popup = (state.popup != Some(Popup::Size)).then_some(Popup::Size);
+            }
             return;
         }
         _ => {}
@@ -797,7 +1000,7 @@ fn dispatch(emitter: &Rc<Emitter>, state: &Rc<RefCell<State>>, action: &str) {
     if let Some(tool) = Tool::from_button(action) {
         let mut state = state.borrow_mut();
         state.annotator.set_tool(tool);
-        state.popup = None;
+        state.dismiss_popup();
         return;
     }
     emitter.invoke(action);
@@ -924,7 +1127,7 @@ fn draw(state: &mut State, cr: &Context) {
         draw_longshot_handoff_hint(cr, notice, state.daemon_managed, sw, sh);
     }
 
-    if state.annotating {
+    if state.annotating || state.annotator.has_content() {
         cr.save().ok();
         cr.rectangle(
             f64::from(rect.x),
@@ -935,18 +1138,29 @@ fn draw(state: &mut State, cr: &Context) {
         cr.clip();
         state.annotator.draw(cr);
         cr.restore().ok();
+    }
 
+    if state.annotating {
         let hover = state.hover.clone();
         let active = Some(state.annotator.tool().button_id().to_string());
-        state
-            .anno_toolbar
-            .layout(cr, rect, state.screen_w, state.screen_h);
+        layout_annotation(state, cr);
         state
             .anno_toolbar
             .draw(cr, hover.as_deref(), active.as_deref());
+        state.property_toolbar.draw(cr, hover.as_deref(), None);
         draw_swatches(state, cr);
         if let Some(popup) = state.popup {
             draw_popup(state, cr, popup);
+        } else {
+            state
+                .anno_toolbar
+                .draw_tooltip(cr, hover.as_deref(), state.screen_w, state.screen_h);
+            state.property_toolbar.draw_tooltip(
+                cr,
+                hover.as_deref(),
+                state.screen_w,
+                state.screen_h,
+            );
         }
         return;
     }
@@ -961,6 +1175,9 @@ fn draw(state: &mut State, cr: &Context) {
             .toolbar
             .layout(cr, rect, state.screen_w, state.screen_h);
         state.toolbar.draw(cr, hover.as_deref(), None);
+        state
+            .toolbar
+            .draw_tooltip(cr, hover.as_deref(), state.screen_w, state.screen_h);
     }
 }
 
@@ -1153,7 +1370,7 @@ fn draw_longshot_handoff_hint(
     let bx = (sw - bw) / 2.0;
     let by = (sh - bh - 34.0).max(12.0);
     let bounds = Bounds::new(bx, by, bw, bh);
-    paint::crystal_slab(cr, bounds, 10.0);
+    paint::soft_panel(cr, bounds, 10.0);
     // The handoff rail is the one surface that carries a state colour: amber
     // when the control panel may not fit, cold blue otherwise.
     paint::stroke_rounded(
@@ -1164,7 +1381,7 @@ fn draw_longshot_handoff_hint(
         if warning {
             (0.94, 0.78, 0.45, 0.80)
         } else {
-            (0.56, 0.66, 1.0, 0.45)
+            (ACCENT.0, ACCENT.1, ACCENT.2, 0.45)
         },
     );
     paint::draw_text(
@@ -1187,7 +1404,7 @@ fn draw_center_hint(cr: &Context, text: &str, sw: f64, sh: f64) {
     let bh = th + 18.0;
     let bx = (sw - bw) / 2.0;
     let by = (sh - bh) / 2.0 - 40.0;
-    paint::crystal_slab(cr, Bounds::new(bx, by, bw, bh), 12.0);
+    paint::soft_panel(cr, Bounds::new(bx, by, bw, bh), 12.0);
     paint::draw_text(
         cr,
         CENTER_HINT_FONT,
@@ -1201,39 +1418,29 @@ fn draw_center_hint(cr: &Context, text: &str, sw: f64, sh: f64) {
 /// Small colour/width indicators on the annotate toolbar buttons, so the
 /// current choice is visible without opening a popup.
 fn draw_swatches(state: &State, cr: &Context) {
-    for button in state.anno_toolbar.buttons() {
+    for button in state.property_toolbar.buttons() {
         let bounds = button.bounds;
         match button.id() {
             "anno.color" => {
                 let (r, g, b) = state.annotator.color();
-                paint::fill_rounded(
+                paint::fill_circle(
                     cr,
-                    Bounds::new(
-                        bounds.x + bounds.w - 16.0,
-                        bounds.y + bounds.h - 9.0,
-                        10.0,
-                        4.0,
-                    ),
-                    2.0,
+                    bounds.x + 16.0,
+                    bounds.y + bounds.h / 2.0,
+                    4.0,
                     (r, g, b, 1.0),
                 );
             }
             "anno.width" => {
-                // The indicator mirrors the slider's position, so it reports the
-                // active tool's size — a line weight or a type size — rather than
-                // only the stroke width. It used to be scaled from the width
-                // alone and saturated, so the top settings all looked identical.
-                let shown = 1.0 + state.annotator.size_fraction() * 5.0;
-                paint::fill_rounded(
+                let value = size_readout(state.annotator.size());
+                let (w, h) = paint::text_size(cr, "Sans 9", &value);
+                paint::draw_text(
                     cr,
-                    Bounds::new(
-                        bounds.x + bounds.w - 18.0,
-                        bounds.y + bounds.h - 8.0,
-                        14.0,
-                        shown,
-                    ),
-                    1.0,
-                    (0.90, 0.93, 1.0, 0.85),
+                    "Sans 9",
+                    &value,
+                    bounds.x + bounds.w - w - 9.0,
+                    bounds.y + (bounds.h - h) / 2.0,
+                    (0.88, 0.84, 0.74, 1.0),
                 );
             }
             _ => {}
@@ -1285,7 +1492,7 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
         Popup::Size => "anno.width",
     };
     let anchor = state
-        .anno_toolbar
+        .property_toolbar
         .buttons()
         .iter()
         .find(|button| button.id() == id)?
@@ -1311,11 +1518,21 @@ fn popup_layout(state: &State, popup: Popup) -> Option<PopupLayout> {
 
     let mut bx = anchor.x + (anchor.w - popup_w) / 2.0;
     bx = bx.clamp(8.0, (f64::from(state.screen_w) - popup_w - 8.0).max(8.0));
-    let above = anchor.y - popup_h - 8.0;
+    let top = state
+        .anno_toolbar
+        .bar()
+        .y
+        .min(state.property_toolbar.bar().y);
+    let bottom = (state.anno_toolbar.bar().y + state.anno_toolbar.bar().h)
+        .max(state.property_toolbar.bar().y + state.property_toolbar.bar().h);
+    let above = top - popup_h - 8.0;
+    let below = bottom + 8.0;
     let by = if above >= 8.0 {
         above
+    } else if below + popup_h <= f64::from(state.screen_h) - 8.0 {
+        below
     } else {
-        anchor.y + anchor.h + 8.0
+        above.clamp(8.0, (f64::from(state.screen_h) - popup_h - 8.0).max(8.0))
     };
 
     let bar = Bounds::new(bx, by, popup_w, popup_h);
@@ -1386,7 +1603,7 @@ fn draw_popup(state: &State, cr: &Context, popup: Popup) {
     let Some(layout) = popup_layout(state, popup) else {
         return;
     };
-    paint::crystal_slab(cr, layout.bar, 11.0);
+    paint::soft_panel(cr, layout.bar, 11.0);
 
     match popup {
         Popup::Color => {
@@ -1457,7 +1674,7 @@ fn draw_size_slider(cr: &Context, track: Bounds, fraction: f64) {
             cr,
             Bounds::new(x0, track_y, handle_x - x0, SLIDER_TRACK_H),
             SLIDER_TRACK_H / 2.0,
-            (0.48, 0.62, 1.0, 0.85),
+            (ACCENT.0, ACCENT.1, ACCENT.2, 0.85),
         );
     }
     paint::fill_circle(
@@ -1474,9 +1691,13 @@ fn draw_size_slider(cr: &Context, track: Bounds, fraction: f64) {
         cy,
         SLIDER_HANDLE_R,
         1.5,
-        (0.48, 0.62, 1.0, 0.9),
+        (ACCENT.0, ACCENT.1, ACCENT.2, 0.9),
     );
 }
+
+#[cfg(test)]
+#[path = "surface_interaction_tests.rs"]
+mod interaction_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1534,7 +1755,14 @@ mod tests {
 
         // Two states: the region toolbar, and annotate mode with a popup open.
         // Each is written as its own PNG so both can be reviewed.
-        for (label, annotating) in [("plain", false), ("annotate", true)] {
+        for (label, annotating, tool, popup) in [
+            ("plain", false, Tool::Pen, None),
+            ("annotate", true, Tool::Pen, None),
+            ("annotate-color", true, Tool::Pen, Some(Popup::Color)),
+            ("annotate-text", true, Tool::Text, Some(Popup::Size)),
+            ("annotate-mosaic", true, Tool::Mosaic, None),
+            ("annotate-cover", true, Tool::Cover, None),
+        ] {
             let mut surface =
                 ImageSurface::create(cairo::Format::ARgb32, width, height).expect("target");
             let cr = Context::new(&surface).expect("cairo context");
@@ -1566,13 +1794,19 @@ mod tests {
             assert_eq!(state.selector.mode, Mode::HasSelection);
 
             state.annotating = annotating;
-            state.popup = annotating.then_some(Popup::Color);
+            state.popup = popup;
             state.annotator = Annotator::new();
+            state.annotator.set_tool(tool);
             if annotating {
                 let bg = state.bg.clone();
                 state.annotator.begin_canvas(state.selector.rect, &bg);
+                if tool == Tool::Cover {
+                    state.annotator.press(265.25, 211.75);
+                    state.annotator.motion(610.5, 265.25);
+                    state.annotator.release(610.5, 265.25);
+                }
             }
-            state.hover = Some(if annotating { "tool.arrow" } else { "ocr" }.to_string());
+            state.hover = None;
 
             draw(&mut state, &cr);
             drop(cr);
@@ -1673,7 +1907,7 @@ mod tests {
     /// actual `draw` entry point, so the selection frame, handles, size chip,
     /// toolbar and annotation layer all run together exactly as they do on
     /// screen, including whatever path state one stage leaves for the next.
-    fn overlay_state(selection: bool) -> State {
+    pub(super) fn overlay_state(selection: bool) -> State {
         let width = 400;
         let height = 300;
         let bg =
@@ -1691,7 +1925,8 @@ mod tests {
             screen_h: height,
             selector,
             toolbar: Toolbar::new(BUTTONS),
-            anno_toolbar: Toolbar::new(ANNOTATE_BUTTONS),
+            anno_toolbar: Toolbar::new(ANNOTATE_TOOLS),
+            property_toolbar: Toolbar::new(&annotation_properties(Tool::Pen)),
             annotator: Annotator::new(),
             annotating: false,
             popup: None,
@@ -1799,11 +2034,11 @@ mod tests {
             "no dark backing outside the frame: got {outside:?} \
              (a value near 249 means the backing pass is missing)"
         );
-        // And the accent body itself must still be present, indigo-dominant.
+        // The accent body remains warm and distinct from its dark backing.
         let (b, _, r, _) = pixel(64, 40);
         assert!(
-            u16::from(b) > u16::from(r) + 40,
-            "the accent frame body is not indigo: got b={b} r={r}"
+            u16::from(r) > u16::from(b) + 40,
+            "the accent frame body is not warm: got b={b} r={r}"
         );
     }
 
@@ -1847,15 +2082,13 @@ mod tests {
         // HANDLE_RADIUS is 4.5 and the ring is 1.5 wide, so the ring body spans
         // roughly r = 4.5..5.25 from the centre. Sample at r = 5 to the left.
         //
-        // The blue-minus-red margin is asserted, not merely "blue beats red":
-        // measured, the indigo ring gives b-r of about 150, while the grey seat
-        // visible once the ring is deleted gives b-r = 2. A bare check that blue
-        // exceeds red therefore passed with the entire ring removed.
+        // Assert a real warm-color margin, not merely red beating blue: the
+        // neutral dark seat must fail if the champagne ring is removed.
         let (b, g, r, a) = pixel_at(cx - 5, cy);
         assert!(a > 0, "no ring pixel at r=5: got {a} alpha");
         assert!(
-            i32::from(b) - i32::from(r) > 60,
-            "the handle is not ringed in indigo at r=5: got rgb({r},{g},{b})"
+            i32::from(r) - i32::from(b) > 60,
+            "the handle is not ringed in champagne at r=5: got rgb({r},{g},{b})"
         );
 
         // Outside the outermost painted radius (4.5 + 1.5/2 = 5.25) plus the
@@ -1996,8 +2229,8 @@ mod tests {
         let mut state = overlay_state(true);
         let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
         let cr = Context::new(&surface).expect("cairo context");
-        let rect = state.selector.rect;
-        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        state.screen_w = 1920;
+        layout_annotation(&mut state, &cr);
 
         let layout = popup_layout(&state, Popup::Size).expect("popup layout");
         let rail = layout.rail;
@@ -2051,8 +2284,8 @@ mod tests {
         let mut state = overlay_state(true);
         let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
         let cr = Context::new(&surface).expect("cairo context");
-        let rect = state.selector.rect;
-        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        state.screen_w = 1920;
+        layout_annotation(&mut state, &cr);
         let rail = popup_layout(&state, Popup::Size).expect("layout").rail;
 
         for want in [0.0, 0.25, 0.5, 0.75, 1.0] {
@@ -2078,8 +2311,7 @@ mod tests {
             state.screen_w = width;
             let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
             let cr = Context::new(&surface).expect("cairo context");
-            let rect = state.selector.rect;
-            state.anno_toolbar.layout(&cr, rect, width, state.screen_h);
+            layout_annotation(&mut state, &cr);
 
             let layout = popup_layout(&state, Popup::Size).expect("popup layout");
             assert!(
@@ -2145,8 +2377,8 @@ mod tests {
         let mut state = overlay_state(true);
         let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
         let cr = Context::new(&surface).expect("cairo context");
-        let rect = state.selector.rect;
-        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        state.screen_w = 1920;
+        layout_annotation(&mut state, &cr);
 
         let layout = popup_layout(&state, Popup::Color).expect("popup layout");
         assert_eq!(layout.items.len(), PALETTE.len());
@@ -2205,6 +2437,15 @@ mod tests {
                 keys.im_context().is_some(),
                 "the input method was not attached, so a label cannot be typed"
             );
+
+            state.borrow_mut().annotator.press(120.0, 130.0);
+            im.sync(&state);
+            assert_eq!(
+                im.anchor.get(),
+                Some((120.0, 130.0)),
+                "candidate anchor must follow a new label"
+            );
+            assert!(keys.im_context().is_some());
 
             state.borrow_mut().annotator.commit_text();
             im.sync(&state);
@@ -2382,8 +2623,8 @@ mod tests {
         // `by_hotkey` searches.
         let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
         let cr = Context::new(&surface).expect("cairo context");
-        let rect = state.selector.rect;
-        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        state.screen_w = 1920;
+        layout_annotation(&mut state, &cr);
 
         let mut action = None;
         assert!(
@@ -2432,8 +2673,8 @@ mod tests {
         let mut state = overlay_state(true);
         let surface = ImageSurface::create(cairo::Format::ARgb32, 64, 64).expect("surface");
         let cr = Context::new(&surface).expect("cairo context");
-        let rect = state.selector.rect;
-        state.anno_toolbar.layout(&cr, rect, 1920, state.screen_h);
+        state.screen_w = 1920;
+        layout_annotation(&mut state, &cr);
         // The near-black entry: a white tick on it cannot be missed.
         let swatch = popup_layout(&state, Popup::Color).expect("layout").items[4];
 
@@ -2446,7 +2687,7 @@ mod tests {
         );
 
         let bg = state.bg.clone();
-        state.annotator.begin_canvas(rect, &bg);
+        state.annotator.begin_canvas(state.selector.rect, &bg);
         assert!(state.annotator.pick(70.0, 60.0).is_some());
         assert_eq!(
             state.annotator.color_index(),

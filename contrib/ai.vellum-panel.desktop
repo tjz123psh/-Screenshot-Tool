@@ -1,9 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=vellum Settings
-GenericName=Model Access Settings
+Name=Vellum Workbench
+Name[zh_CN]=Vellum 工作台
+GenericName=Screenshot Workbench
 Comment=Configure the model API used by vellum's OCR and translation
-Comment[zh_CN]=配置 vellum 的模型接口、翻译与 OCR
+Comment[zh_CN]=截图、长图浏览、识别翻译与偏好设置
 Exec=@VELLUM_LAUNCHER@ panel
 TryExec=@VELLUM_LAUNCHER@
 Icon=ai.vellum
@@ -11,3 +12,5 @@ Terminal=false
 Categories=Settings;Utility;
 Keywords=vellum;OCR;Translate;API;设置;翻译;识别;
 StartupNotify=false
+# Compatibility entry; the main Vellum launcher now opens the same workbench.
+NoDisplay=true

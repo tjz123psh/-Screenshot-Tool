@@ -8,12 +8,11 @@
 //!    row statistics rate as perfect (repeated cards, list rows, photos).
 //!
 //! Both have a "robust" variant that discards the noisiest 20% of rows. Those
-//! are used only after the ordinary score has already failed, so a video strip
+//! are used only after ordinary matching has failed, so a video strip
 //! or blinking caret cannot lower the bar for the whole frame.
 
 use crate::signature::{
-    Cols, Sparse, content_bottom_ignore, content_top_ignore, effective_min_overlap, overlap_window,
-    trimmed_mean,
+    Cols, Sparse, content_overlap_bounds, effective_min_overlap, overlap_window, trimmed_mean,
 };
 
 /// Absolute sparse-RGB MAD limit on the normal path.
@@ -172,8 +171,7 @@ fn col_diff_rows(
     if window.length < min_overlap {
         return f32::INFINITY;
     }
-    let top = content_top_ignore(window.length);
-    let end = window.length - content_bottom_ignore(window.length);
+    let (top, end) = content_overlap_bounds(window.length, min_overlap);
     if end <= top {
         return f32::INFINITY;
     }
@@ -230,8 +228,7 @@ fn robust_col_diff_rows(
     if window.length < min_overlap {
         return f32::INFINITY;
     }
-    let top = content_top_ignore(window.length);
-    let end = window.length - content_bottom_ignore(window.length);
+    let (top, end) = content_overlap_bounds(window.length, min_overlap);
     if end <= top {
         return f32::INFINITY;
     }
@@ -310,10 +307,10 @@ fn sparse_row_scores(
     mask: &Mask<'_>,
 ) -> Option<Vec<f32>> {
     let window = overlap_window(a.height(), b.height(), offset)?;
-    let top = content_top_ignore(window.length);
-    let end = window
-        .length
-        .checked_sub(content_bottom_ignore(window.length))?;
+    let (top, end) = content_overlap_bounds(
+        window.length,
+        effective_min_overlap(a.height().min(b.height())),
+    );
     if end <= top {
         return None;
     }
@@ -427,7 +424,13 @@ pub fn is_false_motion(aligned: f32, stationary: f32, changed: f32, robust: bool
     } else {
         MAX_PIXEL_DIFF
     };
-    changed < MIN_CHANGED_FRACTION || stationary <= aligned + 0.2 || aligned > limit
+    // A tiny absolute improvement can occur by chance on unrelated text-heavy
+    // pages. Demand a material relative improvement as well, especially after
+    // a fast wheel jump leaves no real overlap. This only tightens acceptance.
+    changed < MIN_CHANGED_FRACTION
+        || stationary <= aligned + 0.2
+        || aligned > stationary * 0.85
+        || aligned > limit
 }
 
 #[cfg(test)]
