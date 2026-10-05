@@ -1,28 +1,10 @@
 #!/usr/bin/env bash
-# vellum installer.
-#
-# Usage (from a checkout):
-#   ./install.sh
-#
-# What it does:
-#   1. Installs missing Arch runtime/build packages (asks for sudo only when a
-#      package is genuinely absent)
-#   2. Builds the release binaries with cargo
-#   3. Installs vellum / vellumctl / vellum-ui / vellum-tray into ~/.local/bin
-#   4. Installs the desktop entry and the application/status icons
-#   5. Installs app-owned global shortcuts; compositor files are untouched by default
-#   6. Installs and starts the systemd user service and the tray
-#   7. Removes the cargo build tree — an end-user install never rebuilds, so
-#      the cache is pure waste; set VELLUM_SKIP_CLEANUP=1 to keep it
-#   8. Reports anything still missing and whether ~/.local/bin is on PATH
-#
-# Re-running is idempotent: every install step overwrites in place.  Unless the
-# build tree was cleaned at the end (see step 7), cargo rebuilds only what
-# changed; after a cleaned install a re-run simply rebuilds from scratch.
-#
-# Unlike its Python predecessor this script does not clone anything.  It builds
-# the tree it lives in, so there is no remote to drift from and no second copy
-# of the source to keep in sync.
+# Developer/source install: check build dependencies, build all four programs,
+# validate their shared identity, prepare a complete version bundle, then delegate
+# live mutation to `vellum release install`. No compositor configuration writes.
+# Source/build trees stay available for continued development; only the private
+# temporary bundle is cleaned. Published binary bundles use their own install.sh.
+# VELLUM_ADOPT_LEGACY=1 explicitly permits migration of a verified old installation.
 set -euo pipefail
 
 SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +34,7 @@ die()   { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 # external tools vellum shells out to.  tesseract is used as a subprocess
 # rather than linked, so no leptonica development package is needed.
 REQUIRED_PACKAGES=(
-    rust pkgconf gtk4 gtk4-layer-shell xdg-desktop-portal
+    rust pkgconf python gtk4 gtk4-layer-shell xdg-desktop-portal
     grim wl-clipboard libnotify
     tesseract tesseract-data-chi_sim tesseract-data-eng
 )
@@ -93,6 +75,9 @@ if [[ "${VELLUM_SKIP_PACKAGES:-0}" != "1" ]]; then
             if [[ $EUID -eq 0 ]]; then
                 pacman -S --needed --noconfirm "${missing_system[@]}" \
                     || die "依赖安装失败"
+            elif [[ -x "$HOME/scripts/desktop/gsudo" ]]; then
+                "$HOME/scripts/desktop/gsudo" pacman -S --needed --noconfirm "${missing_system[@]}" \
+                    || die "依赖安装未完成或已取消；不会自动重试"
             elif command -v sudo >/dev/null; then
                 sudo pacman -S --needed --noconfirm "${missing_system[@]}" \
                     || die "依赖安装失败"
@@ -110,120 +95,54 @@ fi
 
 command -v cargo >/dev/null || die "需要 cargo，请先安装：sudo pacman -S rust"
 
-# --- 1. Build -------------------------------------------------------------
-info "构建 release 二进制（首次构建需要几分钟）"
-cargo build --locked --release --manifest-path "$SRC_DIR/Cargo.toml" \
-    || die "构建失败"
+# --- Build and prepare a complete candidate -------------------------------
+PYTHON="${VELLUM_PACKAGE_PYTHON:-python3}"
+command -v "$PYTHON" >/dev/null || die "源码打包需要 python3；二进制发行包不需要此步骤"
+info "构建 release 二进制"
+cargo build --locked --release --manifest-path "$SRC_DIR/Cargo.toml" || die "构建失败"
 for bin in "${BINARIES[@]}"; do
     [[ -x "$SRC_DIR/target/release/$bin" ]] || die "构建产物缺失：$bin"
 done
-ok "构建完成"
 
-# --- 2. Install binaries --------------------------------------------------
-info "安装二进制到：$BIN_DIR"
-mkdir -p "$BIN_DIR"
-for bin in "${BINARIES[@]}"; do
-    # install(1) replaces the file rather than writing through it, so a running
-    # daemon or tray keeps its own inode and is not corrupted mid-flight.
-    install -m 0755 "$SRC_DIR/target/release/$bin" "$BIN_DIR/$bin"
-done
-ok "二进制已安装"
-
-# --- 3. Global shortcuts --------------------------------------------------
-# Standard portal registration is the default. Never modify a compositor file
-# merely because the user installed a screenshot application.
-if [[ "${VELLUM_ENABLE_LEGACY_SHORTCUTS:-0}" == "1" && "${VELLUM_SKIP_SHORTCUTS:-0}" != "1" ]]; then
-    if ! "$LAUNCHER" shortcuts install; then
-        warn "旧版桌面绑定配置未完成；标准全局快捷键仍可在应用内启用"
+umask 077
+TMP_BASE="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)"
+BUNDLE_TMP="$(mktemp -d "$TMP_BASE/vellum-source-bundle.XXXXXX")" || die "无法创建私有打包暂存目录"
+cleanup_bundle() {
+    # This exact directory was exclusively created above. No user files, source
+    # tree, build cache, installed release, settings or recovery images are here.
+    if [[ -n "$BUNDLE_TMP" && ! -L "$BUNDLE_TMP" && -f "$BUNDLE_TMP/.vellum-source-staging" ]]; then
+        case "$BUNDLE_TMP" in
+            "$TMP_BASE"/vellum-source-bundle.*) rm -rf -- "$BUNDLE_TMP" ;;
+            *) warn "暂存目录校验失败，已保留而未删除" ;;
+        esac
     fi
+}
+trap cleanup_bundle EXIT
+printf '%s\n' "vellum-source-staging" > "$BUNDLE_TMP/.vellum-source-staging"
+info "校验四个程序的构建身份并生成完整版本包"
+"$PYTHON" "$SRC_DIR/tools/package_release.py" --root "$SRC_DIR" \
+    --bin-dir "$SRC_DIR/target/release" --output "$BUNDLE_TMP/bundle" \
+    || die "打包或构建身份校验失败，已安装版本未修改"
+
+# --- Transactional user-level deployment ---------------------------------
+# Legacy desktop keybindings are a separate explicit action, never an install side effect.
+info "安装不修改 niri/Hyprland 快捷键；保留用户设置、截图与恢复资料"
+manager=(release install --bundle "$BUNDLE_TMP/bundle" --bin-dir "$BIN_DIR" \
+    --config-dir "${XDG_CONFIG_HOME:-$HOME/.config}" --data-dir "${XDG_DATA_HOME:-$HOME/.local/share}")
+if [[ -n "${VELLUM_INSTALL_ROOT:-}" ]]; then manager+=(--root "$VELLUM_INSTALL_ROOT"); fi
+if [[ "${VELLUM_ADOPT_LEGACY:-0}" == "1" ]]; then manager+=(--adopt-legacy); fi
+if [[ "${VELLUM_NO_ACTIVATE:-0}" == "1" ]]; then manager+=(--no-activate); fi
+"$SRC_DIR/target/release/vellum" "${manager[@]}" || die "版本管理器未完成安装；请以上方恢复/回退状态为准"
+
+# The source channel is for development. Deleting target here could also erase
+# a caller's custom installation root and defeats incremental development.
+if [[ "${VELLUM_REMOTE_INSTALL:-0}" == "1" ]]; then
+    info "远程临时源码将由外层清理；安装版本由用户级版本管理器持有"
 else
-    info "使用应用管理的全局快捷键，不修改 niri/Hyprland 配置；安装后请在应用内启用并授权"
+    info "源码与构建目录已保留（兼容 VELLUM_SKIP_CLEANUP=1）；临时打包目录会清理"
 fi
-
-# --- 4. Service, tray, desktop entry, icons -------------------------------
-info "安装截图服务与系统托盘"
-mkdir -p "$SYSTEMD_DIR" "$APPLICATION_DIR" "$ICON_APP_DIR" "$ICON_STATUS_DIR" "$DBUS_SERVICE_DIR" "$AUTOSTART_DIR"
-sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" "$SRC_DIR/contrib/vellum-shortcuts.service" > "$SYSTEMD_DIR/vellum-shortcuts.service"
-sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" "$SRC_DIR/contrib/ai.vellum.Shortcuts.service" > "$DBUS_SERVICE_DIR/ai.vellum.Shortcuts.service"
-sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" "$SRC_DIR/contrib/ai.vellum-shortcuts.desktop" > "$AUTOSTART_DIR/ai.vellum-shortcuts.desktop"
-sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" \
-    "$SRC_DIR/contrib/vellum.service" > "$SYSTEMD_DIR/vellum.service"
-sed "s|@VELLUM_TRAY@|$TRAY_BIN|g" \
-    "$SRC_DIR/contrib/vellum-tray.service" > "$SYSTEMD_DIR/vellum-tray.service"
-sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" \
-    "$SRC_DIR/contrib/ai.vellum.desktop" > "$APPLICATION_DIR/ai.vellum.desktop"
-sed "s|@VELLUM_LAUNCHER@|$LAUNCHER|g" \
-    "$SRC_DIR/contrib/ai.vellum-panel.desktop" > "$APPLICATION_DIR/ai.vellum-panel.desktop"
-install -m 0644 "$SRC_DIR/contrib/icons/ai.vellum.svg" \
-    "$ICON_APP_DIR/ai.vellum.svg"
-for icon in ai.vellum-symbolic ai.vellum-recording-symbolic ai.vellum-warning-symbolic; do
-    install -m 0644 "$SRC_DIR/contrib/icons/$icon.svg" "$ICON_STATUS_DIR/$icon.svg"
-done
-
-# Cache refreshes are best-effort: the files are valid without them, but a
-# running shell may otherwise not notice the new icon until the next login.
-if command -v gtk-update-icon-cache >/dev/null; then
-    gtk-update-icon-cache -f -t "$ICON_ROOT" >/dev/null 2>&1 || true
-fi
-if command -v update-desktop-database >/dev/null; then
-    update-desktop-database "$APPLICATION_DIR" >/dev/null 2>&1 || true
-fi
-
-if command -v systemctl >/dev/null; then
-    # Best-effort: under sudo (which strips XDG_RUNTIME_DIR) or in a session
-    # without a user manager this fails, and an unguarded failure would abort
-    # the install after the binaries were replaced but before the environment
-    # check and the build-tree cleanup. The hotkey path can still start the
-    # daemon on demand.
-    systemctl --user daemon-reload \
-        || warn "systemd 用户实例不可达，跳过服务单元刷新"
-    # `enable --now` will not replace an already-running daemon after an
-    # upgrade.  `vellum restart` also shuts down an instance that a hotkey
-    # spawned directly, before systemd starts the freshly installed code.
-    if systemctl --user enable vellum.service vellum-tray.service vellum-shortcuts.service \
-        && "$LAUNCHER" restart \
-        && systemctl --user restart vellum-tray.service vellum-shortcuts.service; then
-        ok "截图服务与系统托盘已启动，并将在登录后自动运行"
-    else
-        warn "截图服务暂未启动；快捷键调用时仍会自动拉起"
-    fi
-else
-    warn "未找到 systemctl；快捷键调用时会按需启动服务"
-fi
-
-# --- 5. Environment check -------------------------------------------------
-# `vellum doctor` is the single source of truth for what vellum needs; the
-# installer just runs it instead of maintaining a second, drifting checklist.
-info "检查运行环境"
-if "$LAUNCHER" doctor; then
-    ok "环境检查通过"
-else
-    warn "环境检查发现问题，详见上方 ✗ 条目"
-fi
-
-# --- 6. PATH check --------------------------------------------------------
 case ":$PATH:" in
-    *":$BIN_DIR:"*) ok "$BIN_DIR 已在 PATH 中" ;;
-    *) warn "$BIN_DIR 不在 PATH，请加入你的 shell 配置，例如：
-    echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc" ;;
+    *":$BIN_DIR:"*) ;;
+    *) warn "$BIN_DIR 不在 PATH 中；桌面入口仍可使用，终端调用请使用完整路径" ;;
 esac
-
-# --- 7. Cleanup -----------------------------------------------------------
-# The build tree exists only to produce the installed binaries.  An end user
-# never rebuilds, so the cache would otherwise sit on disk for nothing; the
-# install is complete by this point, so nothing below depends on it.
-# VELLUM_SKIP_CLEANUP=1 keeps it for incremental rebuilds.
-if [[ "${VELLUM_SKIP_CLEANUP:-0}" != "1" ]]; then
-    rm -rf -- "$SRC_DIR/target"
-    ok "已清理编译缓存（target/）"
-else
-    info "已保留编译缓存（VELLUM_SKIP_CLEANUP=1）"
-fi
-
-echo
-ok "安装完成，vellum 图标已加入系统托盘。"
-info "状态检查：vellum status；完整诊断：vellum doctor"
-info "键位与窗口规则示例见 $SRC_DIR/contrib/：niri-vellum.kdl、hyprland-vellum.conf、hyprland-vellum.lua"
-if [[ "${VELLUM_REMOTE_INSTALL:-0}" != "1" ]]; then
-    info "源码目录 $SRC_DIR 已保留；确认无需保留时可自行删除"
-fi
+ok "安装处理完成；实际激活状态以上方版本管理器报告为准"

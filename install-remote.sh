@@ -1,43 +1,38 @@
 #!/usr/bin/env bash
-# vellum remote installer.
-#
-# Downloads the latest vellum source from GitHub and runs the in-tree
-# install.sh.  Everything is staged in a temporary directory that is removed
-# on every exit path, so a successful install leaves nothing behind except the
-# binaries, systemd units, desktop entry, icons and the tray.
-#
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install-remote.sh | bash
-#
-# install.sh switches pass through as environment variables:
-#   VELLUM_SKIP_PACKAGES=1 VELLUM_SKIP_SHORTCUTS=1 VELLUM_SKIP_CLEANUP=1
+# Explicit developer source channel. Ordinary users should install a verified
+# binary bundle; this script never silently fetches a moving main branch.
 set -euo pipefail
-
-REPO="tjz123psh/-Screenshot-Tool"
-BRANCH="main"
-TARBALL_URL="https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz"
-
-info() { printf '\033[1;34m::\033[0m %s\n' "$*"; }
-die()  { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
-
-command -v curl >/dev/null 2>&1 || die "需要 curl（Arch: sudo pacman -S curl）"
-command -v tar  >/dev/null 2>&1 || die "需要 tar（Arch: sudo pacman -S tar）"
-
-# Stage the whole install in a temp dir.  The trap fires on success and on
-# failure, so neither the source tree nor the cargo build tree ever survives.
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/vellum-install.XXXXXX")"
-trap 'rm -rf -- "$tmp_dir"' EXIT
-
-info "下载 vellum（$BRANCH 分支）..."
-curl -fsSL --retry 3 "$TARBALL_URL" -o "$tmp_dir/vellum.tar.gz" \
-    || die "下载失败：$TARBALL_URL"
-
-info "解压源码..."
-mkdir -p "$tmp_dir/src"
-tar -xzf "$tmp_dir/vellum.tar.gz" -C "$tmp_dir/src" --strip-components=1
-[[ -f "$tmp_dir/src/install.sh" ]] || die "下载的源码缺少 install.sh，已中止"
-
-cd "$tmp_dir/src"
-# Mark this as a remote install so install.sh skips the "source tree kept"
-# hint: the source lives in our temp dir and vanishes on exit.
-VELLUM_REMOTE_INSTALL=1 bash install.sh
+REF="${VELLUM_SOURCE_REF:-}"
+REPO="${VELLUM_SOURCE_REPO:-tjz123psh/-Screenshot-Tool}"
+die() { printf '%s\n' "$*" >&2; exit 1; }
+[[ "$REF" =~ ^[0-9a-f]{40}$ ]] || die '远程源码安装需要 VELLUM_SOURCE_REF=完整40位提交SHA；普通用户请使用版本化发行包，不会自动拉取main。'
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$REPO" != ../* && "$REPO" != */.. ]] || die '源码仓库名称无效'
+command -v git >/dev/null || die '固定提交源码安装需要git；二进制发行包不需要此步骤'
+umask 077
+TMP_BASE="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)"
+TMP="$(mktemp -d "$TMP_BASE/vellum-fixed-source.XXXXXX")"
+cleanup() {
+    if [[ -n "$TMP" && ! -L "$TMP" && -f "$TMP/.vellum-fixed-source" ]]; then
+        case "$TMP" in "$TMP_BASE"/vellum-fixed-source.*) rm -rf -- "$TMP" ;; esac
+    fi
+}
+trap cleanup EXIT
+printf '%s\n' 'private fixed-source checkout' > "$TMP/.vellum-fixed-source"
+safe_git() {
+    env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        git -c core.hooksPath=/dev/null -c credential.helper= \
+        -c protocol.file.allow=never -c submodule.recurse=false "$@"
+}
+printf '获取固定提交 %s（开发源码通道）\n' "$REF"
+safe_git init --quiet --template= "$TMP/src" > "$TMP/git.log" 2>&1 || die '无法创建私有源码目录，安装版未修改'
+safe_git -C "$TMP/src" remote add origin "https://github.com/$REPO.git" >> "$TMP/git.log" 2>&1 || die '无法设置源码来源，安装版未修改'
+safe_git -C "$TMP/src" fetch --quiet --depth=1 --no-tags origin "$REF" >> "$TMP/git.log" 2>&1 || die '无法获取指定提交；请检查网络、仓库权限与提交SHA。安装版未修改'
+actual="$(safe_git -C "$TMP/src" rev-parse --verify FETCH_HEAD 2>> "$TMP/git.log")" || die '无法验证源码提交'
+[[ "$actual" == "$REF" ]] || die '实际源码提交不匹配，已拒绝安装'
+safe_git -C "$TMP/src" checkout --quiet --detach FETCH_HEAD >> "$TMP/git.log" 2>&1 || die '无法检出已验证提交'
+[[ -f "$TMP/src/install.sh" && -f "$TMP/src/tools/package_release.py" && -f "$TMP/src/crates/vellum-cli/src/release.rs" ]] || die '此提交尚不支持版本化安装；请使用新版本发行包，未运行旧式覆盖安装器'
+(
+    cd -- "$TMP/src"
+    VELLUM_REMOTE_INSTALL=1 bash install.sh
+)

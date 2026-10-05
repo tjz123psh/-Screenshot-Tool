@@ -3,15 +3,18 @@
 //! This is the hotkey hot path: niri runs a binary that ends up here, so the
 //! code must not touch GTK, spawn helpers, or read config before the request
 //! is on the wire. The Python version measurably lost time by sending a
-//! separate `ping` before every action; here the action goes out first and
-//! service activation is only attempted after a failure.
+//! separate `ping` before every action. Versioned routing intentionally pays
+//! that handshake: a legacy daemon ignores unknown fields and must never see a
+//! managed action before its identity is known. New peers reuse one connection.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{Action, MAX_MESSAGE_BYTES, Request, Response, encode_line};
+use crate::protocol::{
+    Action, MAX_MESSAGE_BYTES, PeerIdentity, Request, Response, control, encode_line,
+};
 
 /// Timeout for `ping`: only used to decide whether activation is needed.
 pub const PING_TIMEOUT: Duration = Duration::from_millis(150);
@@ -27,20 +30,134 @@ pub fn send(request: &Request, timeout: Duration) -> Option<Response> {
 
 /// Same as [`send`], with an explicit socket path (used by tests).
 pub fn send_to(socket: &PathBuf, request: &Request, timeout: Duration) -> Option<Response> {
+    let deadline = Instant::now().checked_add(timeout)?;
+    if let Request::Action { action, args, .. } = request {
+        return send_action_to(
+            socket,
+            *action,
+            args,
+            deadline,
+            &control::current_identity(),
+        );
+    }
     let stream = UnixStream::connect(socket).ok()?;
-    // Both directions get the timeout: a daemon that accepted the connection
-    // but never answers must not hold up the hotkey.
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
+    exchange(&stream, request, deadline).ok()
+}
 
-    let mut writer = &stream;
-    writer.write_all(&encode_line(request)).ok()?;
-    writer.flush().ok()?;
+fn send_action_to(
+    socket: &PathBuf,
+    action: Action,
+    args: &[String],
+    deadline: Instant,
+    local: &PeerIdentity,
+) -> Option<Response> {
+    if let Err(error) = control::check_action_identity(local, Some(local)) {
+        return Some(error.response());
+    }
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return None;
+        }
+        Err(_) => {
+            return Some(control::refusal(
+                "identity-unavailable",
+                control::IDENTITY_UNAVAILABLE,
+            ));
+        }
+    };
+    let peer = match exchange(&stream, &Request::Ping, deadline) {
+        Ok(peer) => peer,
+        Err(_) => {
+            return Some(control::refusal(
+                "identity-unavailable",
+                control::IDENTITY_UNAVAILABLE,
+            ));
+        }
+    };
+    if let Err(error) = control::check_action_identity(local, peer.identity.as_ref()) {
+        return Some(error.response());
+    }
+    if !peer.is_running() {
+        return Some(peer);
+    }
+    // A legacy development daemon serves exactly one request per connection.
+    // Managed peers always use the verified connection for the action, so a
+    // current-link/socket replacement cannot swap the daemon between stages.
+    if peer.identity.is_none() {
+        stream = UnixStream::connect(socket).ok()?;
+    }
+    let request = Request::Action {
+        action,
+        args: args.to_vec(),
+        identity: Some(local.clone()),
+    };
+    match exchange(&stream, &request, deadline) {
+        Ok(response) if response.no_fallback => Some(response),
+        Ok(response) => match control::check_action_identity(local, response.identity.as_ref()) {
+            Ok(()) => Some(response),
+            Err(error) => Some(error.response()),
+        },
+        // An action may already have run. Never repeat it via fallback after
+        // a lost/malformed acknowledgement, regardless of installation mode.
+        Err(_) => Some(control::refusal(
+            "action-outcome-unknown",
+            "截图任务回执丢失，未自动重试；请先检查当前截图或服务状态",
+        )),
+    }
+}
 
+fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC deadline"))
+}
+
+fn exchange(
+    stream: &UnixStream,
+    request: &Request,
+    deadline: Instant,
+) -> std::io::Result<Response> {
+    let payload = encode_line(request);
+    if payload.len() > MAX_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IPC request too large",
+        ));
+    }
+    let mut socket = stream;
+    let mut written = 0;
+    while written < payload.len() {
+        stream.set_write_timeout(Some(remaining(deadline)?))?;
+        let count = socket.write(&payload[written..])?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        written += count;
+    }
     let mut line = Vec::new();
-    let mut reader = BufReader::new(&stream).take(MAX_MESSAGE_BYTES as u64);
-    reader.read_until(b'\n', &mut line).ok()?;
-    serde_json::from_slice(trim_newline(&line)).ok()
+    let mut buffer = [0u8; 1024];
+    loop {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        let count = socket.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if line.len() + count > MAX_MESSAGE_BYTES {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        line.extend_from_slice(&buffer[..count]);
+        if line.contains(&b'\n') {
+            break;
+        }
+    }
+    serde_json::from_slice(trim_newline(&line)).map_err(|_| std::io::ErrorKind::InvalidData.into())
 }
 
 fn trim_newline(line: &[u8]) -> &[u8] {
@@ -86,10 +203,7 @@ use std::io::Read as _;
 
 /// Send an action, activating the daemon once if it is not reachable.
 pub fn route_action(action: Action, args: &[String]) -> Routed {
-    let request = Request::Action {
-        action,
-        args: args.to_vec(),
-    };
+    let request = Request::action(action, args.to_vec());
 
     if let Some(response) = send(&request, ACTION_TIMEOUT) {
         return classify(response);
@@ -104,7 +218,13 @@ pub fn route_action(action: Action, args: &[String]) -> Routed {
 }
 
 fn classify(response: Response) -> Routed {
-    if response.accepted {
+    if response.no_fallback {
+        Routed::Rejected(
+            response
+                .message
+                .unwrap_or_else(|| control::IDENTITY_UNAVAILABLE.into()),
+        )
+    } else if response.accepted {
         Routed::Accepted
     } else if response.running {
         // The daemon is alive and declined on purpose: a selector already owns
@@ -279,5 +399,177 @@ mod tests {
             classify(Response::error("cannot launch region")),
             Routed::Unavailable
         );
+    }
+
+    fn managed_identity() -> PeerIdentity {
+        PeerIdentity {
+            managed: true,
+            build_id: Some("0.2.0-synthetic-a".into()),
+            ipc_schema: Some(1),
+        }
+    }
+
+    struct SocketFixture {
+        directory: PathBuf,
+        socket: PathBuf,
+    }
+    impl SocketFixture {
+        fn new() -> (Self, std::os::unix::net::UnixListener) {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "vellum-ipc-client-test-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let socket = directory.join("peer.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            (Self { directory, socket }, listener)
+        }
+    }
+    impl Drop for SocketFixture {
+        fn drop(&mut self) {
+            // Only the exact socket and newly-created empty directory are ours.
+            let _ = std::fs::remove_file(&self.socket);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    fn mock_exchange(
+        local: PeerIdentity,
+        peer: Vec<u8>,
+        answer: Option<Response>,
+    ) -> (Response, Vec<Request>) {
+        use std::io::{BufRead, BufReader};
+        let (fixture, listener) = SocketFixture::new();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(stream) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(error) => panic!("mock accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut requests = vec![serde_json::from_str::<Request>(&line).unwrap()];
+            stream.write_all(&peer).unwrap();
+            line.clear();
+            if reader.read_line(&mut line).unwrap() > 0 {
+                requests.push(serde_json::from_str(&line).unwrap());
+                if let Some(answer) = answer {
+                    stream.write_all(&encode_line(&answer)).unwrap();
+                }
+            }
+            requests
+        });
+        let response = send_action_to(
+            &fixture.socket,
+            Action::Region,
+            &[],
+            Instant::now() + Duration::from_secs(2),
+            &local,
+        )
+        .unwrap();
+        let requests = handle.join().unwrap();
+        (response, requests)
+    }
+
+    #[test]
+    fn managed_client_never_sends_work_to_legacy_or_different_build() {
+        for identity in [
+            None,
+            Some(PeerIdentity {
+                build_id: Some("0.2.0-synthetic-b".into()),
+                ..managed_identity()
+            }),
+        ] {
+            let peer = Response {
+                running: true,
+                identity,
+                ..Response::default()
+            };
+            let (response, requests) = mock_exchange(managed_identity(), encode_line(&peer), None);
+            assert!(response.no_fallback && !response.accepted && response.running);
+            assert!(matches!(classify(response), Routed::Rejected(_)));
+            assert_eq!(requests.len(), 1);
+            assert!(matches!(requests[0], Request::Ping));
+        }
+    }
+
+    #[test]
+    fn managed_client_matches_then_sends_its_identity_on_the_same_connection() {
+        let identity = managed_identity();
+        let peer = Response {
+            running: true,
+            identity: Some(identity.clone()),
+            ..Response::default()
+        };
+        let answer = Response {
+            accepted: true,
+            ..peer.clone()
+        };
+        let (response, requests) =
+            mock_exchange(identity.clone(), encode_line(&peer), Some(answer));
+        assert_eq!(classify(response), Routed::Accepted);
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(&requests[1], Request::Action { identity: Some(sent), .. } if sent == &identity)
+        );
+    }
+
+    #[test]
+    fn managed_client_does_not_replay_work_when_action_acknowledgement_is_lost() {
+        let peer = Response {
+            running: true,
+            identity: Some(managed_identity()),
+            ..Response::default()
+        };
+        let (response, requests) = mock_exchange(managed_identity(), encode_line(&peer), None);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("action-outcome-unknown")
+        );
+        assert!(matches!(classify(response), Routed::Rejected(_)));
+    }
+
+    #[test]
+    fn managed_client_rejects_malformed_identity_reply_without_leaking_it() {
+        let (response, requests) = mock_exchange(
+            managed_identity(),
+            b"synthetic-private-token\n".to_vec(),
+            None,
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(response.no_fallback);
+        assert!(!format!("{response:?}").contains("synthetic-private-token"));
+    }
+
+    #[test]
+    fn no_fallback_takes_precedence_even_over_inconsistent_running_and_accepted_bits() {
+        let response = Response {
+            running: false,
+            accepted: true,
+            no_fallback: true,
+            message: Some("synthetic fixed refusal".into()),
+            ..Response::default()
+        };
+        assert!(matches!(classify(response), Routed::Rejected(_)));
     }
 }

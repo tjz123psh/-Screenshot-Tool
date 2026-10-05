@@ -9,7 +9,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use vellum_cli::{diagnostics, shortcuts, ui};
+use vellum_cli::{diagnostics, release, shortcuts, ui};
 use vellum_ipc::client::{self, Routed};
 use vellum_ipc::{Action, State};
 
@@ -31,6 +31,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 安全安装、查看、回退、修复或卸载版本化程序
+    Release {
+        #[command(subcommand)]
+        command: release::ReleaseCommand,
+    },
+    /// 显示可追踪的版本、源码和构建身份
+    BuildInfo {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 生成可公开分享的脱敏支持报告（不包含截图或原始配置）
+    Support {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+    },
     /// 框选截图
     Region {
         #[command(flatten)]
@@ -218,6 +235,13 @@ impl OutputFlags {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-info-json")) {
+        if std::env::args_os().count() != 2 {
+            return ExitCode::from(2);
+        }
+        println!("{}", vellum_core::build_info::json());
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
@@ -237,6 +261,27 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<u8> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Release { command } => {
+            release::run(command).map(|code| u8::try_from(code).unwrap_or(1))
+        }
+        Command::BuildInfo { json } => {
+            let info = vellum_core::build_info::current();
+            if json {
+                println!("{}", vellum_core::build_info::json());
+            } else {
+                let source = match info.source_dirty {
+                    Some(true) => "开发构建（源码有修改）",
+                    Some(false) => "干净源码构建",
+                    None => "源码状态未知",
+                };
+                println!(
+                    "Vellum {}\n构建：{}\n目标：{}\n来源：{}\n{}",
+                    info.version, info.build_id, info.target, info.source_commit, source
+                );
+            }
+            Ok(0)
+        }
+        Command::Support { json, output } => support(json, output),
         Command::Region { output } => capture(Action::Region, &output, &[]),
         Command::Long {
             output,
@@ -394,6 +439,33 @@ fn status(json: bool) -> anyhow::Result<u8> {
     println!("vellum 服务已就绪 · PID {pid} · {state}");
     if let Some(event) = response.last_event.as_deref() {
         println!("最近活动：{event}");
+    }
+    Ok(0)
+}
+
+fn support(json: bool, output: Option<std::path::PathBuf>) -> anyhow::Result<u8> {
+    let report = diagnostics::support_report();
+    let mut body = serde_json::to_vec_pretty(&report)?;
+    body.push(10); // trailing newline
+    if let Some(path) = output {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        match vellum_core::io::write_private_file_atomic(&path, &body) {
+            Ok(()) => println!("脱敏支持报告已写入"),
+            Err(error) if vellum_core::io::committed_save_path(&error).is_some() => {
+                eprintln!("支持报告已写入，但目录同步未确认；请核对后再分享");
+                return Ok(1);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        if !json {
+            println!("Vellum 支持报告（默认脱敏，不含截图、识别正文或原始配置）");
+        }
+        print!("{}", String::from_utf8(body)?);
     }
     Ok(0)
 }

@@ -159,6 +159,14 @@ fn recover_display_environment() {
 }
 
 fn main() -> std::process::ExitCode {
+    // Packaging and diagnostics must not initialise GTK, a display, services or user settings.
+    if std::env::args_os()
+        .skip(1)
+        .any(|argument| argument == "--build-info-json")
+    {
+        println!("{}", vellum_core::build_info::json());
+        return std::process::ExitCode::SUCCESS;
+    }
     // Must run before GTK initialises: without a reachable display every later
     // step fails with the same warning the user was seeing.
     recover_display_environment();

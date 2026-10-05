@@ -41,6 +41,25 @@ use crate::model_picker::ModelPicker;
 use crate::theme;
 
 const APP_ID: &str = "ai.vellum.panel";
+
+fn about_details(build: &vellum_core::build_info::BuildInfo, installation: &str) -> String {
+    let source = match build.source_dirty {
+        Some(true) => "包含本地源码修改（开发构建）",
+        Some(false) => "源码工作区干净（不等于发布者认证）",
+        None => "源码来源未知，不能视为干净发布版",
+    };
+    format!(
+        "{installation}\n{source}\n\n构建：{}\n源码提交：{}\n目标：{}\n编译器：{}\n构建模式：{}\n配置格式：{} · 通信格式：{}",
+        build.build_id,
+        build.source_commit,
+        build.target,
+        build.rustc,
+        build.profile,
+        build.config_schema,
+        build.ipc_schema
+    )
+}
+
 /// Comfortable at 800×560 without turning settings into a full-screen dashboard.
 /// Smaller outputs are clamped by panel_size; each page scrolls independently.
 const WIDTH: i32 = 800;
@@ -771,6 +790,9 @@ impl Panel {
         let nav_spacer = GtkBox::new(Orientation::Vertical, 0);
         nav_spacer.set_vexpand(true);
         sidebar.append(&nav_spacer);
+        let about_button = controls::secondary_button("关于 Vellum", Some("help-about-symbolic"));
+        about_button.set_tooltip_text(Some(&format!("版本 {} · 构建信息", vellum_core::VERSION)));
+        sidebar.append(&about_button);
 
         let nav_items = vec![nav_home, nav_shortcuts, nav_capture, nav_text, nav_api];
 
@@ -884,6 +906,14 @@ impl Panel {
             probing: Cell::new(false),
         });
 
+        let weak = Rc::downgrade(&panel);
+        about_button.connect_clicked(move |_| {
+            if let Some(panel) = weak.upgrade()
+                && !panel.closed.get()
+            {
+                panel.show_about();
+            }
+        });
         panel.form.populate(&panel.base.borrow(), &prefs);
         panel.refresh_credentials();
         for (button, action) in launchers {
@@ -927,6 +957,27 @@ impl Panel {
         PANELS.with(|slot| slot.borrow_mut().push((panel.id, panel.clone())));
         panel.connect(&close);
         panel
+    }
+
+    fn show_about(&self) {
+        let build = vellum_core::build_info::current();
+        let installation = if vellum_core::build_info::managed_release_id().is_some() {
+            "受管理安装 · 当前运行版本"
+        } else if vellum_core::build_info::is_managed_location() {
+            "安装身份校验失败 · 请运行安装修复"
+        } else {
+            "开发目录或独立运行"
+        };
+        let details = about_details(&build, installation);
+        let dialog = gtk4::AboutDialog::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .program_name("Vellum")
+            .version(&build.version)
+            .comments(&details)
+            .license_type(gtk4::License::MitX11)
+            .build();
+        dialog.present();
     }
 
     fn connect(self: &Rc<Self>, close: &Button) {
@@ -1991,6 +2042,18 @@ mod live_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_uses_compiled_identity_and_explicit_unknown_state() {
+        let mut build = vellum_core::build_info::current();
+        build.source_dirty = None;
+        let details = about_details(&build, "开发目录或独立运行");
+        assert!(details.contains(&build.build_id));
+        assert!(details.contains("来源未知"));
+        assert!(details.contains(&build.target));
+        build.source_dirty = Some(true);
+        assert!(about_details(&build, "受管理安装").contains("本地源码修改"));
+    }
 
     fn values() -> FormValues {
         FormValues::from_config(&Config::default(), &Preferences::default())

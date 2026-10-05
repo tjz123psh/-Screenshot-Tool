@@ -26,6 +26,13 @@ const TIMEOUT: Duration = Duration::from_millis(700);
 const EXIT_REJECTED: u8 = 2;
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-info-json")) {
+        if std::env::args_os().count() != 2 {
+            return ExitCode::from(2);
+        }
+        println!("{}", vellum_core::build_info::json());
+        return ExitCode::SUCCESS;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Anything that is not one of the three hotkey actions belongs to the full
@@ -45,6 +52,7 @@ fn main() -> ExitCode {
     let request = Request::Action {
         action,
         args: request_args,
+        identity: None, // client::send supplies and verifies the running release identity.
     };
 
     match decide(client::send(&request, TIMEOUT)) {
@@ -77,6 +85,11 @@ enum Decision {
 
 fn decide(response: Option<Response>) -> Decision {
     match response {
+        Some(response) if response.no_fallback => Decision::Rejected(
+            response
+                .message
+                .unwrap_or_else(|| "运行版本不一致；请保存并关闭旧窗口后重新打开".into()),
+        ),
         Some(response) if response.accepted => Decision::Accepted,
         Some(response) if response.running => Decision::Rejected(
             response
@@ -135,24 +148,69 @@ fn fallback(args: &[String]) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// Prefer the sibling binary so a build tree or staging directory stays
-/// self-consistent, then fall back to PATH.
+/// A managed client may only execute its own immutable version's sibling.
+/// A missing or replaced sibling is damage, not permission to try another PATH.
 fn locate(program: &str) -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    let managed = vellum_core::build_info::is_managed_location();
+    let verified = !managed || vellum_core::build_info::managed_release_id().is_some();
+    locate_from(
+        std::env::current_exe().ok().as_deref(),
+        program,
+        managed,
+        verified,
+        || vellum_core::proc::which(program),
+    )
+}
+
+fn locate_from(
+    executable: Option<&std::path::Path>,
+    program: &str,
+    managed: bool,
+    verified: bool,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if managed && !verified {
+        return None;
+    }
+    if let Some(dir) = executable.and_then(|path| path.parent()) {
         let candidate = dir.join(program);
-        if vellum_core::proc::is_executable(&candidate) {
+        let regular = std::fs::symlink_metadata(&candidate)
+            .ok()
+            .is_some_and(|meta| meta.file_type().is_file());
+        if (!managed || regular) && vellum_core::proc::is_executable(&candidate) {
             return Some(candidate);
         }
     }
-
-    vellum_core::proc::which(program)
+    if managed { None } else { fallback() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_no_fallback_wins_even_if_peer_is_stopping() {
+        let reply = Response {
+            running: false,
+            no_fallback: true,
+            message: Some("版本不一致".into()),
+            ..Response::default()
+        };
+        assert_eq!(decide(Some(reply)), Decision::Rejected("版本不一致".into()));
+    }
+
+    #[test]
+    fn managed_missing_or_invalid_siblings_never_search_path() {
+        let foreign = || Some(PathBuf::from("/different-release/vellum"));
+        let absent = std::path::Path::new("/nonexistent/vellum-managed-fixture/bin/vellumctl");
+        assert!(locate_from(Some(absent), "vellum", true, true, foreign).is_none());
+        assert!(locate_from(Some(absent), "vellum", true, false, foreign).is_none());
+        assert!(locate_from(None, "vellum", true, true, foreign).is_none());
+        assert_eq!(
+            locate_from(Some(absent), "vellum", false, true, foreign),
+            foreign()
+        );
+    }
 
     #[test]
     fn an_accepted_reply_finishes_the_keypress() {

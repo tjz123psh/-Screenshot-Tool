@@ -183,6 +183,12 @@ pub fn save_bytes(dir: &Path, prefix: &str, png: &[u8]) -> std::io::Result<PathB
 }
 
 /// Replace a target only after the complete image has reached disk.
+/// Atomically replace caller-selected bytes with private file permissions.
+/// Post-commit durability warnings stay distinguishable through committed_save_path.
+pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_file::replace(path, bytes)
+}
+
 pub(crate) fn replace_image_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_file::replace(path, bytes)
 }

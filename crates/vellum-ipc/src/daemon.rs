@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::log::{Log, create_private_dir};
 use crate::protocol::{
-    Action, BYPASS_ENV, MAX_MESSAGE_BYTES, Request, Response, State, encode_line,
+    Action, BYPASS_ENV, MAX_MESSAGE_BYTES, PeerIdentity, Request, Response, State, control,
+    encode_line,
 };
 #[cfg(test)]
 use vellum_core::longshot_trace::TRACE_ARG;
@@ -74,6 +75,7 @@ pub struct Service {
     log: Arc<Log>,
     /// Path of the binary used to run actions; overridable in tests.
     exe: Arc<PathBuf>,
+    identity: PeerIdentity,
     running: Arc<AtomicBool>,
     /// Serializes child completion, launch and shutdown. The state mutex alone
     /// cannot be dropped around cursor/notification side effects without
@@ -108,6 +110,7 @@ impl Service {
             })),
             log,
             exe: Arc::new(exe),
+            identity: control::current_identity(),
             running: Arc::new(AtomicBool::new(true)),
             lifecycle: Arc::new(Mutex::new(())),
             display_env: Arc::new(Mutex::new(None)),
@@ -161,6 +164,7 @@ impl Service {
             action_pid,
             pid: Some(std::process::id()),
             version: Some(vellum_core::VERSION.to_string()),
+            identity: Some(self.identity.clone()),
             started_at: Some(inner.started_at),
             last_event: Some(inner.last_event.clone()),
             last_event_at: Some(inner.last_event_at),
@@ -581,9 +585,16 @@ impl Service {
     /// Handle one request. Public so integration tests can exercise the
     /// protocol without a socket.
     pub fn handle(&self, request: Request) -> Response {
-        match request {
+        let mut response = match request {
             Request::Ping | Request::Status => self.snapshot(),
-            Request::Action { action, args } => self.launch(action, &args),
+            Request::Action {
+                action,
+                args,
+                identity,
+            } => match control::check_action_identity(&self.identity, identity.as_ref()) {
+                Ok(()) => self.launch(action, &args),
+                Err(error) => error.response(),
+            },
             Request::Shutdown => {
                 let _lifecycle = self.lock_lifecycle();
                 self.running.store(false, Ordering::SeqCst);
@@ -592,7 +603,9 @@ impl Service {
                     ..Response::default()
                 }
             }
-        }
+        };
+        response.identity = Some(self.identity.clone());
+        response
     }
 }
 
@@ -816,21 +829,32 @@ fn serve_connection(service: &Service, stream: UnixStream) {
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
-    let mut line = Vec::new();
-    {
-        use std::io::Read as _;
-        let mut reader = BufReader::new(&stream).take(MAX_MESSAGE_BYTES as u64);
-        if reader.read_until(b'\n', &mut line).is_err() {
-            return;
+    // New clients send Ping then Action on this same authenticated peer socket.
+    // Legacy one-line clients still work; closing their socket ends the loop.
+    // At most two bounded frames prevent an idle peer monopolising a worker.
+    let mut reader = BufReader::new(&stream);
+    for _ in 0..2 {
+        let mut line = Vec::new();
+        if !matches!((&mut reader).take(MAX_MESSAGE_BYTES as u64).read_until(b'\n', &mut line), Ok(size) if size > 0)
+        {
+            break;
+        }
+        let response = match serde_json::from_slice::<Request>(&line) {
+            Ok(request) => service.handle(request),
+            Err(_) => Response::error("无效请求"),
+        };
+        let mut writer = &stream;
+        if writer
+            .write_all(&encode_line(&response))
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
+            break;
+        }
+        if !service.is_running() {
+            break;
         }
     }
-    let response = match serde_json::from_slice::<Request>(&line) {
-        Ok(request) => service.handle(request),
-        Err(_) => Response::error("无效请求"),
-    };
-    let mut writer = &stream;
-    let _ = writer.write_all(&encode_line(&response));
-    let _ = writer.flush();
 }
 
 #[cfg(test)]
@@ -1075,5 +1099,101 @@ mod tests {
             prepare_action_args(Action::Region, &original, true).unwrap(),
             (original, None)
         );
+    }
+
+    fn managed_test_service() -> Service {
+        let mut service = service();
+        service.identity = PeerIdentity {
+            managed: true,
+            build_id: Some("0.2.0-synthetic-managed".into()),
+            ipc_schema: Some(1),
+        };
+        service
+    }
+
+    #[test]
+    fn managed_daemon_rejects_legacy_and_mismatched_work_without_side_effects() {
+        let service = managed_test_service();
+        for identity in [
+            None,
+            Some(PeerIdentity::default()),
+            Some(PeerIdentity {
+                managed: true,
+                build_id: Some("0.2.0-other-synthetic".into()),
+                ipc_schema: Some(1),
+            }),
+        ] {
+            let response = service.handle(Request::Action {
+                action: Action::Long,
+                args: vec![],
+                identity,
+            });
+            assert!(response.no_fallback && response.running && !response.accepted);
+            assert!(response.error_code.is_some());
+            assert!(
+                service.lock().active.is_none(),
+                "incompatible request must not launch or toggle a child"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_daemon_management_remains_available_for_unknown_or_broken_identity() {
+        let mut service = managed_test_service();
+        service.identity.build_id = None;
+        assert!(service.handle(Request::Ping).is_running());
+        let status = service.handle(Request::Status);
+        assert_eq!(status.state, Some(State::Idle));
+        assert_eq!(status.identity.unwrap().build_id, None);
+        assert!(service.handle(Request::Shutdown).ok);
+        assert!(!service.is_running());
+        let refusal = service.handle(Request::action(Action::Region, vec![]));
+        assert!(
+            refusal.no_fallback && refusal.running,
+            "old ctl must not fall back even during shutdown"
+        );
+    }
+
+    #[test]
+    fn managed_daemon_matching_identity_reaches_existing_argument_validation() {
+        let service = managed_test_service();
+        // Reject at the old argv bound rather than actually starting a process.
+        let response = service.handle(Request::Action {
+            action: Action::Region,
+            args: vec!["x".repeat(256)],
+            identity: Some(service.identity.clone()),
+        });
+        assert!(!response.no_fallback);
+        assert_eq!(response.message.as_deref(), Some("无效启动参数"));
+        assert_eq!(response.identity, Some(service.identity.clone()));
+    }
+
+    #[test]
+    fn managed_daemon_accepts_ping_then_action_on_the_same_socket() {
+        let service = managed_test_service();
+        let identity = service.identity.clone();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let handle = std::thread::spawn(move || serve_connection(&service, server));
+        client.write_all(&encode_line(&Request::Ping)).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let first: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(first.identity, Some(identity.clone()));
+        client
+            .write_all(&encode_line(&Request::Action {
+                action: Action::Region,
+                args: vec!["x".repeat(256)],
+                identity: Some(identity),
+            }))
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let second: Response = serde_json::from_str(&line).unwrap();
+        assert_eq!(second.message.as_deref(), Some("无效启动参数"));
+        handle.join().unwrap();
     }
 }

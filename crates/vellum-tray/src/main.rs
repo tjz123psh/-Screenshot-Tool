@@ -270,12 +270,27 @@ impl ksni::Tray for Tray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
+        let build = vellum_core::build_info::current();
         let long_label = self.long_label();
         let state = self.presentation().1;
 
         vec![
             StandardItem {
                 label: state,
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: format!(
+                    "构建 {} · {}",
+                    &build.build_id[build.build_id.len().saturating_sub(12)..],
+                    match build.source_dirty {
+                        Some(true) => "开发修改",
+                        Some(false) => "干净源码",
+                        None => "来源未知",
+                    }
+                ),
                 enabled: false,
                 ..Default::default()
             }
@@ -367,6 +382,13 @@ impl ksni::Tray for Tray {
 /// Icons are looked up in the user's icon theme once installed; the env
 /// override exists so the tray can be exercised from a build tree.
 fn icon_theme_path() -> Option<PathBuf> {
+    if vellum_core::build_info::is_managed_location() {
+        let root = vellum_core::build_info::versioned_resource_root()?;
+        let icons = root.join("icons/hicolor/scalable/status");
+        let resolved = icons.canonicalize().ok()?;
+        return (resolved.is_dir() && resolved.starts_with(root.canonicalize().ok()?))
+            .then_some(resolved);
+    }
     if let Some(dir) = std::env::var_os("VELLUM_ICON_PATH") {
         return Some(PathBuf::from(dir));
     }
@@ -430,15 +452,30 @@ fn doctor() -> Option<(u64, u64)> {
 /// Prefers a sibling of the running binary so an uninstalled build tree stays
 /// self-consistent, then falls back to PATH.
 fn locate(name: &str) -> Option<PathBuf> {
+    let managed = vellum_core::build_info::is_managed_location();
+    if managed && vellum_core::build_info::managed_release_id().is_none() {
+        return None;
+    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         let candidate = dir.join(name);
-        if vellum_core::proc::is_executable(&candidate) {
+        if vellum_core::proc::is_executable(&candidate)
+            && (!managed
+                || candidate
+                    .canonicalize()
+                    .ok()
+                    .and_then(|path| path.parent().map(PathBuf::from))
+                    == dir.canonicalize().ok())
+        {
             return Some(candidate);
         }
     }
-    vellum_core::proc::which(name)
+    if managed {
+        None
+    } else {
+        vellum_core::proc::which(name)
+    }
 }
 
 /// Exclusive tray lock. Held for the process lifetime; the kernel releases it
@@ -457,6 +494,14 @@ fn acquire_lock() -> std::io::Result<Option<std::fs::File>> {
 }
 
 fn main() -> std::process::ExitCode {
+    // This metadata-only branch must precede locks, DBus, preferences and service startup.
+    if std::env::args_os()
+        .skip(1)
+        .any(|argument| argument == "--build-info-json")
+    {
+        println!("{}", vellum_core::build_info::json());
+        return std::process::ExitCode::SUCCESS;
+    }
     match run() {
         Ok(code) => std::process::ExitCode::from(code),
         Err(err) => {

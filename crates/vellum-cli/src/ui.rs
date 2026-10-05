@@ -6,7 +6,7 @@
 //! sends the long-shot finish signal to it, so the pid must survive the switch.
 
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,16 +19,32 @@ pub const TRAY_BINARY: &str = "vellum-tray";
 /// Look next to the running executable first so a build tree or a staged
 /// install directory stays self-consistent, and only then fall back to PATH.
 pub(crate) fn locate(program: &str) -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(program);
-        if vellum_core::proc::is_executable(&candidate) {
-            return Some(candidate);
-        }
+    let managed = vellum_core::build_info::is_managed_location();
+    if managed && vellum_core::build_info::managed_release_id().is_none() {
+        return None;
     }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(candidate) = sibling(&exe, program, managed)
+    {
+        return Some(candidate);
+    }
+    if managed {
+        None
+    } else {
+        vellum_core::proc::which(program)
+    }
+}
 
-    vellum_core::proc::which(program)
+fn sibling(executable: &Path, program: &str, strict: bool) -> Option<PathBuf> {
+    let dir = executable.parent()?;
+    let candidate = dir.join(program);
+    if !vellum_core::proc::is_executable(&candidate) {
+        return None;
+    }
+    if strict && candidate.canonicalize().ok()?.parent()? != dir.canonicalize().ok()? {
+        return None;
+    }
+    Some(candidate)
 }
 
 /// Replace this process with `program`, passing `args` after the binary name.
@@ -38,7 +54,11 @@ pub(crate) fn locate(program: &str) -> Option<PathBuf> {
 /// problem that forced the Python version to preload the library is gone.
 pub fn exec(program: &str, args: &[String]) -> Result<std::convert::Infallible> {
     let path = locate(program).with_context(|| {
-        format!("未找到 {program}；请先完整安装 vellum（cargo build --release）")
+        if vellum_core::build_info::is_managed_location() {
+            format!("当前安装版本缺少 {program} 或身份校验失败；请运行 vellum release repair")
+        } else {
+            format!("未找到 {program}；请先完整安装 vellum（cargo build --release）")
+        }
     })?;
 
     let binary = CString::new(path.as_os_str().as_encoded_bytes())
@@ -63,4 +83,43 @@ pub fn exec(program: &str, args: &[String]) -> Result<std::convert::Infallible> 
         path.display(),
         std::io::Error::last_os_error()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[test]
+    fn managed_sibling_lookup_rejects_cross_version_symlinks() {
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        let root = (0..1024)
+            .find_map(|index| {
+                let path = temp.join(format!(
+                    "vellum-ui-sibling-test-{}-{index}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&path).ok().map(|()| path)
+            })
+            .expect("fresh isolated fixture");
+        let first = root.join("first/bin");
+        let second = root.join("second/bin");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let target = second.join("vellum-ui");
+        std::fs::write(&target, b"synthetic").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, first.join("vellum-ui")).unwrap();
+        assert!(sibling(&first.join("vellum"), "vellum-ui", true).is_none());
+        assert!(sibling(&first.join("vellum"), "vellum-ui", false).is_some());
+        let local = first.join("vellum-tray");
+        std::fs::write(&local, b"synthetic").unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            sibling(&first.join("vellum"), "vellum-tray", true),
+            Some(local)
+        );
+        // Only the exact fresh test directory is removed, never user paths.
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -1,0 +1,96 @@
+name: Verify release bundle (manual tag)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable tag, exactly v followed by Cargo version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Arch Linux x86_64 tagged candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: archlinux:base
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      WORKFLOW_REF: ${{ github.ref }}
+      WORKFLOW_SHA: ${{ github.sha }}
+      OUTPUT_DIR: ${{ runner.temp }}/vellum-release
+    steps:
+      - name: Validate fixed tag input
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([-+][A-Za-z0-9._-]+)?$ ]] || {
+            echo '::error::Expected an existing vVERSION tag, never a branch or arbitrary ref'
+            exit 1
+          }
+          test "$WORKFLOW_REF" = "refs/tags/$RELEASE_TAG" || {
+            echo "::error::Dispatch this workflow on the same existing tag so provenance names the actual source"
+            exit 1
+          }
+
+      - name: Install runner build dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed
+          git rust pkgconf gtk4 gtk4-layer-shell python cargo-audit
+
+      - name: Check out the exact tag
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag and derive archive epoch
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+
+      - name: Check source and run offline package regressions
+        shell: bash
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          cargo audit --no-yanked
+          python3 tests/package-release.py
+          bash -n contrib/install-bundle.sh
+
+      - name: Build all four binaries together
+        run: cargo build --locked --release --workspace
+
+      - name: Package clean fixed-tag binaries
+        shell: bash
+        run: |
+          python3 tools/package_release.py --root . --bin-dir target/release \
+            --output "$OUTPUT_DIR/bundle" --release-tag "$RELEASE_TAG" \
+            --archive "$OUTPUT_DIR/vellum-$RELEASE_TAG-arch-x86_64.tar.gz"
+
+      - name: Attach build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/vellum-release/*.tar.gz
+
+      - name: Upload verified candidate (no public release or tag mutation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vellum-${{ inputs.tag }}-arch-x86_64
+          path: |
+            ${{ runner.temp }}/vellum-release/*.tar.gz
+            ${{ runner.temp }}/vellum-release/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14

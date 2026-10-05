@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[path = "control.rs"]
+pub mod control;
+
 /// Largest accepted request/response line. The Python service used the same
 /// bound; it exists so a stuck peer cannot make the daemon allocate freely.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -65,6 +68,18 @@ impl Action {
     }
 }
 
+/// Optional wire identity. Missing values are legacy/unknown, never evidence
+/// of a matching managed release. Values from a peer are not diagnostic text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_schema: Option<u32>,
+    #[serde(default)]
+    pub managed: bool,
+}
+
 /// Requests accepted by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -75,8 +90,22 @@ pub enum Request {
         action: Action,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<PeerIdentity>,
     },
     Shutdown,
+}
+
+impl Request {
+    /// Compatibility constructor; the client attaches its own runtime identity
+    /// before routing. Deserializing legacy JSON still leaves identity absent.
+    pub fn action(action: Action, args: Vec<String>) -> Self {
+        Self::Action {
+            action,
+            args,
+            identity: None,
+        }
+    }
 }
 
 /// Daemon lifecycle state as reported by `status`.
@@ -102,7 +131,9 @@ pub struct Response {
     /// A daemon that has begun shutting down answers with "running": false, so a
     /// client can tell "the daemon declined on purpose" (busy) apart from "the
     /// daemon is going away or could not do the work", and fall back to running
-    /// the action in its own process instead of reporting a rejection.
+    /// the action in its own process instead of reporting a rejection. Identity
+    /// refusals keep this true for legacy ctl; use no_fallback and a separate
+    /// Status response for compatibility decisions and actual lifecycle state.
     #[serde(default, skip_serializing_if = "is_false")]
     pub running: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +163,14 @@ pub struct Response {
     pub toggled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PeerIdentity>,
+    /// An incompatible/unknown peer is not absence of a daemon: never silently
+    /// exec another version after this response, including while it shuts down.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -155,6 +194,9 @@ impl Default for Response {
             busy: false,
             toggled: false,
             message: None,
+            identity: None,
+            no_fallback: false,
+            error_code: None,
         }
     }
 }
@@ -223,7 +265,12 @@ mod tests {
     fn action_request_defaults_to_empty_args() {
         let raw = r#"{"command":"action","action":"region"}"#;
         match serde_json::from_str::<Request>(raw).unwrap() {
-            Request::Action { action, args } => {
+            Request::Action {
+                action,
+                args,
+                identity,
+            } => {
+                assert!(identity.is_none());
                 assert_eq!(action, Action::Region);
                 assert!(args.is_empty());
             }
@@ -257,6 +304,32 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<Request>(r#"{"command":"shutdown"}"#).unwrap(),
             Request::Shutdown
+        ));
+    }
+
+    #[test]
+    fn legacy_messages_remain_optional_but_managed_identity_round_trips() {
+        let legacy: Request =
+            serde_json::from_str(r#"{"command":"action","action":"region"}"#).unwrap();
+        assert!(matches!(legacy, Request::Action { identity: None, .. }));
+        let old: Response = serde_json::from_str(r#"{"ok":true,"running":true}"#).unwrap();
+        assert!(old.identity.is_none() && !old.no_fallback);
+        let request = Request::Action {
+            action: Action::Region,
+            args: vec![],
+            identity: Some(PeerIdentity {
+                managed: true,
+                build_id: Some("0.2.0-synthetic".into()),
+                ipc_schema: Some(1),
+            }),
+        };
+        let decoded: Request = serde_json::from_slice(&encode_line(&request)).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::Action {
+                identity: Some(PeerIdentity { managed: true, .. }),
+                ..
+            }
         ));
     }
 }

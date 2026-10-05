@@ -5,8 +5,13 @@
 //! our own type (rather than `image::RgbImage` everywhere) keeps the hot paths
 //! free of generic indirection and makes row slicing explicit.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+
+/// Encoded file limit, separate from decoder/output-pixel allocation limits.
+/// 256 MiB accommodates the supported 48 MP exports without unbounded reads.
+pub const MAX_ENCODED_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Rgb8 {
@@ -170,9 +175,37 @@ impl Rgb8 {
         Self::from_raw(width, height, data)
     }
 
+    /// Load only a bounded regular file. Symlinks chosen by the caller may point
+    /// to regular files: classification uses the opened FD, not a racy path stat.
+    /// O_NONBLOCK prevents a FIFO from hanging open before it can be rejected.
+    /// Regular files on unhealthy/network filesystems can still stall in the OS;
+    /// this is an input type/byte boundary, not a hard filesystem I/O deadline.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        Self::from_encoded(&data)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| {
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => "图片文件不存在",
+                    std::io::ErrorKind::PermissionDenied => "无权读取图片文件",
+                    _ => "无法打开图片文件",
+                }
+                .to_string()
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "无法读取图片文件信息".to_string())?;
+        if !metadata.is_file() {
+            return Err("图片输入必须是普通文件，不支持目录、设备或管道".into());
+        }
+        if metadata.len() > MAX_ENCODED_FILE_BYTES {
+            return Err("图片文件超过 256 MiB 读取上限".into());
+        }
+        let data = read_encoded_file_bytes(file, MAX_ENCODED_FILE_BYTES)?;
+        // Keep decoding/visible-alpha conversion unchanged; codec errors may
+        // echo header bytes, so only this public file boundary uses fixed text.
+        Self::from_encoded(&data).map_err(|_| "图片格式不支持或数据损坏".into())
     }
 
     /// Bilinear downscale used for pin/preview scaling.
@@ -191,6 +224,27 @@ impl Rgb8 {
         );
         Rgb8::from_raw(width.max(1), height.max(1), scaled.into_raw())
     }
+}
+
+/// Read at most limit+1 bytes even if a regular file grows after metadata().
+/// Read the sentinel separately so exceeding a power-of-two limit by one byte
+/// does not force the Vec to double its entire capacity just to reject the file.
+fn read_encoded_file_bytes(reader: impl Read, limit: u64) -> Result<Vec<u8>, String> {
+    let mut bounded = reader.take(limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    (&mut bounded)
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "无法读取图片文件".to_string())?;
+    let mut extra = [0u8; 1];
+    if bounded
+        .read(&mut extra)
+        .map_err(|_| "无法读取图片文件".to_string())?
+        != 0
+    {
+        return Err("图片文件超过读取上限（读取时仍在增长）".into());
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -247,5 +301,51 @@ mod tests {
         assert_eq!(band.height, 2);
         assert_eq!(band.pixel(0, 0)[0], 1);
         assert_eq!(band.pixel(0, 1)[0], 2);
+    }
+
+    #[test]
+    fn encoded_reader_accepts_exact_limit_and_rejects_growth_past_it() {
+        assert_eq!(
+            read_encoded_file_bytes(Cursor::new(vec![7; 8]), 8).unwrap(),
+            vec![7; 8]
+        );
+        assert!(read_encoded_file_bytes(Cursor::new(vec![7; 9]), 8).is_err());
+        assert!(
+            read_encoded_file_bytes(Cursor::new(Vec::<u8>::new()), 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(read_encoded_file_bytes(Cursor::new(vec![7]), 0).is_err());
+    }
+
+    #[test]
+    fn encoded_reader_consumes_only_limit_plus_one_on_unbounded_growth() {
+        struct CountingReader {
+            consumed: usize,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                output.fill(42);
+                self.consumed += output.len();
+                Ok(output.len())
+            }
+        }
+        let mut reader = CountingReader { consumed: 0 };
+        assert!(read_encoded_file_bytes(&mut reader, 32).is_err());
+        assert_eq!(reader.consumed, 33);
+    }
+
+    #[test]
+    fn encoded_reader_does_not_echo_underlying_error_text() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic-private-bytes/path"))
+            }
+        }
+        assert_eq!(
+            read_encoded_file_bytes(FailingReader, 8).unwrap_err(),
+            "无法读取图片文件"
+        );
     }
 }

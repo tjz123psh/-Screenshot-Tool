@@ -9,5 +9,6 @@
 //! separate executable invoked from here.
 
 pub mod diagnostics;
+pub mod release;
 pub mod shortcuts;
 pub mod ui;

@@ -31,7 +31,7 @@
 
 ![Vellum 工作台 · 800×560](<docs/screenshots/compact-workbench.png>)
 
-[长图查看器](<docs/screenshots/preview.png>) · [快捷键设置](<docs/screenshots/native-shortcuts.png>) · [紧凑截图与标注工具栏](<docs/screenshots/compact-toolbars.png>) · [品牌图标](<contrib/icons/ai.vellum.svg>) · [功能完整性与最新界面验收](<docs/COMPACT_UI_AND_FEATURE_AUDIT.md>) · [长截图可靠性复查](<docs/REFINEMENT_REVIEW.md>) · [第一批可靠性修复](<docs/RELIABILITY_PHASE1.md>)
+[长图查看器](<docs/screenshots/preview.png>) · [快捷键设置](<docs/screenshots/native-shortcuts.png>) · [紧凑截图与标注工具栏](<docs/screenshots/compact-toolbars.png>) · [品牌图标](<contrib/icons/ai.vellum.svg>) · [功能完整性与最新界面验收](<docs/COMPACT_UI_AND_FEATURE_AUDIT.md>) · [长截图可靠性复查](<docs/REFINEMENT_REVIEW.md>) · [第一批可靠性修复](<docs/RELIABILITY_PHASE1.md>) · [会话编辑与统一输出](<docs/WORKFLOW_PHASE2.md>)
 
 设置窗口现在会自动探测标准 `ext-background-effect-v1`：支持的桌面直接由合成器模糊背景，无需手改窗口规则；不支持时保留更深的透明底。图片和录制区域仍不透明。已完成[真实高速采集与模糊量化验证](<docs/NATIVE_CAPTURE_AND_BLUR.md>)。
 
@@ -49,72 +49,72 @@
 
 ## 系统要求
 
-- Arch Linux
-- Wayland
-- niri 或 Hyprland；其他 Wayland 合成器可以截图，但 pin/result 窗口无法自动浮动和精确调整尺寸
-- GTK 4.12 或更高版本
+- 当前交付目标：Arch Linux x86_64、Wayland、GTK 4.12及以上。
+- 本机验证以 niri 为准；Hyprland 有适配代码但本轮未实机验收，其他桌面/发行版不承诺兼容。版本说明必须保留这个边界。
+- 运行依赖包括 gtk4、gtk4-layer-shell、xdg-desktop-portal、grim、wl-clipboard、libnotify、tesseract 及所需语言包。
+- Rust、pkgconf、Python仅用于源码构建/打包；二进制发行包不要求用户本机编译。
 
-安装脚本可自动检查并安装以下 Arch 包：
+翻译与API视觉OCR需要配置自己的兼容接口；本地Tesseract识别不需要外部服务。普通导出与OCR使用遮挡合成后的成品，不附带原始编辑工程。
 
-```text
-rust pkgconf gtk4 gtk4-layer-shell
-grim wl-clipboard libnotify
-tesseract tesseract-data-chi_sim tesseract-data-eng
-```
+## 安装与版本管理
 
-翻译与 API 视觉 OCR 需要你自己准备一个 OpenAI 兼容的模型接口（接口地址、模型名、可选密钥）；内置 Tesseract OCR 不需要任何外部服务或密钥。
+### 使用已校验的二进制包
 
-## 安装
+仅安装信任来源的包。校验和可以检查损坏与一致性，但不能单独证明发布者身份；正式候选还应核对固定标签与构建来源。**本工作树生成的dirty/未知来源包明确标为开发包，不等于已经公开发布的正式版本。**
 
-### 远程一键安装（不克隆源码）
+在解压后的发行包目录执行：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/tjz123psh/-Screenshot-Tool/main/install-remote.sh | bash
-```
-
-脚本下载 main 分支源码到临时目录并运行安装流程，安装完成后自动清理临时文件。想先审阅脚本内容再执行，可先打开上面的 URL。
-
-### 从源码安装
-
-克隆后运行可审查的安装脚本：
-
-```sh
-git clone https://github.com/tjz123psh/-Screenshot-Tool.git vellum
-cd vellum
 ./install.sh
 ```
 
-脚本会：
-
-1. 检查 Arch 依赖，只在缺包时请求安装；
-2. 执行 `cargo build --release`；
-3. 将四个二进制安装到 `~/.local/bin`；
-4. 安装应用管理的标准全局快捷键服务；默认不修改 niri/Hyprland 配置；
-5. 安装用户级 systemd 服务、desktop 文件和图标；
-6. 启动截图、托盘和全局快捷键用户服务，最后运行诊断；首次快捷键授权在应用内完成。
-
-不希望安装脚本处理系统包或快捷键时：
+旧式安装迁移需要明确选择接管，并先备份。此通道只接管不含新构建身份的旧程序；带新身份的现代散装二进制会被拒绝，不能伪装成可回退旧版：
 
 ```sh
-VELLUM_SKIP_PACKAGES=1 VELLUM_SKIP_SHORTCUTS=1 ./install.sh
+./install.sh --adopt-legacy
 ```
 
-也可以自定义二进制目录：
+安装先准备整套程序与资源，再切换当前版本。活动窗口、截图或独立旧后台进程会导致安全延期；用户服务不可达时只报告“已安装待激活”，不会声称托盘已就绪。按报告提供的管理程序及参数，在保存关闭工作后执行修复/激活。
+
+### 管理已安装版本
 
 ```sh
-VELLUM_BIN_DIR="$HOME/bin" ./install.sh
+vellum build-info --json
+vellum release status --json
+vellum release install --bundle /path/to/verified-bundle
+vellum release rollback
+vellum release repair
+vellum release uninstall --yes
+vellum support --json
+vellum support --output support.json
 ```
 
-> 安装脚本构建当前 checkout，不会从网络下载并执行另一个脚本，也不会维护第二份源码副本。
+回退只切程序与资源，不拿陈旧配置覆盖用户新设置。卸载只清理仍能验证归属的入口和程序；旧式备份、在用版本、用户改动及未知文件保留并列出原因，截图、设置、恢复图片和桌面快捷键不动。release status描述安装事务，vellum status描述当前截图服务，两者不是一回事。
 
-### 安装后的清理行为
+### 开发者从源码安装
 
-两种安装方式都不会在系统里留下编译产物：
+本段针对仓库源码根目录，和发行包内的小安装入口不同：
 
-- **远程一键安装**：源码和构建产物都放在临时目录，装完整个临时目录自动删除；
-- **从源码安装**：装完自动删除 `target/`（编译缓存），源码目录保留——用 `VELLUM_SKIP_CLEANUP=1` 可保留缓存以便下次增量构建。
+```sh
+./install.sh
+# 仅当确需迁移已确认属于Vellum的旧式安装：
+VELLUM_ADOPT_LEGACY=1 ./install.sh
+# 依赖已核对齐全时可跳过系统装包：
+VELLUM_SKIP_PACKAGES=1 VELLUM_SKIP_CLEANUP=1 ./install.sh
+```
 
-其余保留项均为程序运行所需：`~/.local/bin` 下的二进制、systemd 服务、桌面入口与图标、快捷键配置，以及轮转中的服务日志。
+源码入口保留构建缓存，先校验四个程序构建身份，再委托同一版本管理器。依赖检查失败会在构建和安装前停止；提权取消不重试。安装器不再写入任何合成器快捷键，传统绑定必须另行明确操作。
+
+远程源码通道现在要求完整固定提交，不再默认下载移动的main分支：
+
+```sh
+VELLUM_SOURCE_REF=<40位提交SHA> bash install-remote.sh
+```
+
+只有包含版本化安装器的提交才会运行；临时源码会清理，安装版本保存在用户级版本根。该开发通道不代替正式二进制发行包。
+
+详情见[发布格式](<docs/RELEASE_FORMAT.md>)与[连续执行计划](<docs/PRODUCT_EXECUTION_PLAN.md>)。
+
 
 ## 使用
 
@@ -147,7 +147,7 @@ vellum logs               # 查看服务日志
 
 Vellum 通过 XDG GlobalShortcuts 注册并处理全局按键，首次在应用“快捷键”页启用，系统可能要求授权。应用显示系统实际绑定的组合键，不把建议值当作已生效。**桌面后端必须支持此接口；仅能枚举接口不等于能成功绑定。** 本机 niri + GNOME portal 的真实绑定被拒绝，详见[兼容性与高速滚动记录](<docs/SHORTCUTS_AND_SPEED.md>)。
 
-旧配置不会自动删除。`vellum shortcuts legacy-list` 只读检查旧绑定；`install` / `remove` 子命令仅保留为显式传统兼容入口。安装器只有在明确设置 `VELLUM_ENABLE_LEGACY_SHORTCUTS=1` 时才尝试写旧配置。兼容示例在 `contrib/`：
+旧配置不会自动删除。`vellum shortcuts legacy-list` 只读检查旧绑定；`install` / `remove` 子命令仅保留为显式传统兼容入口。版本化安装器不再自动写旧配置，即使环境中残留旧安装开关也不会恢复已移除的绑定。兼容示例在 `contrib/`：
 
 - `niri-vellum.kdl`
 - `hyprland-vellum.conf`

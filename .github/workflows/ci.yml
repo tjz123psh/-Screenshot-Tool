@@ -24,6 +24,7 @@ jobs:
           rust
           cargo-audit
           pkgconf
+          python
           gtk4
           gtk4-layer-shell
 
@@ -50,6 +51,14 @@ jobs:
 
       - name: Test installer without a systemd user instance
         run: bash tests/install-systemd-unreachable.sh
+
+      - name: Test fixed source commit and release packaging
+        run: |
+          bash tests/install-remote-fixed.sh
+          python3 tests/package-release.py
+
+      - name: Test versioned install fault matrix
+        run: bash tests/release-manager.sh
 
       - name: Check whitespace
         run: |
