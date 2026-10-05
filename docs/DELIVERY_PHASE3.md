@@ -56,17 +56,27 @@ vellum support --output support.json
 
 ## 验收记录
 
-- 整个工作区release自动回归：**827通过、0失败、17默认忽略**；按顶层测试程序统计，不重复计算内部隔离子进程报告。
+- 整个工作区release自动回归：**832通过、0失败、17默认忽略**（27个测试程序）；按顶层测试程序统计，不重复计算内部隔离子进程报告。
 - fmt、全工作区strict Clippy -D warnings、release构建及依赖审计通过；打包15项测试、源码安装与固定提交脚本测试通过。
 - 发布管理器39项核心回归覆盖14个关键阶段的自有子进程SIGKILL，以及待激活直接卸载、CLI退出码、默认实例推断、现代散装拒绝等。服务适配18项模拟测试通过；未知外来单元、错误角色、同根旧版本和不相关受保护进程有明确验证。
 - 使用真实四个二进制在独立user/PID namespace及临时空格路径安装，无用户服务环境下得到真实pending状态；4bin身份一致、默认实例定位正确，直接卸载清理程序且配置/图片/恢复/niri哨兵均逐字节不变。
 - 首次本机尝试在任何live mutation前因无关受保护进程被保守拒绝。已缩小为先读comm筛Vellum候选后再严格核身份，重新完整构建/测试/打包，旧程序和配置未受影响。
 - 本机实际执行：旧regular 0.1.2 → 受管理0.2.0 ready → 回退0.1.2（四bin逐字节等于原备份）→ 再激活0.2.0 ready。回退成功退出0；全程用户配置与niri文件摘要完全一致。
 - 最终4bin与验证包完全一致，3个服务active/running、重启计数0；服务身份managed且build_id匹配，支持报告service.compatible=true、ready=true。安装版800×560工作台已打开。
-- 当前开发包及SHA256文件已生成并校验；GitHub工作流未实际运行，未创建标签、推送或公开发布。配置/旧程序/完整未跟踪源码均有本机私有备份。
+- 升级后发现旧版本的快捷键服务仍在占用D-Bus名字（它由D-Bus唤醒，systemd接管不到）。已修：被替换的受管版本自行退出，未知状态（开发构建、未安装包、链接缺失或无法解析）永不误停服务；本机实测交接成功，unit恢复active，三个进程均属当前版本。
+- 代码已提交并推送到 `main`（`d4640cc`、`dec5153`、`f4541ed`）。安装版本由 `f4541ed` 干净构建，没有未提交改动；此后仅文档变化，不影响构建输入，因此构建编号不变。
+- 本机清理了编译缓存与过期评审产物（release约18G可重建数据），只保留与已安装版本对应的发行包；旧程序、用户配置、完整源码归档仍在私有备份中。GitHub工作流未实际运行，未创建标签、推送以外的公开发布。
 
-最终构建编号：`0.2.0-dirty-651de78c85837ac2ca03dc7deffa1be18b983c0f843ba71019fb684349463af8`。
+最终构建编号：`0.2.0-clean-e1798197d52e324df78b613a520469c2669a951b0c27240a1e5484b444567cd7`。
 
-[可分发开发包](<../target/delivery/0.2.0-dirty-651de78c85837ac2ca03dc7deffa1be18b983c0f843ba71019fb684349463af8/vellum-dev-0.2.0-linux-x86_64.tar.gz>) · [校验和](<../target/delivery/0.2.0-dirty-651de78c85837ac2ca03dc7deffa1be18b983c0f843ba71019fb684349463af8/vellum-dev-0.2.0-linux-x86_64.tar.gz.sha256>)
+发行包不进入版本库（`target/` 已被忽略）。需要时在对应提交上重新生成：
+
+```sh
+cargo build --locked --release --workspace
+id=$(target/release/vellum --build-info-json | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_id"])')
+python3 tools/package_release.py --root "$PWD" --bin-dir "$PWD/target/release" \
+    --output "$PWD/target/delivery/$id/bundle" \
+    --archive "$PWD/target/delivery/$id/vellum-dev-0.2.0-linux-x86_64.tar.gz"
+```
 
 已执行的故障注入使用假服务和自有子进程SIGKILL，不是对用户机器断电或填满磁盘；未测试的平台不得宣称通过。首发以实际验收过的Arch/Wayland组合为范围，其他桌面/混合缩放保留实验说明。
