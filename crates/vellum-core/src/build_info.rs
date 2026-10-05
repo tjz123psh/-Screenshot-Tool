@@ -205,6 +205,47 @@ pub fn managed_release_id() -> Option<String> {
     Some(build.build_id)
 }
 
+/// True when this program is a managed release that an update has replaced.
+///
+/// A background service started by D-Bus activation is not restarted by the
+/// version manager, so it would otherwise keep serving the old build after
+/// `current` moved. Such a process stands down; the next request activates the
+/// current release instead. Anything unknown - a development build, a
+/// downloaded bundle, or a missing link - is never treated as superseded.
+pub fn is_superseded() -> bool {
+    actual_executable().is_some_and(|executable| superseded_at(&executable))
+}
+
+fn superseded_at(executable: &Path) -> bool {
+    let build = current();
+    let Some(release) = verified_release(executable, &build) else {
+        return false;
+    };
+    // Layout is <installation root>/releases/<id>; require it explicitly rather
+    // than assuming how many levels up the installation root lives.
+    let Some(releases) = release.parent() else {
+        return false;
+    };
+    if releases.file_name().and_then(|name| name.to_str()) != Some("releases") {
+        return false;
+    }
+    let Some(root) = releases.parent() else {
+        return false;
+    };
+    let Ok(target) = fs::read_link(root.join("current")) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target
+    } else {
+        root.join(target)
+    };
+    let (Ok(current), Ok(own)) = (resolved.canonicalize(), release.canonicalize()) else {
+        return false;
+    };
+    current != own
+}
+
 /// Anchored to the immutable actual executable's release, never the current
 /// symlink. Old processes keep the matching generated resources after an update.
 pub fn versioned_resource_root() -> Option<PathBuf> {
@@ -338,6 +379,44 @@ mod tests {
         std::os::unix::fs::symlink("manifest.json", f.release.join("installed.json")).unwrap();
         assert!(verified_release(&f.executable, &f.build).is_none());
     }
+    #[test]
+    fn a_release_replaced_by_an_update_stands_down() {
+        let f = Fixture::new();
+        f.install_marker();
+        let link = f.root.join("current");
+        std::os::unix::fs::symlink(f.release.strip_prefix(&f.root).unwrap(), &link).unwrap();
+        assert!(
+            !superseded_at(&f.executable),
+            "the running release is still the current one"
+        );
+        fs::create_dir_all(f.root.join("releases/another-build")).unwrap();
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("releases/another-build", &link).unwrap();
+        assert!(
+            superseded_at(&f.executable),
+            "an update moved current away from this release"
+        );
+    }
+
+    #[test]
+    fn supersession_is_never_guessed_from_partial_state() {
+        let f = Fixture::new();
+        assert!(
+            !superseded_at(&f.executable),
+            "a bundle or development build is not a managed release"
+        );
+        f.install_marker();
+        assert!(
+            !superseded_at(&f.executable),
+            "without a current link the state is unknown"
+        );
+        std::os::unix::fs::symlink("releases/missing", f.root.join("current")).unwrap();
+        assert!(
+            !superseded_at(&f.executable),
+            "an unresolvable current link must not stop a service"
+        );
+    }
+
     #[test]
     fn resource_identity_does_not_follow_current_switch() {
         let f = Fixture::new();

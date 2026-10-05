@@ -528,6 +528,11 @@ impl Service {
 }
 
 pub fn run_service() -> anyhow::Result<i32> {
+    // A managed release that an update replaced must not hold the D-Bus name:
+    // standing down lets the next request activate the current build.
+    if vellum_core::build_info::is_superseded() {
+        return Ok(0);
+    }
     let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)?;
     let reply = connection.call_sync(
         Some("org.freedesktop.DBus"),
@@ -682,6 +687,17 @@ pub fn run_service() -> anyhow::Result<i32> {
         service.initialize();
     }
     let loop_ = glib::MainLoop::new(None, false);
+    // This service can be D-Bus activated rather than started by systemd, so an
+    // upgrade cannot restart it. Hand the name over once current moves on.
+    let resign = loop_.clone();
+    let _resign = glib::timeout_add_local(Duration::from_secs(15), move || {
+        if vellum_core::build_info::is_superseded() {
+            resign.quit();
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
     let on_closed = loop_.clone();
     connection.set_exit_on_close(false);
     connection.connect_closed(move |_, _, _| on_closed.quit());
