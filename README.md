@@ -43,6 +43,7 @@
 | `contrib/` | desktop、systemd、图标及 niri/Hyprland 示例 |
 | `tests/` | 安装器失败路径集成测试 |
 | `tools/` | 可选的本地 OCR 合成回归工具 |
+| `install-release.sh` | 一键安装：下载发行包、校验和、交给版本管理器（也不写合成器配置） |
 | `ARCHITECTURE.md` | Rust 重写时的原始需求契约，只作历史与验收参考 |
 | `DESIGN.md` | 当前实现的架构、进程边界和技术取舍 |
 | `PERFORMANCE.md` | 基准、真机验证方法和能力边界 |
@@ -58,7 +59,29 @@
 
 ## 安装与版本管理
 
-### 使用已校验的二进制包
+### 一键安装（推荐）
+
+```sh
+curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash
+```
+
+脚本只做四件事：下载最新发行包、核对 SHA256、解压、交给版本管理器安装。它**不联网构建、不需要 root，也不写任何合成器配置**。
+
+从旧式 0.1.x 安装迁移时明确选择接管（会先把旧程序完整备份成可回退版本）：
+
+```sh
+curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash -s -- --adopt-legacy
+```
+
+也可以安装指定版本，或用仓库内的同一脚本：
+
+```sh
+VELLUM_RELEASE_TAG=v0.2.0 bash install-release.sh
+```
+
+安装后用 `vellum build-info --json` 或工作台「关于 Vellum」核对实际版本与来源提交。
+
+### 手动安装已校验的二进制包
 
 仅安装信任来源的包。校验和可以检查损坏与一致性，但不能单独证明发布者身份；正式候选还应核对固定标签与构建来源。**本工作树生成的dirty/未知来源包明确标为开发包，不等于已经公开发布的正式版本。**
 

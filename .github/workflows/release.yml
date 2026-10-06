@@ -1,4 +1,11 @@
-name: Verify release bundle (manual tag)
+name: Build and publish a tagged release
+
+# Manual by design: a public release should be a deliberate act. Dispatch this
+# on an existing vVERSION tag; it verifies the tag, runs the full checks,
+# packages a clean candidate, attaches build provenance and publishes the
+# release with stable asset names so that
+#   .../releases/latest/download/install.sh
+# keeps working for every future version.
 
 on:
   workflow_dispatch:
@@ -13,13 +20,13 @@ permissions:
 
 jobs:
   package:
-    name: Arch Linux x86_64 tagged candidate
+    name: Arch Linux x86_64 tagged release
     runs-on: ubuntu-latest
     timeout-minutes: 45
     container:
       image: archlinux:base
     permissions:
-      contents: read
+      contents: write
       id-token: write
       attestations: write
     env:
@@ -27,6 +34,7 @@ jobs:
       WORKFLOW_REF: ${{ github.ref }}
       WORKFLOW_SHA: ${{ github.sha }}
       OUTPUT_DIR: ${{ runner.temp }}/vellum-release
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Validate fixed tag input
         shell: bash
@@ -43,7 +51,7 @@ jobs:
       - name: Install runner build dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          git rust pkgconf gtk4 gtk4-layer-shell python cargo-audit
+          git rust pkgconf gtk4 gtk4-layer-shell python cargo-audit github-cli
 
       - name: Check out the exact tag
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
@@ -60,7 +68,7 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=all)"
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
 
-      - name: Check source and run offline package regressions
+      - name: Check source and run offline regressions
         shell: bash
         run: |
           cargo fmt --check
@@ -68,7 +76,8 @@ jobs:
           cargo test --locked --workspace
           cargo audit --no-yanked
           python3 tests/package-release.py
-          bash -n contrib/install-bundle.sh
+          bash -n contrib/install-bundle.sh install-release.sh
+          bash tests/install-remote-fixed.sh
 
       - name: Build all four binaries together
         run: cargo build --locked --release --workspace
@@ -79,18 +88,74 @@ jobs:
           python3 tools/package_release.py --root . --bin-dir target/release \
             --output "$OUTPUT_DIR/bundle" --release-tag "$RELEASE_TAG" \
             --archive "$OUTPUT_DIR/vellum-$RELEASE_TAG-arch-x86_64.tar.gz"
+          # Stable names: releases/latest/download/<name> must never change, and
+          # the checksum must verify the name it is published under.
+          cp "$OUTPUT_DIR/vellum-$RELEASE_TAG-arch-x86_64.tar.gz" \
+             "$OUTPUT_DIR/vellum-linux-x86_64.tar.gz"
+          ( cd "$OUTPUT_DIR" && sha256sum vellum-linux-x86_64.tar.gz \
+              > vellum-linux-x86_64.tar.gz.sha256 )
+          grep -q "vellum-linux-x86_64.tar.gz" "$OUTPUT_DIR/vellum-linux-x86_64.tar.gz.sha256"
+          cp install-release.sh "$OUTPUT_DIR/install.sh"
 
       - name: Attach build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ${{ runner.temp }}/vellum-release/*.tar.gz
+          subject-path: |
+            ${{ runner.temp }}/vellum-release/vellum-linux-x86_64.tar.gz
+            ${{ runner.temp }}/vellum-release/vellum-${{ inputs.tag }}-arch-x86_64.tar.gz
 
-      - name: Upload verified candidate (no public release or tag mutation)
+      - name: Upload the verified candidate as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: vellum-${{ inputs.tag }}-arch-x86_64
           path: |
             ${{ runner.temp }}/vellum-release/*.tar.gz
-            ${{ runner.temp }}/vellum-release/*.tar.gz.sha256
+            ${{ runner.temp }}/vellum-release/*.sha256
+            ${{ runner.temp }}/vellum-release/install.sh
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish the release for this tag
+        shell: bash
+        run: |
+          notes="$OUTPUT_DIR/notes.md"
+          {
+            echo "已校验的 Arch Linux x86_64 / Wayland 版本。安装到用户目录，不需要 root，也不会写入 niri/Hyprland 配置。"
+            echo
+            echo "一键安装："
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash"
+            echo '```'
+            echo
+            echo "从旧式 0.1.x 迁移时加 --adopt-legacy（会先完整备份旧程序）："
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash -s -- --adopt-legacy"
+            echo '```'
+            echo
+            echo "回退与卸载："
+            echo
+            echo '```sh'
+            echo "vellum release status --json"
+            echo "vellum release rollback"
+            echo "vellum release uninstall --yes"
+            echo '```'
+            echo
+            echo "校验：下载 vellum-linux-x86_64.tar.gz.sha256 后执行 sha256sum -c；校验和只证明传输完整与包内一致，不单独证明发布者身份，本工作流同时附构建来源证明。"
+          } > "$notes"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists; attaching verified assets"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "Vellum $RELEASE_TAG" \
+              --verify-tag \
+              --notes-file "$notes" \
+              --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" --clobber \
+            "$OUTPUT_DIR/vellum-linux-x86_64.tar.gz" \
+            "$OUTPUT_DIR/vellum-linux-x86_64.tar.gz.sha256" \
+            "$OUTPUT_DIR/install.sh"
+          gh release view "$RELEASE_TAG" --json assets --jq ".assets[].name" | sort
+
