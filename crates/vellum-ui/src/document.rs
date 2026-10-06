@@ -59,6 +59,9 @@ fn new_document_id() -> Result<u64, String> {
     allocate_document_id(*nonce, &NEXT_ID)
 }
 
+// `fetch_update` was only renamed to `try_update` after our declared minimum
+// Rust version, so the older name stays until the MSRV moves past that.
+#[allow(deprecated)]
 fn allocate_document_id(nonce: u64, counter: &AtomicU64) -> Result<u64, String> {
     loop {
         let sequence = counter

@@ -49,14 +49,7 @@ fn editable_capture_retains_only_selected_pixels_and_visible_cover() {
     assert_eq!((image.width, image.height), (35, 25));
     assert_eq!(image.pixel(3, 4), [0, 0, 0]);
     assert_eq!(image.pixel(30, 20), [27, 91, 153]);
-    assert!(
-        !image
-            .data
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .any(|p| *p == [231, 17, 5])
-    );
+    assert!(!image.data.as_chunks::<3>().0.contains(&[231, 17, 5]));
     assert!(original_selection(&state.bg, Rect::new(-1, 0, 30, 30)).is_err());
     assert!(original_selection(&state.bg, Rect::new(630, 0, 30, 30)).is_err());
 }
