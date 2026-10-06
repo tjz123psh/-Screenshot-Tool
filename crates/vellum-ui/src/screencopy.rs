@@ -612,7 +612,7 @@ fn decode_shm(
         };
         let start = source_y as usize * stride as usize;
         let row = &payload[start..start + row_bytes as usize];
-        for pixel in row.chunks_exact(4) {
+        for pixel in row.as_chunks::<4>().0.iter() {
             #[cfg(target_endian = "little")]
             let channels = match format {
                 FORMAT_ARGB8888 | FORMAT_XRGB8888 => [pixel[2], pixel[1], pixel[0]],

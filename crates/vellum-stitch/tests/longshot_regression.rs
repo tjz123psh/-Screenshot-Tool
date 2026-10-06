@@ -366,7 +366,7 @@ fn sparse_scrolling_foreground_is_not_hidden_by_a_fixed_background() {
             let row = frame.row_mut(y);
             // A fixed, dark translucent-looking background. These rows are what
             // the 24-point idle signature lands on.
-            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+            for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let texture = ((x / 13 + y / 9 * 3) % 7) as u8;
                 pixel.copy_from_slice(&[30 + texture, 36 + texture, 40 + texture]);
             }
@@ -438,7 +438,7 @@ fn a_narrow_static_animation_must_not_be_learned_as_fixed_footer() {
         let mut frame = viewport(&src, 60, VIEW_H);
         let y = 200 + tick;
         let row = frame.row_mut(y);
-        for px in row.chunks_exact_mut(3) {
+        for px in row.as_chunks_mut::<3>().0.iter_mut() {
             px.copy_from_slice(&[30, 120, 220]);
         }
         frames.push(frame);

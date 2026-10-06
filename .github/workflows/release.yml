@@ -68,6 +68,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Container jobs run as a different user than the checkout owner, so git
+      # refuses the workspace as "dubious ownership" without this.
+      - name: Trust the mounted workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Verify tag and derive archive epoch
         shell: bash
         run: |

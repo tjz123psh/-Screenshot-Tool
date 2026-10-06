@@ -102,7 +102,7 @@ impl Gray {
 /// Rec. 601 luma, matching Pillow's `convert("L")`.
 pub fn to_gray(image: &Rgb8) -> Gray {
     let mut out = Gray::new(image.width, image.height);
-    for (dst, src) in out.data.iter_mut().zip(image.data.chunks_exact(3)) {
+    for (dst, src) in out.data.iter_mut().zip(image.data.as_chunks::<3>().0.iter()) {
         let value =
             299 * u32::from(src[0]) + 587 * u32::from(src[1]) + 114 * u32::from(src[2]) + 500;
         *dst = (value / 1000) as u8;
@@ -595,7 +595,7 @@ fn clahe(gray: &Gray) -> Gray {
 
 fn max_channel(image: &Rgb8) -> Gray {
     let mut out = Gray::new(image.width, image.height);
-    for (dst, src) in out.data.iter_mut().zip(image.data.chunks_exact(3)) {
+    for (dst, src) in out.data.iter_mut().zip(image.data.as_chunks::<3>().0.iter()) {
         *dst = src[0].max(src[1]).max(src[2]);
     }
     out
@@ -607,7 +607,9 @@ fn mean_chroma(image: &Rgb8) -> f64 {
     }
     let sum: u64 = image
         .data
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|pixel| u64::from(pixel.iter().max().unwrap() - pixel.iter().min().unwrap()))
         .sum();
     sum as f64 / (image.data.len() / 3) as f64
@@ -617,7 +619,7 @@ fn strongest_channel_range(image: &Rgb8) -> u8 {
     (0..3)
         .map(|channel| {
             let mut gray = Gray::new(image.width, image.height);
-            for (dst, pixel) in gray.data.iter_mut().zip(image.data.chunks_exact(3)) {
+            for (dst, pixel) in gray.data.iter_mut().zip(image.data.as_chunks::<3>().0.iter()) {
                 *dst = pixel[channel];
             }
             robust_range(&gray)
@@ -639,7 +641,7 @@ fn principal_color_gray(image: &Rgb8) -> Gray {
     let stride = (pixels / 200_000).max(1);
     let mut mean = [0.0f64; 3];
     let mut count = 0.0f64;
-    for pixel in image.data.chunks_exact(3).step_by(stride) {
+    for pixel in image.data.as_chunks::<3>().0.iter().step_by(stride) {
         for channel in 0..3 {
             mean[channel] += f64::from(pixel[channel]);
         }
@@ -650,7 +652,7 @@ fn principal_color_gray(image: &Rgb8) -> Gray {
     }
 
     let mut covariance = [[0.0f64; 3]; 3];
-    for pixel in image.data.chunks_exact(3).step_by(stride) {
+    for pixel in image.data.as_chunks::<3>().0.iter().step_by(stride) {
         let centered = [
             f64::from(pixel[0]) - mean[0],
             f64::from(pixel[1]) - mean[1],
@@ -707,7 +709,7 @@ fn principal_color_gray(image: &Rgb8) -> Gray {
     let mut projected = Vec::with_capacity(pixels);
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
-    for pixel in image.data.chunks_exact(3) {
+    for pixel in image.data.as_chunks::<3>().0.iter() {
         let value = (f64::from(pixel[0]) - mean[0]) * vector[0]
             + (f64::from(pixel[1]) - mean[1]) * vector[1]
             + (f64::from(pixel[2]) - mean[2]) * vector[2];
@@ -1005,7 +1007,7 @@ mod tests {
     fn a_dark_theme_is_inverted_before_recognition() {
         let mut dark = solid(32, 32, 20);
         // A few bright pixels so autocontrast has a range to work with.
-        for pixel in dark.data.chunks_exact_mut(3).take(16) {
+        for pixel in dark.data.as_chunks_mut::<3>().0.iter_mut().take(16) {
             pixel.copy_from_slice(&[200, 200, 200]);
         }
         let prepared = prepare(&dark, 1.0);

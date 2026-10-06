@@ -46,7 +46,7 @@ fn repeating_list_page(height: usize) -> Rgb8 {
         // More than 10% of every edge column moves between frames, preventing
         // the synthetic white margins from masquerading as a fixed sidebar.
         if (36..45).contains(&within) {
-            for pixel in row.chunks_exact_mut(3) {
+            for pixel in row.as_chunks_mut::<3>().0.iter_mut() {
                 pixel.copy_from_slice(&[232, 236, 240]);
             }
         }

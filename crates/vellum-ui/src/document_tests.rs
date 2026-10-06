@@ -296,7 +296,7 @@ fn sampled_effect_crossing_source_edges_cannot_read_outside_the_capture() {
     annotator.release(14.5, 12.5);
     let doc = Document::from_selection(image(4, 4), annotator.snapshot_objects(selection)).unwrap();
     let output = doc.snapshot().unwrap();
-    for pixel in output.image.data.chunks_exact(3) {
+    for pixel in output.image.data.as_chunks::<3>().0.iter() {
         assert_eq!(pixel[0], pixel[1]);
         assert_eq!(pixel[1], pixel[2]);
     }

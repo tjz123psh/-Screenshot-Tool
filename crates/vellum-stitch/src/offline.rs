@@ -535,8 +535,10 @@ fn uniform_band(frame: &Rgb8, start: usize, end: usize) -> Option<[u8; 3]> {
     (0..frame.height)
         .all(|y| {
             frame.row(y)[start * 3..end * 3]
-                .chunks_exact(3)
-                .all(|pixel| pixel == colour)
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == colour)
         })
         .then_some(colour)
 }

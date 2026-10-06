@@ -358,7 +358,7 @@ fn original_selection(bg: &ImageSurface, rect: Rect) -> Result<Rgb8, String> {
     bg.with_data(|bytes| {
         for y in rect.y as usize..rect.y as usize + height {
             let row = &bytes[y * stride + rect.x as usize * 4..][..width * 4];
-            for p in row.chunks_exact(4) {
+            for p in row.as_chunks::<4>().0.iter() {
                 let inv = 255u16 - u16::from(p[3]);
                 for c in [p[2], p[1], p[0]] {
                     out.push((u16::from(c) + inv).min(255) as u8);

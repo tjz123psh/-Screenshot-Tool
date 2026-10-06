@@ -92,7 +92,7 @@ impl FixedRegionDetector {
             let mut unchanged_in_row = 0usize;
             for (count, (p, c)) in column_unchanged
                 .iter_mut()
-                .zip(pr.chunks_exact(3).zip(cr.chunks_exact(3)))
+                .zip(pr.as_chunks::<3>().0.iter().zip(cr.as_chunks::<3>().0.iter()))
             {
                 let delta = (0..3)
                     .map(|i| (i16::from(p[i]) - i16::from(c[i])).abs())
