@@ -254,11 +254,20 @@ class PackageTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("workflow_dispatch:", workflow)
         self.assertNotIn("  push:", workflow)
-        self.assertNotIn("contents: write", workflow)
+        # Publishing stays a deliberate act: the workflow is manual only, the
+        # default permission is read-only and just the packaging job may write.
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn("      contents: write", workflow)
         self.assertIn('test "$WORKFLOW_REF" = "refs/tags/$RELEASE_TAG"', workflow)
         self.assertIn('test "$(git rev-parse HEAD)" = "$WORKFLOW_SHA"', workflow)
         self.assertIn("actions/attest-build-provenance@", workflow)
         self.assertIn('--output "$OUTPUT_DIR/bundle"', workflow)
+        # Stable asset names keep releases/latest/download/... valid across
+        # versions, and the checksum must verify the name it is published under.
+        self.assertIn("vellum-linux-x86_64.tar.gz", workflow)
+        self.assertIn("sha256sum vellum-linux-x86_64.tar.gz", workflow)
+        self.assertIn("gh release create", workflow)
+        self.assertIn("gh release upload", workflow)
         lines = workflow.splitlines()
         for index, line in enumerate(lines):
             if line.strip() != "run: |":
