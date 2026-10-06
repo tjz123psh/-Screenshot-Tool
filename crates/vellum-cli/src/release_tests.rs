@@ -209,6 +209,90 @@ fn make_legacy_fixture(sandbox: &Sandbox) -> PathBuf {
     }
     directory
 }
+fn staged_directories(sandbox: &Sandbox) -> Vec<PathBuf> {
+    fs::read_dir(sandbox.root())
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("stage-"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn an_install_after_an_interrupted_preparation_heals_itself() {
+    let sandbox = Sandbox::new();
+    let bundle = make_bundle(&sandbox, "release-a");
+    let mut services = FakeServices::default();
+    let mut hooks = TraceHooks {
+        fail: Some("file-copied"),
+        ..TraceHooks::default()
+    };
+    assert!(
+        execute(
+            Operation::Install {
+                bundle: bundle.clone(),
+                adopt_legacy: false,
+            },
+            &sandbox.paths(),
+            &mut services,
+            &mut hooks,
+        )
+        .is_err(),
+        "the injected failure did not interrupt the install"
+    );
+    assert!(sandbox.root().join("journal.json").exists());
+    let staged = staged_directories(&sandbox);
+    assert!(
+        !staged.is_empty(),
+        "the interrupted preparation left no staging copy to clean"
+    );
+    // The copy is cut short before the manifest lands, which is exactly the
+    // shape a real interrupted preparation has.
+
+    // A transaction that only prepared a candidate touched no public file, so
+    // the next install rolls it back instead of demanding a manual repair.
+    let report = install(&sandbox, &bundle, &mut services);
+    assert_eq!(report.state, "ready");
+    assert!(!sandbox.root().join("journal.json").exists());
+    assert!(
+        staged_directories(&sandbox).is_empty(),
+        "the abandoned staging copy survived the recovery"
+    );
+}
+
+#[test]
+fn uninstall_removes_staging_copies_from_earlier_failed_attempts() {
+    let sandbox = Sandbox::new();
+    let bundle = make_bundle(&sandbox, "release-a");
+    let mut services = FakeServices::default();
+    install(&sandbox, &bundle, &mut services);
+
+    // Mimic a copy left behind by a failed attempt: it looks like our own
+    // staging area, but no journal refers to it any more.
+    let orphan = sandbox.root().join("stage-4242-deadbeef");
+    fs::create_dir(&orphan).unwrap();
+    fs::copy(bundle.join("manifest.json"), orphan.join("manifest.json")).unwrap();
+
+    let report = execute(
+        Operation::Uninstall { confirmed: true },
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    assert_eq!(report.state, "uninstalled");
+    assert!(
+        !orphan.exists(),
+        "an abandoned staging copy survived an uninstall"
+    );
+}
+
 fn change_manifest(bundle: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     let path = bundle.join("manifest.json");
     let mut manifest: serde_json::Value =

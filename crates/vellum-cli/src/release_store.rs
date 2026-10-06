@@ -1165,8 +1165,14 @@ fn uninstall(
     atomic_json(&paths.root, STATE, &state)?;
     checkpoint(paths, &mut journal, "committed", "committed", hooks)?;
     remove_journal(paths)?;
-    let mut report =
-        state.report("已卸载自有入口并清理完整且未使用的程序版本；legacy备份、在用/改动/未知版本及全部用户数据保留");
+    // No journal is open any more, so any staging directory left in the root is
+    // an abandoned copy from an earlier interrupted attempt.
+    let swept = discard_orphan_stages(paths);
+    let mut report = state.report(if swept.is_empty() {
+        "已卸载自有入口并清理完整且未使用的程序版本；legacy备份、在用/改动/未知版本及全部用户数据保留"
+    } else {
+        "已卸载自有入口并清理完整且未使用的程序版本；同时清理了上次失败留下的暂存副本；用户设置与图片保留"
+    });
     if cancel_legacy {
         report.message =
             "已取消尚未接管的候选安装；旧式regular入口、运行中的旧程序与服务均未修改".into();
@@ -1174,6 +1180,60 @@ fn uninstall(
     report.preserved = preserved;
     Ok(report)
 }
+/// Remove the private staging copy of a candidate that was never activated.
+///
+/// Only a `stage-*` directory directly under our own root whose manifest names
+/// the journal target is ever touched; anything unexpected is left in place and
+/// reported instead, so a surprising layout is never deleted.
+fn discard_stage(
+    paths: &Paths,
+    name: &str,
+    require_manifest: bool,
+    target: Option<&str>,
+) -> Option<PathBuf> {
+    if !name.starts_with("stage-") || name.contains('/') || name.contains("..") {
+        return None;
+    }
+    let path = paths.root.join(name);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    // A directory the journal recorded is ours even when the copy was cut short
+    // before the manifest landed; a manifest that does exist must still agree
+    // with the target. An unreferenced directory has to prove itself instead.
+    match Manifest::read(&path) {
+        Ok(manifest) => {
+            if let Some(target) = target
+                && manifest.release_id != target
+            {
+                return None;
+            }
+        }
+        Err(_) if require_manifest => return None,
+        Err(_) => {}
+    }
+    fs::remove_dir_all(&path).ok()?;
+    Some(path)
+}
+
+/// Staging directories only exist while a transaction is open, so any that
+/// survive without a journal are abandoned copies. Swept by an explicit
+/// uninstall; each one still has to look like our own staging area.
+fn discard_orphan_stages(paths: &Paths) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let Ok(entries) = fs::read_dir(&paths.root) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if discard_stage(paths, &name, true, None).is_some() {
+            removed.push(paths.root.join(name));
+        }
+    }
+    removed
+}
+
 fn repair(
     paths: &Paths,
     services: &mut dyn Services,
@@ -1220,13 +1280,25 @@ fn repair(
         return Ok(state.report("已完成原版本恢复，清理中断日志"));
     }
     if matches!(journal.phase.as_str(), "preparing" | "adopting") {
-        // No public file was touched in these phases. Leave partial private
-        // staging/backups for inspection rather than guessing a recursive delete.
+        // No public file was touched in these phases: the candidate only ever
+        // existed as a private staging copy. Discard it instead of leaving a
+        // bundle-sized directory behind for the user to find and wonder about.
         let old = journal.old.clone();
+        let stage = journal.stage.clone();
+        let target = journal.target.clone();
         atomic_json(&paths.root, STATE, &old)?;
         remove_journal(paths)?;
-        let mut report = old.report("未完成准备已撤销；旧安装未改动，私有临时副本保留供检查");
-        if let Some(stage) = journal.stage {
+        let cleaned = stage
+            .as_deref()
+            .and_then(|name| discard_stage(paths, name, false, target.as_deref()));
+        let mut report = old.report(if cleaned.is_some() {
+            "未完成准备已撤销；旧安装未改动，私有临时副本已清理"
+        } else {
+            "未完成准备已撤销；旧安装未改动，私有临时副本保留供检查"
+        });
+        if cleaned.is_none()
+            && let Some(stage) = stage
+        {
             report.preserved.push(paths.root.join(stage));
         }
         return Ok(report);
@@ -1286,8 +1358,22 @@ pub fn execute(
         return Ok(report);
     }
     let _lock = lock(paths, !matches!(operation, Operation::Status))?;
-    let state = load_state(paths)?;
-    let journal_exists = fs::symlink_metadata(paths.root.join(JOURNAL)).is_ok();
+    let mut state = load_state(paths)?;
+    let mut journal_exists = fs::symlink_metadata(paths.root.join(JOURNAL)).is_ok();
+    if journal_exists
+        && matches!(&operation, Operation::Install { .. })
+        && matches!(
+            read_journal(paths)?.phase.as_str(),
+            "preparing" | "adopting"
+        )
+    {
+        // A transaction that stopped while merely preparing never touched a
+        // public file, so a fresh install rolls it back and continues instead
+        // of sending the user to repair for a state that lost nothing.
+        repair(paths, services, hooks)?;
+        state = load_state(paths)?;
+        journal_exists = fs::symlink_metadata(paths.root.join(JOURNAL)).is_ok();
+    }
     if matches!(operation, Operation::Status) {
         let mut report = state.report("发布状态");
         if journal_exists {
@@ -1330,9 +1416,15 @@ pub fn execute(
             }
             return cancel_pending(paths, state, services, hooks);
         }
-        return Err(
-            "有未完成的发布事务，请先运行repair；待激活安装可明确uninstall --yes取消".into(),
-        );
+        // Name a program the user can actually run: nothing may be on PATH yet.
+        let program = read_journal(paths)?
+            .target
+            .and_then(|id| paths.release(&id).ok())
+            .map(|release| release.join("bin/vellum").display().to_string())
+            .unwrap_or_else(|| "发行包内的 bin/vellum".into());
+        return Err(format!(
+            "有未完成的发布事务，请先运行repair；待激活安装可明确uninstall --yes取消（修复程序：{program}）"
+        ));
     }
     if current(paths)? != state.current {
         return Err("current与发布记录不一致，拒绝修改".into());
