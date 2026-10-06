@@ -69,9 +69,13 @@ jobs:
           persist-credentials: false
 
       # Container jobs run as a different user than the checkout owner, so git
-      # refuses the workspace as "dubious ownership" without this.
+      # refuses the workspace as "dubious ownership". The build script probes git
+      # with the global and system config disabled, so the ownership itself has
+      # to match, not just a safe.directory entry.
       - name: Trust the mounted workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
       - name: Verify tag and derive archive epoch
         shell: bash
@@ -98,6 +102,8 @@ jobs:
       - name: Package clean fixed-tag binaries
         shell: bash
         run: |
+          # Make a rejected candidate diagnosable from the log alone.
+          ./target/release/vellum --build-info-json
           python3 tools/package_release.py --root . --bin-dir target/release \
             --output "$OUTPUT_DIR/bundle" --release-tag "$RELEASE_TAG" \
             --archive "$OUTPUT_DIR/vellum-$RELEASE_TAG-arch-x86_64.tar.gz"

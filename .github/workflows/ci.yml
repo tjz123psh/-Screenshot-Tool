@@ -32,9 +32,13 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
       # Container jobs run as a different user than the checkout owner, so git
-      # refuses the workspace as "dubious ownership" without this.
+      # refuses the workspace as "dubious ownership". The build script probes git
+      # with the global and system config disabled, so the ownership itself has
+      # to match, not just a safe.directory entry.
       - name: Trust the mounted workspace
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
       - name: Check formatting
         run: cargo fmt --check
