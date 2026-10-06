@@ -258,6 +258,39 @@ pub fn has_build_info_marker(path: &Path) -> Result<bool, String> {
     }
     Ok(found)
 }
+/// Ask the dynamic loader what a bundled program cannot find.
+///
+/// A probe failure on a freshly installed system is almost always a missing
+/// runtime library, and "probe failed" alone leaves the user with nothing to
+/// act on. The list is bounded and only names libraries.
+fn missing_libraries(path: &Path) -> Vec<String> {
+    let Ok(output) = vellum_core::proc::command("ldd").arg(path).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.trim().split_once("=> ")?;
+            rest.trim()
+                .starts_with("not found")
+                .then(|| name.trim().to_string())
+        })
+        .take(4)
+        .collect()
+}
+
+fn probe_failure(path: &Path) -> String {
+    let missing = missing_libraries(path);
+    if missing.is_empty() {
+        "构建信息探测失败：程序无法运行，请检查运行依赖".into()
+    } else {
+        format!(
+            "构建信息探测失败：缺少运行库 {}；请先用系统包管理器安装对应软件包，再重试",
+            missing.join("、")
+        )
+    }
+}
+
 pub fn probe_build_info(path: &Path) -> Result<BuildInfo, String> {
     if !has_build_info_marker(path)? {
         return Err("二进制没有安全构建信息入口，拒绝执行探测".into());
@@ -269,7 +302,7 @@ pub fn probe_build_info(path: &Path) -> Result<BuildInfo, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_| "无法探测构建信息")?;
+        .map_err(|_| probe_failure(path))?;
     let mut stdout = child.stdout.take().ok_or("构建探测没有输出管道")?;
     let fd = stdout.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -308,7 +341,7 @@ pub fn probe_build_info(path: &Path) -> Result<BuildInfo, String> {
                     }
                 }
                 if !status.success() || output.len() > 65536 {
-                    break Err("构建信息探测失败".into());
+                    break Err(probe_failure(path));
                 }
                 break serde_json::from_slice::<BuildInfo>(&output)
                     .map_err(|_| "构建信息JSON无效".into());

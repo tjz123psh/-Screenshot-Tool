@@ -139,7 +139,11 @@ jobs:
         run: |
           notes="$OUTPUT_DIR/notes.md"
           {
-            echo "已校验的 Arch Linux x86_64 / Wayland 版本。安装到用户目录，不需要 root，也不会写入 niri/Hyprland 配置。"
+            echo "已校验的 Arch Linux x86_64 / Wayland 版本。安装到用户目录，也不会写入 niri/Hyprland 配置。"
+            echo
+            echo "一键脚本会检查运行库：缺哪个库就报哪个库，在 Arch 上用 \`pacman -S --needed\` 补齐（通过 sudo 询问密码，可取消），补不齐就不开始安装。"
+            echo
+            echo "运行依赖：\`gtk4\`、\`gtk4-layer-shell\`、\`grim\`、\`wl-clipboard\`、\`libnotify\`；本地 OCR 另需 \`tesseract\` 及语言包。"
             echo
             echo "一键安装："
             echo

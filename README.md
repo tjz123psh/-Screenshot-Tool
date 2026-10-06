@@ -65,7 +65,11 @@
 curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash
 ```
 
-脚本只做四件事：下载最新发行包、核对 SHA256、解压、交给版本管理器安装。它**不联网构建、不需要 root，也不写任何合成器配置**。
+脚本做四件事：下载最新发行包、核对 SHA256、**检查并补齐运行库**、交给版本管理器安装。它**不联网构建，也不写任何合成器配置**。
+
+运行库检查由动态加载器判定：缺哪个库就报哪个库；在 Arch 上用 `pacman -S --needed` 补齐（通过 `sudo` 询问密码，可以取消），补不齐则明确报告并**不开始安装**。其他发行版只报告缺少的库名。加 `--no-deps` 可完全跳过系统包处理。
+
+运行依赖：`gtk4`、`gtk4-layer-shell`、`grim`、`wl-clipboard`、`libnotify`；本地 OCR 另需 `tesseract` 及语言包。
 
 从旧式 0.1.x 安装迁移时明确选择接管（会先把旧程序完整备份成可回退版本）：
 
