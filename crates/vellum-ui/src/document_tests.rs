@@ -69,6 +69,16 @@ fn concurrent_id_allocation_never_reuses_a_sequence() {
 }
 
 #[test]
+fn untouched_snapshot_reuses_pixels_but_crop_does_not() {
+    let mut doc = Document::from_raster(image(12, 12)).unwrap();
+    assert!(Arc::ptr_eq(&doc.snapshot().unwrap().image, &doc.source));
+    doc.set_crop(Rect::new(2, 2, 6, 6)).unwrap();
+    let cropped = doc.snapshot().unwrap();
+    assert!(!Arc::ptr_eq(&cropped.image, &doc.source));
+    assert_eq!((cropped.image.width, cropped.image.height), (6, 6));
+}
+
+#[test]
 fn snapshot_caches_only_composite_and_preserves_opaque_cover_above_blur() {
     let cover = shape(Tool::Cover, vec![(2.2, 3.7), (8.6, 9.1)]);
     let blur = shape(Tool::Blur, vec![(0.0, 0.0), (12.0, 12.0)]);

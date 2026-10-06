@@ -30,6 +30,10 @@ pub struct ServiceSnapshot {
     pub active: Vec<String>,
 }
 pub trait Services {
+    /// Change only persistent startup links, never active processes.
+    fn set_enabled(&mut self, _: &Paths, _: &Path, _: &[String]) -> Result<(), String> {
+        Err("此服务管理器不支持修改开机自启".into())
+    }
     fn snapshot(&mut self, paths: &Paths) -> Result<ServiceSnapshot, String>;
     fn activate(
         &mut self,
@@ -50,6 +54,14 @@ pub struct RealServices {
     _private: (),
 }
 impl Services for RealServices {
+    fn set_enabled(
+        &mut self,
+        paths: &Paths,
+        release: &Path,
+        enabled: &[String],
+    ) -> Result<(), String> {
+        real_adapter().set_enabled(paths, release, enabled)
+    }
     fn snapshot(&mut self, paths: &Paths) -> Result<ServiceSnapshot, String> {
         real_adapter().snapshot(paths)
     }
@@ -478,6 +490,51 @@ impl<R: Runner> Adapter<R> {
             }
             if state.active && !self.matches_process(release, &name, state.main_pid) {
                 return Err("服务实际进程不是目标版本".into());
+            }
+        }
+        Ok(())
+    }
+    fn set_enabled(
+        &mut self,
+        paths: &Paths,
+        release: &Path,
+        enabled: &[String],
+    ) -> Result<(), String> {
+        if enabled.iter().any(|name| !UNITS.contains(&name.as_str())) {
+            return Err("自启服务名称无效".into());
+        }
+        let deadline = Instant::now() + self.timeout;
+        // Unlike activation, an open panel is allowed: no start/stop/restart here.
+        let states = self.bindings(paths, release, deadline)?;
+        for (name, state) in states {
+            let enable = enabled.contains(&name);
+            if state.enabled == enable {
+                continue;
+            }
+            let public = paths.config_dir.join("systemd/user").join(&name);
+            let link = fs::read_link(&public).map_err(|_| "受管理服务入口不再是符号链接")?;
+            verify_public(paths, release, &name)?;
+            let result = self.required(
+                &[if enable { "enable" } else { "disable" }, "--", &name],
+                deadline,
+            );
+            // disable may remove the public unit link too. Restore exactly that
+            // owned link, not its wants links, without replacing any foreign file.
+            match fs::symlink_metadata(&public) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    std::os::unix::fs::symlink(&link, &public)
+                        .map_err(|_| "无法恢复受管理服务入口")?;
+                }
+                Err(_) => return Err("无法确认受管理服务入口".into()),
+                Ok(_) => {}
+            }
+            verify_public(paths, release, &name)?;
+            result?;
+        }
+        self.required(&["daemon-reload"], deadline)?;
+        for (name, state) in self.bindings(paths, release, deadline)? {
+            if state.enabled != enabled.contains(&name) {
+                return Err("开机自启状态未与选择一致".into());
             }
         }
         Ok(())
@@ -1234,6 +1291,66 @@ mod tests {
         adapter
             .apply(&fixture.paths, &fixture.release, &desired)
             .unwrap();
+        assert!(!has_mutations(&adapter.runner));
+    }
+
+    #[test]
+    fn startup_toggle_preserves_running_processes_and_public_unit_links() {
+        let fixture = Fixture::new();
+        fixture.process(104, "vellum-ui", "panel");
+        let mut adapter = fixture.adapter();
+        adapter.runner.delete_link_on_disable = true;
+        for state in adapter.runner.states.values_mut() {
+            state.enabled = true;
+            state.active = true;
+        }
+        adapter
+            .set_enabled(&fixture.paths, &fixture.release, &[])
+            .unwrap();
+        for name in UNITS {
+            let state = &adapter.runner.states[name];
+            assert!(!state.enabled && state.active);
+            assert!(
+                fixture
+                    .paths
+                    .config_dir
+                    .join("systemd/user")
+                    .join(name)
+                    .is_symlink()
+            );
+        }
+        let enabled = UNITS.iter().map(|name| (*name).into()).collect::<Vec<_>>();
+        adapter
+            .set_enabled(&fixture.paths, &fixture.release, &enabled)
+            .unwrap();
+        assert!(
+            adapter
+                .runner
+                .states
+                .values()
+                .all(|state| state.enabled && state.active)
+        );
+        assert!(!adapter.runner.calls.iter().any(|args| {
+            matches!(args[3].as_str(), "start" | "restart" | "stop")
+                || args.iter().any(|arg| arg == "--now")
+        }));
+    }
+
+    #[test]
+    fn startup_toggle_rejects_foreign_unit_before_any_mutation() {
+        let fixture = Fixture::new();
+        let mut adapter = fixture.adapter();
+        adapter
+            .runner
+            .states
+            .get_mut("vellum-tray.service")
+            .unwrap()
+            .fragment = fixture.directory.join("foreign.service");
+        assert!(
+            adapter
+                .set_enabled(&fixture.paths, &fixture.release, &[])
+                .is_err()
+        );
         assert!(!has_mutations(&adapter.runner));
     }
 

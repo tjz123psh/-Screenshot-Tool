@@ -14,15 +14,24 @@ use vellum_core::Rgb8;
 /// The Rust binding takes ownership of the buffer, so unlike the Python
 /// version there is no separate backing reference the caller must keep alive.
 pub fn to_surface(image: &Rgb8) -> Result<ImageSurface> {
-    let width = image.width as i32;
-    let height = image.height as i32;
+    to_surface_rows(image, 0, image.height)
+}
+
+/// Convert only visible rows, without allocating an intermediate RGB copy.
+pub fn to_surface_rows(image: &Rgb8, start: usize, end: usize) -> Result<ImageSurface> {
+    anyhow::ensure!(
+        start < end && end <= image.height,
+        "invalid surface row range"
+    );
+    let width = i32::try_from(image.width).context("surface width exceeds i32")?;
+    let height = i32::try_from(end - start).context("surface height exceeds i32")?;
     let stride = Format::ARgb32
         .stride_for_width(image.width as u32)
         .map_err(|err| anyhow::anyhow!("cairo rejected width {}: {err}", image.width))?;
 
-    let mut data = vec![0u8; stride as usize * image.height];
-    for y in 0..image.height {
-        let src = image.row(y);
+    let mut data = vec![0u8; stride as usize * height as usize];
+    for y in 0..height as usize {
+        let src = image.row(start + y);
         let dst = &mut data[y * stride as usize..][..image.width * 4];
         for (pixel, out) in src
             .as_chunks::<3>()
@@ -123,6 +132,17 @@ mod tests {
         assert_eq!(restored.width, original.width);
         assert_eq!(restored.height, original.height);
         assert_eq!(restored.data, original.data);
+    }
+
+    #[test]
+    fn row_conversion_matches_source_without_including_other_rows() {
+        let image = frame();
+        let mut surface = to_surface_rows(&image, 1, 2).unwrap();
+        let restored = from_surface(&mut surface).unwrap();
+        assert_eq!((restored.width, restored.height), (3, 1));
+        assert_eq!(restored.data, image.row(1));
+        assert!(to_surface_rows(&image, 1, 1).is_err());
+        assert!(to_surface_rows(&image, 0, 3).is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! client depend on it, and both must stay light enough to start in a few
 //! milliseconds (ARCHITECTURE.md §6).
 
+pub mod autostart;
 pub mod build_info;
 pub mod capture;
 pub mod compositor;

@@ -567,6 +567,9 @@ fn adopt_legacy_installation(
     Ok(())
 }
 fn install_links(paths: &Paths, journal: &Journal) -> Result<(), String> {
+    let startup_disabled = vellum_core::autostart::load_at(&paths.config_dir)
+        .map_err(|error| error.to_string())?
+        == Some(false);
     let legacy = if journal.adoption.is_some() {
         journal
             .old
@@ -579,6 +582,15 @@ fn install_links(paths: &Paths, journal: &Journal) -> Result<(), String> {
     };
     for entry in paths.entries() {
         check_chain(entry.public.parent().ok_or("入口缺少父目录")?)?;
+        if startup_disabled
+            && entry.relative == "generated/autostart/ai.vellum-shortcuts.desktop"
+            && public_is_ours(paths, &entry)
+        {
+            // Also protects rollback to releases predating the login preference gate.
+            fs::remove_file(&entry.public).map_err(|_| "无法关闭受管桌面自启入口")?;
+            sync_dir(entry.public.parent().unwrap())?;
+            continue;
+        }
         match fs::symlink_metadata(&entry.public) {
             Ok(_) if public_is_ours(paths, &entry) => continue,
             Ok(meta) if meta.is_file() && legacy.is_some() => {
@@ -598,6 +610,15 @@ fn install_links(paths: &Paths, journal: &Journal) -> Result<(), String> {
                 }
             }
             Ok(_) => return Err("公共入口在操作期间被替换，拒绝覆盖".into()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && (journal.old.current.is_some() || startup_disabled)
+                    && entry.relative == "generated/autostart/ai.vellum-shortcuts.desktop" =>
+            {
+                // Removing a login entry is also a user opt-out. Updates/repair
+                // may restore binaries, but only an explicit toggle restores this.
+                continue;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err("无法读取公共入口".into()),
         }
@@ -653,6 +674,9 @@ fn finish(
 ) -> Result<Report, String> {
     let target = journal.target.clone().ok_or("日志缺少候选版本")?;
     verify_release(paths, &target)?;
+    // Read before any live switch; a damaged preference must never mean enabled.
+    let startup =
+        vellum_core::autostart::load_at(&paths.config_dir).map_err(|error| error.to_string())?;
     let now = services.snapshot(paths)?;
     if now.busy {
         checkpoint(paths, journal, "deferred", "activation-deferred", hooks)?;
@@ -704,9 +728,17 @@ fn finish(
     };
     desired.busy = false;
     desired.reachable = true;
-    if old.is_none() {
+    if old.is_none() && startup != Some(false) {
         desired.enabled = UNITS.iter().map(|s| (*s).into()).collect();
         desired.active = desired.enabled.clone();
+    }
+    if startup == Some(false) {
+        desired.enabled.clear();
+        // Existing running processes may be upgraded, but an opted-out fresh
+        // install/reinstall must not start services just because it installed.
+        if old.is_none() {
+            desired.active.clear();
+        }
     }
     checkpoint(paths, journal, "activating", "activation-started", hooks)?;
     if services
@@ -1338,6 +1370,100 @@ fn repair(
     }
     finish(paths, &mut journal, services, hooks)
 }
+fn autostart(
+    paths: &Paths,
+    state: &State,
+    services: &mut dyn Services,
+    requested: Option<bool>,
+) -> Result<Report, String> {
+    let id = state
+        .current
+        .as_deref()
+        .ok_or("请先安装受管版本后再设置开机自启")?;
+    verify_release(paths, id)?;
+    // Never overwrite an externally edited/hidden desktop entry. The immutable
+    // login entry consults the preference instead of being rewritten by the UI.
+    let desktop = paths
+        .entries()
+        .into_iter()
+        .find(|entry| entry.relative == "generated/autostart/ai.vellum-shortcuts.desktop")
+        .ok_or("安装缺少桌面自启入口")?;
+    let desktop_present = match fs::symlink_metadata(&desktop.public) {
+        Ok(_) if public_is_ours(paths, &desktop) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        _ => return Err("桌面自启入口已由外部修改，请先检查安装；不会覆盖".into()),
+    };
+    let mut preference =
+        vellum_core::autostart::load_at(&paths.config_dir).map_err(|error| error.to_string())?;
+    let before = services.snapshot(paths)?;
+    if !before.reachable {
+        return Err("用户服务管理器不可达，无法确认或修改开机自启，请登录桌面后重试".into());
+    }
+    let mut enabled = before.enabled;
+    if requested == Some(true) && !desktop_present {
+        // The user's explicit enable action may restore a deleted desktop entry.
+        // Keep its gate closed until every service link is confirmed enabled.
+        vellum_core::autostart::save_at(&paths.config_dir, false)
+            .map_err(|error| error.to_string())?;
+        check_chain(desktop.public.parent().ok_or("自启入口缺少父目录")?)?;
+        replace_symlink(&desktop.public, &public_target(paths, &desktop.relative))?;
+    }
+    if let Some(requested) = requested {
+        let desired: Vec<String> = if requested {
+            UNITS.iter().map(|name| (*name).into()).collect()
+        } else {
+            Vec::new()
+        };
+        // Disable the desktop gate first. If a service operation fails or the
+        // process is interrupted, installation must still remember the opt-out.
+        if !requested {
+            vellum_core::autostart::save_at(&paths.config_dir, false)
+                .map_err(|error| error.to_string())?;
+            if desktop_present {
+                if !public_is_ours(paths, &desktop) {
+                    return Err("桌面自启入口在保存期间被替换，未删除".into());
+                }
+                fs::remove_file(&desktop.public).map_err(|_| "无法关闭受管桌面自启入口")?;
+                sync_dir(desktop.public.parent().ok_or("自启入口缺少父目录")?)?;
+            }
+        }
+        let release = paths.release(id)?;
+        if let Err(error) = services.set_enabled(paths, &release, &desired) {
+            if requested {
+                let _ = services.set_enabled(paths, &release, &enabled);
+            }
+            return Err(format!("自启更改未全部完成，请重新保存重试：{error}"));
+        }
+        if requested && let Err(error) = vellum_core::autostart::save_at(&paths.config_dir, true) {
+            let _ = services.set_enabled(paths, &release, &enabled);
+            return Err(format!("自启持久化未确认，请重新保存重试：{error}"));
+        }
+        enabled = desired;
+        preference = Some(requested);
+    }
+    let desktop_enabled =
+        (desktop_present || requested == Some(true)) && preference.unwrap_or(true);
+    let (status, message) = if !desktop_enabled && enabled.is_empty() {
+        (
+            "autostart-disabled",
+            "已关闭；不会在下次登录时自启，不影响当前运行的截图和托盘",
+        )
+    } else if desktop_enabled && enabled.len() == UNITS.len() {
+        (
+            "autostart-enabled",
+            "已开启；下次登录桌面时启动后台服务、托盘和快捷键",
+        )
+    } else {
+        (
+            "autostart-mixed",
+            "部分自启入口已启用；切换并保存可统一设置",
+        )
+    };
+    let mut report = state.report(message);
+    report.state = status.into();
+    Ok(report)
+}
+
 pub fn execute(
     operation: Operation,
     paths: &Paths,
@@ -1357,7 +1483,16 @@ pub fn execute(
         }
         return Ok(report);
     }
-    let _lock = lock(paths, !matches!(operation, Operation::Status))?;
+    if !paths.root.exists() && matches!(operation, Operation::Autostart { .. }) {
+        return Err("请先安装受管版本后再设置开机自启".into());
+    }
+    let _lock = lock(
+        paths,
+        !matches!(
+            operation,
+            Operation::Status | Operation::Autostart { enabled: None }
+        ),
+    )?;
     let mut state = load_state(paths)?;
     let mut journal_exists = fs::symlink_metadata(paths.root.join(JOURNAL)).is_ok();
     if journal_exists
@@ -1430,6 +1565,7 @@ pub fn execute(
         return Err("current与发布记录不一致，拒绝修改".into());
     }
     match operation {
+        Operation::Autostart { enabled } => autostart(paths, &state, services, enabled),
         Operation::Install {
             bundle,
             adopt_legacy,

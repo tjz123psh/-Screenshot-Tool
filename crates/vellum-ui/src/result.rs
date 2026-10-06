@@ -20,8 +20,9 @@ use std::time::Duration;
 use gtk4::gdk::Key;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, Image, Label,
-    Orientation, ScrolledWindow, Separator, Spinner, TextView, WrapMode, gio, glib,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, EventControllerKey, FlowBox,
+    Image, Label, Orientation, PolicyType, ScrolledWindow, SelectionMode, Separator, Spinner,
+    TextView, WrapMode, gio, glib,
 };
 use pango::EllipsizeMode;
 use vellum_core::Rgb8;
@@ -33,8 +34,8 @@ use crate::{theme, ui_job};
 use vellum_text::api::RequestControl;
 
 const APP_ID: &str = "ai.vellum.result";
-const WIDTH: i32 = 560;
-const HEIGHT: i32 = 420;
+const WIDTH: i32 = 480;
+const HEIGHT: i32 = 340;
 /// Niri needs the window mapped before it can be floated.
 const FLOAT_DELAY: Duration = Duration::from_millis(60);
 
@@ -76,7 +77,7 @@ thread_local! {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-const DOCUMENT_POLL: Duration = Duration::from_millis(100);
+const DOCUMENT_POLL: Duration = Duration::from_millis(250);
 
 /// A revision alone is not an identity: two separate captures can both be v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,15 +159,35 @@ fn recognize_snapshot(
     .map_err(|error| format!("识别失败：{error}"))
 }
 
-/// Closing a text result must not discard the last owner of an unexported
-/// picture. The viewer owns the eventual save/copy/discard confirmation. Keep
-/// shutdown separate so a failed handoff cannot cancel work or release state.
+/// Text-only captures end with their result window, not an implicit image viewer.
+/// Once the user enters the image workspace, retain its save/copy/discard guard.
+/// Derived OCR/translation windows share this choice, including later promotion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultRoute {
+    StandaloneText,
+    SharedImage,
+}
+
+fn enter_image_workspace(
+    route: &Cell<ResultRoute>,
+    present: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    present()?;
+    route.set(ResultRoute::SharedImage);
+    Ok(())
+}
+
+/// Keep shutdown separate so a failed shared-image handoff cannot cancel work
+/// or release state. Text output must never mark the image as saved or copied.
 fn finish_close_after_handoff(
+    route: ResultRoute,
     document: Option<&SharedDocument>,
     present: impl FnOnce(SharedDocument) -> Result<(), String>,
     finish: impl FnOnce(),
 ) -> Result<(), String> {
-    if let Some(document) = document {
+    if route == ResultRoute::SharedImage
+        && let Some(document) = document
+    {
         // End this borrow before presenting a viewer, which reads the same doc.
         let pending = document.borrow().needs_output_confirmation();
         if pending {
@@ -242,12 +263,14 @@ struct ResultWindow {
     cancel_button: Button,
     copy_status: Label,
     document: Option<SharedDocument>,
+    route: Rc<Cell<ResultRoute>>,
     versions: RefCell<SessionVersions>,
     version_label: Label,
     view_button: Button,
     edit_button: Button,
     state: RefCell<TextState>,
     updating_text: Cell<bool>,
+    text_sync_pending: Cell<bool>,
     request_job: RefCell<JobState>,
     request_slot: WorkerSlot,
     control: RefCell<Option<RequestControl>>,
@@ -265,27 +288,37 @@ impl ResultWindow {
         status: &str,
         document: Option<SharedDocument>,
         text_version: Option<ImageVersion>,
+        route: Rc<Cell<ResultRoute>>,
     ) -> Rc<Self> {
         theme::install_default();
 
+        let (mw, mh) = gtk4::gdk::Display::default()
+            .and_then(|display| display.monitors().item(0))
+            .and_then(|monitor| monitor.downcast::<gtk4::gdk::Monitor>().ok())
+            .map(|monitor| (monitor.geometry().width(), monitor.geometry().height()))
+            .unwrap_or((1440, 900));
         let window = ApplicationWindow::builder()
             .application(app)
-            .default_width(WIDTH)
-            .default_height(HEIGHT)
+            .default_width(WIDTH.min((mw - 64).max(320)))
+            .default_height(HEIGHT.min((mh - 96).max(240)))
+            // A fixed first-map hint avoids a full-height tiling column.
+            // Resizing is enabled only after the compositor floats this window.
+            .resizable(false)
             .title(mode.title())
             .build();
         window.add_css_class("vellum-window");
+        window.add_css_class("vellum-result");
 
         let root = GtkBox::new(Orientation::Vertical, 0);
 
         // The header is ours rather than a compositor title bar: the target
         // session runs without server-side decorations, so a plain window
         // would show no title at all.
-        let header = GtkBox::new(Orientation::Horizontal, 12);
-        header.set_margin_top(16);
-        header.set_margin_bottom(14);
-        header.set_margin_start(18);
-        header.set_margin_end(14);
+        let header = GtkBox::new(Orientation::Horizontal, 8);
+        header.set_margin_top(10);
+        header.set_margin_bottom(8);
+        header.set_margin_start(12);
+        header.set_margin_end(12);
 
         let badge = Label::new(Some(mode.badge()));
         badge.add_css_class("vellum-status-chip");
@@ -296,8 +329,11 @@ impl ResultWindow {
         titles.set_hexpand(true);
         let title = Label::builder().label(mode.title()).xalign(0.0).build();
         title.add_css_class("vellum-title");
+        title.set_ellipsize(EllipsizeMode::End);
         let subtitle = Label::builder().label(mode.subtitle()).xalign(0.0).build();
         subtitle.add_css_class("vellum-dim");
+        subtitle.set_ellipsize(EllipsizeMode::End);
+        subtitle.set_tooltip_text(Some(mode.subtitle()));
         titles.append(&title);
         titles.append(&subtitle);
         header.append(&titles);
@@ -320,15 +356,15 @@ impl ResultWindow {
         root.append(&divider);
 
         let version_row = GtkBox::new(Orientation::Horizontal, 8);
-        version_row.set_margin_start(18);
-        version_row.set_margin_end(18);
-        version_row.set_margin_top(10);
+        version_row.set_margin_start(12);
+        version_row.set_margin_end(12);
+        version_row.set_margin_top(6);
         let version_label = Label::new(None);
         version_label.set_xalign(0.0);
         version_label.set_hexpand(true);
         version_label.set_ellipsize(EllipsizeMode::End);
         version_label.add_css_class("vellum-dim");
-        let view_button = Button::with_label("查看图片");
+        let view_button = Button::with_label("查看原图");
         let edit_button = Button::with_label("继续编辑");
         view_button.set_tooltip_text(Some("查看同一会话的当前图片，不重新截图"));
         edit_button.set_tooltip_text(Some("修改标注或裁切；提交后可重新识别当前成品"));
@@ -339,10 +375,10 @@ impl ResultWindow {
 
         let shell = GtkBox::new(Orientation::Vertical, 0);
         shell.add_css_class("vellum-text-shell");
-        shell.set_margin_top(14);
-        shell.set_margin_bottom(12);
-        shell.set_margin_start(18);
-        shell.set_margin_end(18);
+        shell.set_margin_top(8);
+        shell.set_margin_bottom(8);
+        shell.set_margin_start(12);
+        shell.set_margin_end(12);
         shell.set_vexpand(true);
 
         let view = TextView::builder()
@@ -355,16 +391,23 @@ impl ResultWindow {
         view.add_css_class("vellum-textview");
         view.buffer().set_text(text);
 
-        let scroller = ScrolledWindow::builder().vexpand(true).child(&view).build();
+        // Long OCR lines wrap inside the viewport rather than growing the window.
+        let scroller = ScrolledWindow::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .hscrollbar_policy(PolicyType::Never)
+            .propagate_natural_width(false)
+            .propagate_natural_height(false)
+            .child(&view)
+            .build();
         shell.append(&scroller);
         root.append(&shell);
 
-        // The footer keeps a fixed slot for transient feedback so the buttons
-        // do not jump sideways when a message appears.
-        let footer = GtkBox::new(Orientation::Horizontal, 12);
-        footer.set_margin_bottom(16);
-        footer.set_margin_start(18);
-        footer.set_margin_end(18);
+        // Feedback has its own row; long errors never compete with the actions.
+        let footer = GtkBox::new(Orientation::Vertical, 6);
+        footer.set_margin_bottom(10);
+        footer.set_margin_start(12);
+        footer.set_margin_end(12);
 
         let status_row = GtkBox::new(Orientation::Horizontal, 8);
         status_row.set_hexpand(true);
@@ -373,6 +416,8 @@ impl ResultWindow {
         let status_label = Label::builder().label(status).xalign(0.0).build();
         status_label.add_css_class("vellum-dim");
         status_label.set_ellipsize(EllipsizeMode::End);
+        status_label.set_hexpand(true);
+        status_label.set_tooltip_text(Some(status));
         status_row.append(&spinner);
         status_row.append(&status_label);
         footer.append(&status_row);
@@ -380,24 +425,32 @@ impl ResultWindow {
         let copy_status = Label::new(None);
         copy_status.set_xalign(0.0);
         copy_status.set_wrap(true);
-        copy_status.set_margin_start(18);
-        copy_status.set_margin_end(18);
+        copy_status.set_wrap_mode(pango::WrapMode::WordChar);
+        copy_status.set_margin_start(12);
+        copy_status.set_margin_end(12);
         copy_status.set_visible(false);
         root.append(&copy_status);
 
-        let buttons = GtkBox::new(Orientation::Horizontal, 8);
-        buttons.set_halign(Align::End);
+        // GTK wraps actions when narrowed; no resize timer or pixel rendering.
+        let buttons = FlowBox::builder()
+            .selection_mode(SelectionMode::None)
+            .min_children_per_line(1)
+            .max_children_per_line(4)
+            .column_spacing(4)
+            .row_spacing(4)
+            .halign(Align::End)
+            .build();
         let copy_button = action_button("复制", "edit-copy-symbolic");
         let translate_button = action_button("翻译", "preferences-desktop-locale-symbolic");
-        translate_button.add_css_class("suggested-action");
+        copy_button.add_css_class("suggested-action");
         let retry_button = Button::with_label("重试识别");
         let cancel_button = Button::with_label("取消");
         cancel_button
             .set_tooltip_text(Some("停止接收本次结果；正在运行的请求可能需要等待超时结束"));
-        buttons.append(&copy_button);
-        buttons.append(&retry_button);
-        buttons.append(&translate_button);
-        buttons.append(&cancel_button);
+        buttons.insert(&copy_button, -1);
+        buttons.insert(&retry_button, -1);
+        buttons.insert(&translate_button, -1);
+        buttons.insert(&cancel_button, -1);
         footer.append(&buttons);
         root.append(&footer);
 
@@ -420,11 +473,13 @@ impl ResultWindow {
                 text: text_version,
             }),
             document,
+            route,
             version_label,
             view_button,
             edit_button,
             state: RefCell::new(TextState::new(mode, text)),
             updating_text: Cell::new(false),
+            text_sync_pending: Cell::new(false),
             request_job: RefCell::new(JobState::default()),
             request_slot: WorkerSlot::default(),
             control: RefCell::new(None),
@@ -471,7 +526,9 @@ impl ResultWindow {
         self.view_button.connect_clicked(move |_| {
             if let Some(this) = this.upgrade()
                 && let Some(document) = &this.document
-                && let Err(error) = crate::preview::open_document(&this.app, document.clone())
+                && let Err(error) = enter_image_workspace(&this.route, || {
+                    crate::preview::open_document(&this.app, document.clone())
+                })
             {
                 this.flash(&format!("无法打开查看器：{error}"), true);
             }
@@ -480,7 +537,9 @@ impl ResultWindow {
         self.edit_button.connect_clicked(move |_| {
             if let Some(this) = this.upgrade()
                 && let Some(document) = &this.document
-                && let Err(error) = crate::editor::open(&this.app, document.clone())
+                && let Err(error) = enter_image_workspace(&this.route, || {
+                    crate::editor::open(&this.app, document.clone())
+                })
             {
                 this.flash(&format!("无法打开编辑窗口：{error}"), true);
             }
@@ -493,11 +552,7 @@ impl ResultWindow {
             if this.closed.get() || this.updating_text.get() {
                 return;
             }
-            {
-                let mut state = this.state.borrow_mut();
-                state.body = this.current_text();
-                state.edited = true;
-            }
+            this.state.borrow_mut().edited = true;
             this.observe_document();
             {
                 let mut versions = this.versions.borrow_mut();
@@ -508,7 +563,19 @@ impl ResultWindow {
             if this.request_job.borrow().is_busy() {
                 this.cancel_request();
             }
-            this.sync_actions();
+            // Coalesce a burst of buffer changes (paste/replace/typing) into one
+            // full text copy and action refresh. Cancellation above stays immediate.
+            if !this.text_sync_pending.replace(true) {
+                let weak = Rc::downgrade(&this);
+                glib::idle_add_local_once(move || {
+                    if let Some(window) = weak.upgrade()
+                        && !window.closed.get()
+                    {
+                        window.sync_text_state();
+                        window.sync_actions();
+                    }
+                });
+            }
         });
 
         let keys = EventControllerKey::new();
@@ -529,6 +596,7 @@ impl ResultWindow {
         self.window.connect_close_request(move |_| {
             if let Some(this) = this.upgrade() {
                 let result = finish_close_after_handoff(
+                    this.route.get(),
                     this.document.as_ref(),
                     |document| crate::preview::open_document(&this.app, document),
                     || {
@@ -555,17 +623,19 @@ impl ResultWindow {
         // Watch only the cheap identity/revision, never render/copy pixels on a
         // timer. The weak owner disappears on close, and request callbacks also
         // check the live revision so safety never relies on this polling delay.
-        let weak = Rc::downgrade(self);
-        glib::timeout_add_local(DOCUMENT_POLL, move || {
-            let Some(window) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            if window.closed.get() {
-                return glib::ControlFlow::Break;
-            }
-            window.observe_document();
-            glib::ControlFlow::Continue
-        });
+        if self.document.is_some() {
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local(DOCUMENT_POLL, move || {
+                let Some(window) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                if window.closed.get() {
+                    return glib::ControlFlow::Break;
+                }
+                window.observe_document();
+                glib::ControlFlow::Continue
+            });
+        }
 
         // Floating rather than tiled: a text result is something you read
         // beside the window you captured, not a new column in the scroll.
@@ -573,20 +643,21 @@ impl ResultWindow {
         self.window.connect_map(move |_| {
             let weak = weak.clone();
             glib::timeout_add_local_once(FLOAT_DELAY, move || {
-                if weak.upgrade().is_none_or(|window| window.closed.get()) {
+                let Some(window) = weak.upgrade().filter(|window| !window.closed.get()) else {
                     return;
-                }
+                };
                 // Looked up by pid rather than acting on the focused window:
                 // the user may have moved on during the delay above. Retried on
                 // the main loop because the compositor's client list can lag the
                 // map, and a miss must not fall back to the user's window.
-                crate::own_window::float_own_window_soon();
+                crate::own_window::float_and_resize(&window.window);
             });
         });
     }
 
     fn present(self: &Rc<Self>) {
         self.window.present();
+        theme::snapshot_for_review(&self.window);
     }
 
     fn current_document_version(&self) -> Option<ImageVersion> {
@@ -648,7 +719,8 @@ impl ResultWindow {
         self.copy_button.set_sensitive(
             !stale && !state.body.trim().is_empty() && !self.copy_job.borrow().is_busy(),
         );
-        self.translate_button.set_visible(
+        set_action_visible(
+            &self.translate_button,
             state.mode == Mode::Ocr
                 || state.can_translate()
                 || state.retry == Some(Stage::Translate)
@@ -664,7 +736,7 @@ impl ResultWindow {
                 "翻译"
             },
         );
-        self.retry_button.set_visible(self.document.is_some());
+        set_action_visible(&self.retry_button, self.document.is_some());
         self.retry_button.set_label(if stale {
             "识别新版"
         } else if state.retry == Some(Stage::Recognize) {
@@ -673,8 +745,7 @@ impl ResultWindow {
             "重新识别"
         });
         self.retry_button.set_sensitive(!busy);
-        self.cancel_button
-            .set_visible(self.request_job.borrow().is_busy());
+        set_action_visible(&self.cancel_button, self.request_job.borrow().is_busy());
     }
 
     fn flash(&self, message: &str, error: bool) {
@@ -691,6 +762,12 @@ impl ResultWindow {
         self.sync_actions();
     }
 
+    fn sync_text_state(&self) {
+        if self.text_sync_pending.replace(false) {
+            self.state.borrow_mut().body = self.current_text();
+        }
+    }
+
     fn current_text(&self) -> String {
         let buffer = self.text.buffer();
         let (start, end) = buffer.bounds();
@@ -698,6 +775,7 @@ impl ResultWindow {
     }
 
     fn show_body(&self) {
+        self.text_sync_pending.set(false);
         let text = self.state.borrow().body.clone();
         self.updating_text.set(true);
         self.text.buffer().set_text(&text);
@@ -819,6 +897,7 @@ impl ResultWindow {
     }
 
     fn recognize(self: &Rc<Self>) {
+        self.sync_text_state();
         self.observe_document();
         let Some(document) = &self.document else {
             return;
@@ -888,6 +967,7 @@ impl ResultWindow {
                                 &engine,
                                 window.document.clone(),
                                 version,
+                                window.route.clone(),
                             );
                             fresh.present();
                             window.flash("识别完成；编辑内容已保留，新识别结果已另开窗口", false);
@@ -911,6 +991,7 @@ impl ResultWindow {
     /// With a supplied control this is the translation stage of the same OCR
     /// request; a user retry gets fresh settings and a fresh total budget.
     fn translate(self: &Rc<Self>, continuation: Option<(Config, RequestControl)>) {
+        self.sync_text_state();
         self.observe_document();
         if self.versions.borrow().is_stale() {
             self.flash("文字来自旧版图片；请识别当前成品后再翻译", true);
@@ -980,6 +1061,7 @@ impl ResultWindow {
                                 &transport,
                                 window.document.clone(),
                                 version,
+                                window.route.clone(),
                             );
                             fresh.present();
                         }
@@ -1001,6 +1083,15 @@ fn action_button(label: &str, icon: &str) -> Button {
         .child(&content)
         .tooltip_text(label)
         .build()
+}
+
+// FlowBox wraps each action in a child; hide that child too so an unavailable
+// action never leaves an empty slot or increases the minimum window width.
+fn set_action_visible(button: &Button, visible: bool) {
+    button.set_visible(visible);
+    if let Some(child) = button.parent().and_downcast::<gtk4::FlowBoxChild>() {
+        child.set_visible(visible);
+    }
 }
 
 fn set_action_label(button: &Button, text: &str) {
@@ -1038,11 +1129,12 @@ pub fn open_document(app: &Application, document: SharedDocument, translate: boo
         })
     });
     if let Some(window) = existing {
+        window.route.set(ResultRoute::SharedImage);
         window.observe_document();
         window.present();
         return;
     }
-    let window = document_window(app, document, translate);
+    let window = document_window(app, document, translate, ResultRoute::SharedImage);
     window.present();
     window.recognize();
 }
@@ -1051,6 +1143,7 @@ fn document_window(
     app: &Application,
     document: SharedDocument,
     translate: bool,
+    route: ResultRoute,
 ) -> Rc<ResultWindow> {
     let mode = if translate {
         Mode::Translate
@@ -1062,7 +1155,15 @@ fn document_window(
     } else {
         "识别中…"
     };
-    ResultWindow::new(app, mode, "", placeholder, Some(document), None)
+    ResultWindow::new(
+        app,
+        mode,
+        "",
+        placeholder,
+        Some(document),
+        None,
+        Rc::new(Cell::new(route)),
+    )
 }
 
 /// Initial standalone entrypoint. Only this first window acknowledges the
@@ -1074,7 +1175,7 @@ pub fn run_document(document: SharedDocument, translate: bool) -> i32 {
         let Some(document) = payload.borrow_mut().take() else {
             return;
         };
-        let window = document_window(app, document, translate);
+        let window = document_window(app, document, translate, ResultRoute::StandaloneText);
         crate::handoff::connect_ready(&window.window);
         window.present();
         window.recognize();
@@ -1090,7 +1191,15 @@ pub fn run_text_action(image: Rgb8, translate: bool) -> i32 {
         Err(error) => {
             let app = application();
             app.connect_activate(move |app| {
-                let window = ResultWindow::new(app, Mode::Ocr, "", &error, None, None);
+                let window = ResultWindow::new(
+                    app,
+                    Mode::Ocr,
+                    "",
+                    &error,
+                    None,
+                    None,
+                    Rc::new(Cell::new(ResultRoute::StandaloneText)),
+                );
                 window.present();
                 // No READY: the sender must retain its recoverable composite.
             });
@@ -1145,6 +1254,10 @@ fn run(app: &Application) -> i32 {
 #[cfg(test)]
 #[path = "result_session_tests.rs"]
 mod session_tests;
+
+#[cfg(test)]
+#[path = "result_ocr_live_tests.rs"]
+mod ocr_live_tests;
 
 #[cfg(test)]
 mod tests {

@@ -55,7 +55,7 @@ fn old_worker_cannot_publish_after_commit_even_before_observer_cancels_job() {
     versions.observe(version(30, 2));
     assert!(
         job.is_current(ticket),
-        "simulate result arriving before 100ms observer"
+        "simulate result arriving before the revision observer"
     );
     assert!(!(job.is_current(ticket) && versions.accepts(captured)));
     job.cancel();
@@ -388,6 +388,7 @@ fn pending_image_handoff_failure_keeps_text_image_and_running_request() {
     let ticket = job.borrow_mut().begin().unwrap();
     let closed = Cell::new(false);
     let result = finish_close_after_handoff(
+        ResultRoute::SharedImage,
         Some(&document),
         |_| Err("synthetic viewer allocation failure".into()),
         || {
@@ -417,6 +418,7 @@ fn pending_image_transfers_ownership_before_finishing_result_close() {
     let viewer_owner = RefCell::new(None);
     let events = RefCell::new(Vec::new());
     finish_close_after_handoff(
+        ResultRoute::SharedImage,
         Some(&document),
         |handoff| {
             // Real preview construction may borrow the shared doc mutably: the
@@ -459,6 +461,7 @@ fn current_saved_or_copied_image_closes_without_reopening_viewer() {
         }
         let closed = Cell::new(false);
         finish_close_after_handoff(
+            ResultRoute::SharedImage,
             Some(&document),
             |_| panic!("current exported image needs no extra viewer"),
             || closed.set(true),
@@ -480,6 +483,7 @@ fn previous_revision_output_does_not_skip_pending_image_close_protection() {
     let presented = Cell::new(false);
     let closed = Cell::new(false);
     finish_close_after_handoff(
+        ResultRoute::SharedImage,
         Some(&document),
         |_| {
             presented.set(true);
@@ -494,9 +498,89 @@ fn previous_revision_output_does_not_skip_pending_image_close_protection() {
 }
 
 #[test]
+fn standalone_ocr_with_unexported_image_closes_without_opening_workspace() {
+    let document = protected_document();
+    let before = recognition_snapshot(&document).unwrap();
+    let closed = Cell::new(false);
+    let job = RefCell::new(JobState::default());
+    let ticket = job.borrow_mut().begin().unwrap();
+    let control = RequestControl::new(Duration::from_secs(5));
+    finish_close_after_handoff(
+        ResultRoute::StandaloneText,
+        Some(&document),
+        |_| panic!("closing standalone OCR must not open an image workspace"),
+        || {
+            closed.set(true);
+            control.cancel();
+            job.borrow_mut().close();
+        },
+    )
+    .unwrap();
+    assert!(closed.get());
+    assert!(control.is_cancelled());
+    assert!(!job.borrow().is_current(ticket));
+    assert!(document.borrow().needs_output_confirmation());
+    assert_eq!(document.borrow().saved_revision(), None);
+    assert_eq!(document.borrow().copied_revision(), None);
+    assert_eq!(
+        *recognition_snapshot(&document).unwrap().image,
+        *before.image
+    );
+}
+
+#[test]
+fn explicit_image_workspace_promotes_all_derived_results_only_after_success() {
+    let route = Rc::new(Cell::new(ResultRoute::StandaloneText));
+    let translation_route = route.clone();
+    let retry_route = route.clone();
+    assert!(enter_image_workspace(&route, || Err("synthetic open failure".into())).is_err());
+    assert_eq!(route.get(), ResultRoute::StandaloneText);
+    enter_image_workspace(&route, || {
+        assert_eq!(route.get(), ResultRoute::StandaloneText);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(translation_route.get(), ResultRoute::SharedImage);
+    assert_eq!(retry_route.get(), ResultRoute::SharedImage);
+    let document = protected_document();
+    let closed = Cell::new(false);
+    assert!(
+        finish_close_after_handoff(
+            translation_route.get(),
+            Some(&document),
+            |_| Err("synthetic handoff failure".into()),
+            || closed.set(true),
+        )
+        .is_err()
+    );
+    assert!(
+        !closed.get(),
+        "explicit image work keeps the shared-image guard"
+    );
+}
+
+#[test]
+fn derived_standalone_results_do_not_change_route_or_image_output_markers() {
+    let route = Rc::new(Cell::new(ResultRoute::StandaloneText));
+    let document = protected_document();
+    for derived in [route.clone(), route.clone()] {
+        finish_close_after_handoff(
+            derived.get(),
+            Some(&document),
+            |_| panic!("translation/re-recognition must inherit the text-only route"),
+            || {},
+        )
+        .unwrap();
+    }
+    assert_eq!(route.get(), ResultRoute::StandaloneText);
+    assert!(document.borrow().needs_output_confirmation());
+}
+
+#[test]
 fn independent_text_result_can_close_without_image_handoff() {
     let closed = Cell::new(false);
     finish_close_after_handoff(
+        ResultRoute::StandaloneText,
         None,
         |_| panic!("no image to transfer"),
         || closed.set(true),

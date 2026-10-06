@@ -184,11 +184,22 @@ scrollbar slider:hover { background: rgba(202,188,159,0.46); }
 .vellum-general-label { min-width: 68px; color: #c2bcae; }
 .vellum-general-value { color: #ded8cb; }
 .vellum-shortcut-key { min-width: 106px; padding: 4px 10px; border: 1px solid rgba(221,210,182,0.13); border-top-color: rgba(0,0,0,0.36); border-radius: 4px; background: rgba(15,15,14,0.40); box-shadow: inset 0 1px 2px rgba(0,0,0,0.30); color: #ddd2b9; font-size: 12px; }
-.vellum-preview-header { padding: 11px 16px; border-bottom: 1px solid rgba(230,220,190,0.07); }
-.vellum-preview-toolbar { padding: 8px 12px; background: #242422; border-bottom: 1px solid rgba(230,220,190,0.06); }
+.vellum-preview-header { padding: 9px 14px; background: #252523; border-bottom: 1px solid rgba(230,220,190,0.09); }
+.vellum-preview-toolbar { padding: 6px 10px; background: #222221; border-bottom: 1px solid rgba(230,220,190,0.07); }
 .vellum-preview-toolbar button { padding: 4px 8px; min-height: 24px; }
 .vellum-preview-stage { background: @vellum_dark; }.vellum-preview-minimap { background: #242422; }
-.vellum-preview-status { padding: 8px 14px; background: #242422; color: #aaa495; font-size: 11px; }
+.vellum-preview-status { padding: 5px 10px; background: #242422; color: #b7b2a8; font-size: 11px; border-top: 1px solid rgba(230,220,190,0.07); }
+.vellum-preview-zoom button { padding: 2px 6px; min-height: 20px; }
+.vellum-preview-exports { color: @vellum_muted; font-size: 11px; }
+/* Quiet result surfaces: put the image/text before the chrome. */
+.vellum-preview button, .vellum-result button {
+  background-image: none; box-shadow: none; border-color: rgba(220,211,187,0.12);
+}
+.vellum-preview button.suggested-action, .vellum-result button.suggested-action {
+  background-color: #594f3d; color: #eee6d5; border-color: rgba(236,219,181,0.35);
+}
+.vellum-result .vellum-text-shell { background: #232322; border-color: rgba(228,218,190,0.14); }
+.vellum-result .vellum-textview, .vellum-result .vellum-textview text { padding: 9px; font-size: 14px; }
 
 /* Focus is deliberately LAST and independent of decorative shadows. */
 .vellum-window button:focus-visible, .vellum-card button:focus-visible,

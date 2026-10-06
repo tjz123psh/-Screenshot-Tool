@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use gtk4::glib;
+use gtk4::{ApplicationWindow, glib, prelude::*};
 
 /// Spacing between attempts, after the caller's own initial delay.
 const RETRY: Duration = Duration::from_millis(120);
@@ -21,15 +21,30 @@ const ATTEMPTS: u32 = 5;
 ///
 /// Returns immediately; the attempts happen on the main loop.
 pub fn float_own_window_soon() {
-    attempt(ATTEMPTS);
+    attempt(ATTEMPTS, None);
 }
 
-fn attempt(remaining: u32) {
+/// Keep the fixed-size first-map hint so tiling desktops do not move existing
+/// windows. Allow manual resizing only after our own window is floated.
+pub fn float_and_resize(window: &ApplicationWindow) {
+    attempt(ATTEMPTS, Some(window.downgrade()));
+}
+
+fn attempt(remaining: u32, resize: Option<glib::WeakRef<ApplicationWindow>>) {
+    if resize
+        .as_ref()
+        .is_some_and(|window| window.upgrade().is_none())
+    {
+        return;
+    }
     if vellum_core::compositor::float_own_window(std::process::id()) {
+        if let Some(window) = resize.and_then(|window| window.upgrade()) {
+            window.set_resizable(true);
+        }
         return;
     }
     if remaining > 1 {
-        glib::timeout_add_local_once(RETRY, move || attempt(remaining - 1));
+        glib::timeout_add_local_once(RETRY, move || attempt(remaining - 1, resize));
     }
 }
 

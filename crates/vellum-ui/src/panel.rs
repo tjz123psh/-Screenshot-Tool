@@ -40,6 +40,9 @@ use crate::controls;
 use crate::model_picker::ModelPicker;
 use crate::theme;
 
+#[path = "autostart.rs"]
+mod autostart;
+
 const APP_ID: &str = "ai.vellum.panel";
 
 fn about_details(build: &vellum_core::build_info::BuildInfo, installation: &str) -> String {
@@ -89,6 +92,7 @@ enum Update {
     /// 「获取模型」 finished: the same request, but the list is also poured into
     /// the two model pickers.
     Models(Result<Vec<String>, String>),
+    Autostart(Result<autostart::Status, String>, bool),
 }
 
 /// Hands `update to the main loop for the panel with `id.
@@ -387,6 +391,8 @@ struct FormWidgets {
     output_dir: Entry,
     filename_template: Entry,
     always_preview: Switch,
+    autostart: Switch,
+    autostart_status: Label,
 }
 
 impl FormWidgets {
@@ -514,6 +520,11 @@ impl FormWidgets {
             output_dir,
             filename_template,
             always_preview,
+            autostart: Switch::builder()
+                .valign(Align::Center)
+                .sensitive(false)
+                .build(),
+            autostart_status: Label::new(Some("正在检查开机自启…")),
         };
 
         // The engine choice decides which half of the page matters; the wiring
@@ -671,6 +682,8 @@ struct Panel {
     closed: Cell<bool>,
     /// Guards against a second connection test while one is in flight.
     probing: Cell<bool>,
+    autostart_busy: Cell<bool>,
+    autostart_dirty: Cell<bool>,
 }
 
 impl Panel {
@@ -904,6 +917,8 @@ impl Panel {
             form,
             closed: Cell::new(false),
             probing: Cell::new(false),
+            autostart_busy: Cell::new(false),
+            autostart_dirty: Cell::new(false),
         });
 
         let weak = Rc::downgrade(&panel);
@@ -956,6 +971,27 @@ impl Panel {
 
         PANELS.with(|slot| slot.borrow_mut().push((panel.id, panel.clone())));
         panel.connect(&close);
+        let weak = Rc::downgrade(&panel);
+        panel.form.autostart.connect_active_notify(move |_| {
+            if let Some(panel) = weak.upgrade()
+                && !panel.autostart_busy.get()
+            {
+                panel.autostart_dirty.set(true);
+                panel
+                    .form
+                    .autostart_status
+                    .set_label("自启选择未保存；点击「保存更改」后生效");
+            }
+        });
+        if panel.demo {
+            panel.form.autostart.set_sensitive(true);
+            panel
+                .form
+                .autostart_status
+                .set_label("演示模式 · 不读取或修改开机设置");
+        } else {
+            panel.update_autostart(None);
+        }
         panel
     }
 
@@ -1180,7 +1216,7 @@ impl Panel {
             self.flash("演示模式 · 不启动截图，不读取剪贴板", Flash::Info);
             return;
         }
-        if self.form.values() != *self.saved_values.borrow() {
+        if self.form.values() != *self.saved_values.borrow() || self.autostart_dirty.get() {
             let dialog = gtk4::AlertDialog::builder()
                 .message("还有未保存的设置")
                 .detail("开始截图将关闭工作台。返回保存，或放弃本次修改并使用已保存的设置。")
@@ -1339,6 +1375,33 @@ impl Panel {
         match update {
             Update::Probe(result) => self.show_probe(&result),
             Update::Models(result) => self.show_models(&result),
+            Update::Autostart(result, saving) => {
+                match result {
+                    Ok(status) => {
+                        self.form.autostart.set_active(status.enabled);
+                        self.form.autostart.set_sensitive(true);
+                        self.form.autostart_status.set_label(&status.message);
+                        self.autostart_dirty.set(false);
+                        if saving {
+                            self.flash("已保存 · 自启设置在下次登录时生效", Flash::Success);
+                        }
+                    }
+                    Err(error) => {
+                        self.form.autostart_status.set_label(&error);
+                        // A failed write stays dirty so Save retries; never claim
+                        // all settings were saved or silently undo the user's choice.
+                        self.form.autostart.set_sensitive(saving);
+                        if saving {
+                            self.flash(
+                                "其他设置已保存；自启未全部完成，请重新保存重试",
+                                Flash::Error,
+                            );
+                        }
+                    }
+                }
+                self.autostart_busy.set(false);
+                self.save_button.set_sensitive(true);
+            }
         }
     }
 
@@ -1373,10 +1436,35 @@ impl Panel {
             .set_label(&key_hint(source, loopback, &api.api_key_env));
     }
 
+    fn update_autostart(&self, enabled: Option<bool>) {
+        if self.autostart_busy.replace(true) {
+            return;
+        }
+        self.form.autostart.set_sensitive(false);
+        self.save_button.set_sensitive(false);
+        self.form.autostart_status.set_label(if enabled.is_some() {
+            "正在保存自启设置…"
+        } else {
+            "正在检查开机自启…"
+        });
+        let id = self.id;
+        std::thread::spawn(move || {
+            post(
+                id,
+                Update::Autostart(autostart::request(enabled), enabled.is_some()),
+            );
+        });
+    }
+
     fn save(self: &Rc<Self>) {
+        if self.autostart_busy.get() {
+            self.flash("正在确认开机自启，请稍候再保存", Flash::Info);
+            return;
+        }
         let values = self.form.values();
         if self.demo {
             *self.saved_values.borrow_mut() = values;
+            self.autostart_dirty.set(false);
             self.flash("演示模式 · 未写入任何设置", Flash::Success);
             return;
         }
@@ -1403,7 +1491,11 @@ impl Panel {
                 *self.saved_values.borrow_mut() = FormValues::from_config(&config, &prefs);
                 *self.base.borrow_mut() = config;
                 self.refresh_credentials();
-                self.flash("已保存 · 下一次截图生效", Flash::Success);
+                if self.autostart_dirty.get() {
+                    self.update_autostart(Some(self.form.autostart.is_active()));
+                } else {
+                    self.flash("已保存 · 下一次截图生效", Flash::Success);
+                }
             }
             Err(err) => self.flash(&format!("保存未全部完成：{err}"), Flash::Error),
         }
@@ -1668,6 +1760,15 @@ fn home_page(form: &FormWidgets) -> (ScrolledWindow, Vec<(Button, &'static str)>
         &form.always_preview,
     ));
     content.append(&outputs);
+    content.append(&controls::action_row(
+        "开机后自启",
+        Some("登录桌面后启动服务、托盘与快捷键；关闭不退出当前程序"),
+        &form.autostart,
+    ));
+    form.autostart_status.add_css_class("vellum-caption");
+    form.autostart_status.set_xalign(0.0);
+    form.autostart_status.set_wrap(true);
+    content.append(&form.autostart_status);
     let divider = gtk4::Separator::new(Orientation::Horizontal);
     divider.add_css_class("vellum-divider");
     divider.set_margin_top(5);

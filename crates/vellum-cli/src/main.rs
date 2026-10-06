@@ -180,6 +180,9 @@ enum ShortcutsCommand {
     /// 运行持久快捷键服务
     #[command(hide = true)]
     Run,
+    /// 按用户开机自启偏好启动快捷键服务
+    #[command(hide = true)]
+    Autostart,
     /// 只读查看旧桌面配置中的绑定
     LegacyList,
     /// 传统兼容方式：显式写入桌面快捷键配置，不是默认方案
@@ -543,6 +546,12 @@ fn manage_shortcuts(command: Option<ShortcutsCommand>) -> anyhow::Result<u8> {
         ShortcutsCommand::Install => return Ok(report_shortcuts(shortcuts::install(None))),
         ShortcutsCommand::Remove => return Ok(report_shortcuts(shortcuts::remove(None))),
         ShortcutsCommand::Run => return handover(ui::UI_BINARY, &["shortcuts-service".into()]),
+        ShortcutsCommand::Autostart => {
+            if !vellum_core::autostart::login_enabled()? {
+                return Ok(0);
+            }
+            return handover(ui::UI_BINARY, &["shortcuts-service".into()]);
+        }
         ShortcutsCommand::List | ShortcutsCommand::Status => "status",
         ShortcutsCommand::Enable => "enable",
         ShortcutsCommand::Disable => "disable",

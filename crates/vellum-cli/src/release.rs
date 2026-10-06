@@ -1,4 +1,4 @@
-//! User-scoped, versioned release management. No command edits user preferences.
+//! User-scoped release management. Only explicit autostart changes login preferences.
 #[path = "release_manifest.rs"]
 pub mod manifest;
 #[path = "release_paths.rs"]
@@ -18,6 +18,7 @@ use std::path::PathBuf;
 pub enum Operation {
     Install { bundle: PathBuf, adopt_legacy: bool },
     Status,
+    Autostart { enabled: Option<bool> },
     Rollback,
     Repair,
     Uninstall { confirmed: bool },
@@ -183,6 +184,13 @@ pub enum ReleaseCommand {
         paths: PathOptions,
     },
     Status(PathOptions),
+    /// Query login startup, or explicitly change it without stopping running work.
+    Autostart {
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: Option<bool>,
+        #[command(flatten)]
+        paths: PathOptions,
+    },
     Rollback(PathOptions),
     Repair(PathOptions),
     Uninstall {
@@ -265,6 +273,9 @@ pub fn run_with(
             no_activate,
         ),
         ReleaseCommand::Status(paths) => (Operation::Status, paths, false),
+        ReleaseCommand::Autostart { enabled, paths } => {
+            (Operation::Autostart { enabled }, paths, false)
+        }
         ReleaseCommand::Rollback(paths) => (Operation::Rollback, paths, false),
         ReleaseCommand::Repair(paths) => (Operation::Repair, paths, false),
         ReleaseCommand::Uninstall { yes, paths } => {

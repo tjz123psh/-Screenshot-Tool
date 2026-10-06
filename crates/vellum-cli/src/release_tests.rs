@@ -347,6 +347,18 @@ struct FakeServices {
     applied: Vec<ServiceSnapshot>,
 }
 impl Services for FakeServices {
+    fn set_enabled(&mut self, _: &Paths, _: &Path, enabled: &[String]) -> Result<(), String> {
+        if self.fail_activation {
+            return Err("synthetic startup failure".into());
+        }
+        let active = self
+            .policy
+            .as_ref()
+            .map(|p| p.1.clone())
+            .unwrap_or_else(|| vec!["vellum.service".into()]);
+        self.policy = Some((enabled.to_vec(), active));
+        Ok(())
+    }
     fn snapshot(&mut self, _: &Paths) -> Result<ServiceSnapshot, String> {
         Ok(ServiceSnapshot {
             reachable: !self.unreachable,
@@ -1066,6 +1078,185 @@ fn busy_gui_defers_upgrade_without_stopping_running_services() {
     assert_eq!(current_id(&sandbox).as_deref(), Some("release-b"));
     sandbox.assert_user_data_untouched();
 }
+#[test]
+fn startup_query_is_read_only_and_toggle_preserves_active_work() {
+    let sandbox = Sandbox::new();
+    let a = make_bundle(&sandbox, "release-a");
+    let mut services = FakeServices::default();
+    install(&sandbox, &a, &mut services);
+    services.busy = true; // An open settings window must not block startup-only edits.
+    let before = (services.activations, services.stops, services.restorations);
+    let query = execute(
+        Operation::Autostart { enabled: None },
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    assert_eq!(query.state, "autostart-mixed");
+    assert!(!sandbox.config().join("vellum/autostart.json").exists());
+    for (enabled, status) in [(false, "autostart-disabled"), (true, "autostart-enabled")] {
+        let report = execute(
+            Operation::Autostart {
+                enabled: Some(enabled),
+            },
+            &sandbox.paths(),
+            &mut services,
+            &mut TraceHooks::default(),
+        )
+        .unwrap();
+        assert_eq!(report.state, status);
+        assert_eq!(
+            vellum_core::autostart::load_at(&sandbox.config()).unwrap(),
+            Some(enabled)
+        );
+        assert_eq!(services.policy.as_ref().unwrap().1, vec!["vellum.service"]);
+    }
+    assert_eq!(
+        (services.activations, services.stops, services.restorations),
+        before
+    );
+    sandbox.assert_user_data_untouched();
+}
+
+#[test]
+fn startup_opt_out_survives_fresh_install_upgrade_and_deferred_repair() {
+    let sandbox = Sandbox::new();
+    vellum_core::autostart::save_at(&sandbox.config(), false).unwrap();
+    let a = make_bundle(&sandbox, "release-a");
+    let b = make_bundle(&sandbox, "release-b");
+    let mut services = FakeServices::default();
+    install(&sandbox, &a, &mut services);
+    let applied = services.applied.last().unwrap();
+    assert!(applied.enabled.is_empty() && applied.active.is_empty());
+    assert!(
+        !sandbox
+            .config()
+            .join("autostart/ai.vellum-shortcuts.desktop")
+            .exists()
+    );
+    services.busy = true;
+    install(&sandbox, &b, &mut services);
+    services.busy = false;
+    services.policy = Some((vec!["vellum-tray.service".into()], Vec::new()));
+    execute(
+        Operation::Repair,
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    let applied = services.applied.last().unwrap();
+    assert!(applied.enabled.is_empty() && applied.active.is_empty());
+    assert_eq!(
+        vellum_core::autostart::load_at(&sandbox.config()).unwrap(),
+        Some(false)
+    );
+    execute(
+        Operation::Rollback,
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    assert!(
+        !sandbox
+            .config()
+            .join("autostart/ai.vellum-shortcuts.desktop")
+            .exists()
+    );
+    assert!(services.applied.last().unwrap().enabled.is_empty());
+    sandbox.assert_user_data_untouched();
+}
+
+#[test]
+fn upgrade_does_not_restore_a_deleted_desktop_startup_entry() {
+    let sandbox = Sandbox::new();
+    let a = make_bundle(&sandbox, "release-a");
+    let b = make_bundle(&sandbox, "release-b");
+    let mut services = FakeServices::default();
+    install(&sandbox, &a, &mut services);
+    let desktop = sandbox
+        .config()
+        .join("autostart/ai.vellum-shortcuts.desktop");
+    assert!(desktop.is_symlink());
+    fs::remove_file(&desktop).unwrap(); // Only this fixture's owned login entry.
+    services.policy = Some((Vec::new(), Vec::new()));
+    install(&sandbox, &b, &mut services);
+    assert!(!desktop.exists());
+    assert!(services.applied.last().unwrap().enabled.is_empty());
+    let query = execute(
+        Operation::Autostart { enabled: None },
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    assert_eq!(query.state, "autostart-disabled");
+    let report = execute(
+        Operation::Autostart {
+            enabled: Some(true),
+        },
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    assert_eq!(report.state, "autostart-enabled");
+    assert!(desktop.is_symlink());
+    sandbox.assert_user_data_untouched();
+}
+
+#[test]
+fn startup_failures_do_not_claim_success_or_forget_opt_out() {
+    let sandbox = Sandbox::new();
+    let a = make_bundle(&sandbox, "release-a");
+    let mut services = FakeServices::default();
+    install(&sandbox, &a, &mut services);
+    services.unreachable = true;
+    assert!(
+        execute(
+            Operation::Autostart {
+                enabled: Some(false)
+            },
+            &sandbox.paths(),
+            &mut services,
+            &mut TraceHooks::default()
+        )
+        .is_err()
+    );
+    assert!(!sandbox.config().join("vellum/autostart.json").exists());
+    services.unreachable = false;
+    services.fail_activation = true;
+    assert!(
+        execute(
+            Operation::Autostart {
+                enabled: Some(false)
+            },
+            &sandbox.paths(),
+            &mut services,
+            &mut TraceHooks::default()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        vellum_core::autostart::load_at(&sandbox.config()).unwrap(),
+        Some(false)
+    );
+    services.fail_activation = false;
+    let report = execute(
+        Operation::Autostart {
+            enabled: Some(false),
+        },
+        &sandbox.paths(),
+        &mut services,
+        &mut TraceHooks::default(),
+    )
+    .unwrap();
+    assert_eq!(report.state, "autostart-disabled");
+    sandbox.assert_user_data_untouched();
+}
+
 #[test]
 fn deferred_repair_preserves_new_service_policy_instead_of_the_old_snapshot() {
     let sandbox = Sandbox::new();

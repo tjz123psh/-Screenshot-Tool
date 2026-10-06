@@ -2,6 +2,13 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.3]
+
+- Keep standalone OCR/translation results separate from image previews; closing a text result no longer automatically opens a second workbench. Explicit image viewing/editing retains shared-session protection.
+- Make OCR results compact and screen-bounded, with clearer text actions and status. Consolidate long-image preview tools, move zoom controls below the image, and adapt labels/minimap to window width.
+- Add a user-controlled login autostart switch for the capture, tray and shortcut services; keep the preference across upgrades without changing compositor key bindings.
+- Avoid the intermediate RGB allocation for each preview tile and reuse untouched screenshot pixels for OCR snapshots. Skip unchanged preview status updates and reduce idle revision polling.
+
 ## [Unreleased]
 
 ### Added

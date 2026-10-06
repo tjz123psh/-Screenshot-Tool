@@ -184,7 +184,7 @@ impl TileCache {
         if row >= end {
             return None;
         }
-        let surface = imaging::to_surface(&image.rows_slice(row, end)).ok()?;
+        let surface = imaging::to_surface_rows(image, row, end).ok()?;
         let bytes = surface.stride() as usize * (end - row);
         while self.bytes + bytes > CACHE_BYTES {
             let Some(old) = self.tiles.pop_front() else {
@@ -247,6 +247,7 @@ struct Viewer {
     close_question: Cell<bool>,
     busy: Cell<bool>,
     actions: Vec<Button>,
+    compact_labels: Vec<Label>,
 }
 thread_local! { static LIVE: RefCell<Vec<Rc<Viewer>>> = const { RefCell::new(Vec::new()) }; }
 fn raster_document(image: &Rgb8) -> Option<SharedDocument> {
@@ -394,6 +395,11 @@ fn run_session(
     if failed.get() { 1 } else { code }
 }
 
+fn window_size(mw: i32, mh: i32, image_width: usize) -> (i32, i32) {
+    let width = (image_width.saturating_add(142).clamp(640, 880) as i32).min((mw - 64).max(320));
+    (width, (mh - 96).clamp(280, 660))
+}
+
 fn button(icon: &str, text: &str, tooltip: &str) -> Button {
     let b = Button::new();
     let row = GtkBox::new(Orientation::Horizontal, 7);
@@ -438,11 +444,17 @@ impl Viewer {
             .and_then(|m| m.downcast::<gtk4::gdk::Monitor>().ok())
             .map(|m| (m.geometry().width(), m.geometry().height()))
             .unwrap_or((1440, 900));
+        let (width, height) = window_size(mw, mh, image.width);
+        let long_image = image.height > image.width.saturating_mul(2);
         let window = ApplicationWindow::builder()
             .application(app)
-            .title("Vellum · 图片预览")
-            .default_width((mw - 100).clamp(420, 980))
-            .default_height((mh - 100).clamp(320, 740))
+            .title(if long_image {
+                "Vellum · 长截图"
+            } else {
+                "Vellum · 图片预览"
+            })
+            .default_width(width)
+            .default_height(height)
             .resizable(false)
             .build();
         window.add_css_class("vellum-window");
@@ -450,14 +462,15 @@ impl Viewer {
         let root = GtkBox::new(Orientation::Vertical, 0);
         let header = GtkBox::new(Orientation::Horizontal, 12);
         header.add_css_class("vellum-preview-header");
-        let brand = Label::new(Some("Vellum"));
+        let brand = Label::new(Some(if long_image {
+            "长截图"
+        } else {
+            "图片预览"
+        }));
         brand.add_css_class("vellum-title");
         header.append(&crate::controls::brand_mark(28));
         header.append(&brand);
-        let dimensions = Label::new(Some(&format!(
-            "图片预览  ·  {} × {}",
-            image.width, image.height
-        )));
+        let dimensions = Label::new(Some(&format!("{} × {}", image.width, image.height)));
         dimensions.set_ellipsize(pango::EllipsizeMode::End);
         dimensions.add_css_class("vellum-dim");
         dimensions.set_hexpand(true);
@@ -468,7 +481,7 @@ impl Viewer {
         header.append(&close);
         root.append(&crate::drag::draggable(&header));
         let bar = GtkBox::new(Orientation::Horizontal, 8);
-        bar.add_css_class("vellum-preview-toolbar");
+        bar.add_css_class("vellum-preview-zoom");
         let minus = button("zoom-out-symbolic", "", "缩小（−）");
         let plus = button("zoom-in-symbolic", "", "放大（+ / Ctrl+滚轮）");
         let zoom_label = Label::new(Some("100%"));
@@ -487,7 +500,6 @@ impl Viewer {
         bar.append(&original);
         let spacer = GtkBox::new(Orientation::Horizontal, 0);
         spacer.set_hexpand(true);
-        bar.append(&spacer);
         let copy = button("edit-copy-symbolic", "复制", "复制完整图片（Ctrl+C）");
         let save = button(
             "document-save-as-symbolic",
@@ -496,28 +508,10 @@ impl Viewer {
         );
         save.add_css_class("suggested-action");
         let pin = button("view-pin-symbolic", "钉图", "将完整图片作为浮动参考图");
-        if mw < 960 {
-            for b in [&fit, &original, &pin, &copy, &save] {
-                if let Some(child) = b
-                    .child()
-                    .and_then(|c| c.last_child())
-                    .and_then(|c| c.downcast::<Label>().ok())
-                {
-                    child.set_visible(false);
-                }
-            }
-        }
-        bar.append(&pin);
-        bar.append(&copy);
-        bar.append(&save);
-        root.append(&bar);
+
         let session_bar = GtkBox::new(Orientation::Horizontal, 8);
         session_bar.add_css_class("vellum-preview-toolbar");
-        let edit = button(
-            "document-edit-symbolic",
-            "继续编辑",
-            "编辑本次会话的标注对象",
-        );
+        let edit = button("document-edit-symbolic", "编辑", "编辑本次会话的标注对象");
         let crop = button(
             "crop-symbolic",
             "裁切",
@@ -536,12 +530,24 @@ impl Viewer {
             edit.set_tooltip_text(Some("图片超出编辑预算；请先裁切一部分"));
             ocr.set_tooltip_text(Some("请先裁切到编辑预算内再识别"));
         }
+        session_bar.append(&spacer);
+        for button in [&pin, &copy, &save] {
+            session_bar.append(button);
+        }
+        let compact_labels: Vec<Label> = [&crop, &translate, &pin, &fit, &original]
+            .into_iter()
+            .filter_map(|button| button.child()?.last_child()?.downcast::<Label>().ok())
+            .collect();
+        for label in &compact_labels {
+            label.set_visible(width >= 760);
+        }
         root.append(&session_bar);
         let exports = GtkBox::new(Orientation::Horizontal, 16);
         exports.set_margin_start(18);
         exports.set_margin_end(18);
-        exports.set_margin_top(6);
-        exports.set_margin_bottom(6);
+        exports.add_css_class("vellum-preview-exports");
+        exports.set_margin_top(4);
+        exports.set_margin_bottom(4);
         let save_status = Label::new(Some(outputs.save_text()));
         let copy_status = Label::new(Some(outputs.copy_text()));
         save_status.set_wrap(true);
@@ -550,7 +556,6 @@ impl Viewer {
         copy_status.set_xalign(0.0);
         exports.append(&save_status);
         exports.append(&copy_status);
-        root.append(&exports);
         if memory_only {
             window.set_title(Some("Vellum · 未保存的恢复图片"));
             let warning = Label::new(Some(
@@ -582,11 +587,11 @@ impl Viewer {
         area.set_focusable(true);
         area.add_css_class("vellum-preview-stage");
         let map = DrawingArea::new();
-        map.set_content_width(94);
+        map.set_content_width(76);
         map.set_vexpand(true);
         map.add_css_class("vellum-preview-minimap");
         map.set_tooltip_text(Some("全文概览：点击或拖动快速定位"));
-        map.set_visible(mw >= 960);
+        map.set_visible(long_image && width >= 820);
         let grid = Grid::new();
         grid.set_hexpand(true);
         grid.set_vexpand(true);
@@ -597,6 +602,7 @@ impl Viewer {
         grid.attach(&map, 2, 0, 1, 1);
         grid.attach(&hbar, 0, 1, 1, 1);
         root.append(&grid);
+        root.append(&exports);
         let footer = GtkBox::new(Orientation::Horizontal, 12);
         footer.add_css_class("vellum-preview-status");
         let status = Label::new(Some("滚轮浏览  ·  Ctrl+滚轮缩放"));
@@ -605,6 +611,7 @@ impl Viewer {
         status.set_ellipsize(pango::EllipsizeMode::Middle);
         let position = Label::new(Some("顶部"));
         position.set_halign(Align::End);
+        footer.append(&bar);
         footer.append(&status);
         footer.append(&position);
         root.append(&footer);
@@ -646,6 +653,7 @@ impl Viewer {
             allow_close: Cell::new(false),
             close_question: Cell::new(false),
             busy: Cell::new(false),
+            compact_labels,
             actions: vec![
                 copy.clone(),
                 save.clone(),
@@ -718,7 +726,7 @@ impl Viewer {
             let weak = weak.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
                 if let Some(v) = weak.upgrade() {
-                    crate::own_window::float_own_window_soon();
+                    crate::own_window::float_and_resize(&v.window);
                     v.area.grab_focus();
                 }
             });
@@ -738,6 +746,13 @@ impl Viewer {
         let weak = Rc::downgrade(&this);
         this.area.connect_resize(move |_, w, h| {
             if let Some(v) = weak.upgrade() {
+                let width = v.window.width();
+                for label in &v.compact_labels {
+                    label.set_visible(width >= 760);
+                }
+                let image = v.image.borrow();
+                v.map
+                    .set_visible(width >= 820 && image.height > image.width.saturating_mul(2));
                 v.view.borrow_mut().resize(f64::from(w), f64::from(h));
                 v.sync();
             }
@@ -896,11 +911,16 @@ impl Viewer {
         });
         this.window.add_controller(keys);
         let weak = Rc::downgrade(&this);
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             let Some(viewer) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            viewer.refresh_document();
+            if viewer.document.is_none() {
+                return glib::ControlFlow::Break;
+            }
+            if viewer.window.is_visible() {
+                viewer.refresh_document();
+            }
             glib::ControlFlow::Continue
         });
         Ok(this)
@@ -914,9 +934,10 @@ impl Viewer {
         let document = document.borrow();
         if document.revision() == self.revision.get() {
             let outputs = shared_outputs(&document, self.outputs.get());
-            self.outputs.set(outputs);
-            self.save_status.set_text(outputs.save_text());
-            self.copy_status.set_text(outputs.copy_text());
+            if self.outputs.replace(outputs) != outputs {
+                self.save_status.set_text(outputs.save_text());
+                self.copy_status.set_text(outputs.copy_text());
+            }
             return true;
         }
         let snapshot = match document.snapshot() {
@@ -1460,6 +1481,12 @@ mod tests {
         assert!(report.save_text().contains("未确认"));
         assert!(!report.save_text().contains("失败"));
         assert!(report.copy_text().contains("已完成"));
+    }
+    #[test]
+    fn preview_size_is_compact_and_bounded_by_screen() {
+        assert_eq!(window_size(1920, 1080, 1200), (880, 660));
+        assert_eq!(window_size(1920, 1080, 300), (640, 660));
+        assert_eq!(window_size(800, 600, 1200), (736, 504));
     }
     #[test]
     fn long_image_fits_width_and_starts_at_top() {

@@ -170,8 +170,17 @@ impl Document {
 
     pub fn snapshot(&self) -> Result<Snapshot, String> {
         if self.cache.borrow().is_none() {
-            let image = render(&self.base, &self.state)?;
-            *self.cache.borrow_mut() = Some(Arc::new(image));
+            // An untouched raster is already a safe composed image. Reuse it
+            // for OCR/preview instead of rendering and copying every pixel.
+            let image = if self.state.objects.is_empty()
+                && self.state.crop
+                    == Rect::new(0, 0, self.source.width as i32, self.source.height as i32)
+            {
+                self.source.clone()
+            } else {
+                Arc::new(render(&self.base, &self.state)?)
+            };
+            *self.cache.borrow_mut() = Some(image);
         }
         Ok(Snapshot {
             document_id: self.id,
