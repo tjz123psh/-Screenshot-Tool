@@ -826,11 +826,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    // Clean up only the private directory this test created. Never follow a
+    // replacement symlink or remove a directory swapped in by another actor.
+    struct FixtureDirectory {
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+    }
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            if let Ok(metadata) = fs::symlink_metadata(&self.path)
+                && metadata.is_dir()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+                && metadata.uid() == unsafe { libc::geteuid() }
+            {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
     struct Fixture {
         directory: PathBuf,
         paths: Paths,
         release: PathBuf,
         proc_root: PathBuf,
+        _directory_guard: FixtureDirectory,
     }
     impl Fixture {
         fn new() -> Self {
@@ -845,6 +867,12 @@ mod tests {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(error) => panic!("fixture directory: {error}"),
                 }
+            };
+            let metadata = fs::symlink_metadata(&directory).unwrap();
+            let directory_guard = FixtureDirectory {
+                path: directory.clone(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
             };
             fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
             let paths = Paths {
@@ -876,6 +904,7 @@ mod tests {
                 paths,
                 release,
                 proc_root,
+                _directory_guard: directory_guard,
             };
             fixture.process(101, "vellum", "daemon");
             fixture.process(102, "vellum-ui", "shortcuts-service");
@@ -936,8 +965,43 @@ mod tests {
             script
         }
     }
-    // Fixtures are small and retained on disk to avoid deleting any externally
-    // replaced test path. They never contain user settings or actual images.
+    #[test]
+    fn fixture_directory_is_removed_after_the_test() {
+        let fixture = Fixture::new();
+        let directory = fixture.directory.clone();
+        assert!(directory.exists());
+        drop(fixture);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn fixture_cleanup_preserves_a_replaced_root() {
+        for replace_with_symlink in [false, true] {
+            let holder = Fixture::new();
+            let fixture = Fixture::new();
+            let path = fixture.directory.clone();
+            fs::rename(&path, holder.directory.join("original-fixture")).unwrap();
+            let foreign = holder.directory.join("foreign-directory");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("keep"), b"do not delete").unwrap();
+            if replace_with_symlink {
+                symlink(&foreign, &path).unwrap();
+            } else {
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("keep"), b"do not delete").unwrap();
+            }
+            drop(fixture);
+            assert_eq!(fs::read(path.join("keep")).unwrap(), b"do not delete");
+            assert!(foreign.join("keep").exists());
+            // These replacements were created explicitly by this test.
+            if replace_with_symlink {
+                fs::remove_file(path).unwrap();
+            } else {
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+    }
+
     struct Fake {
         reachable: bool,
         states: BTreeMap<String, UnitState>,
