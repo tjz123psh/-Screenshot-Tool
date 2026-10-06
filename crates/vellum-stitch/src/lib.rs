@@ -33,6 +33,7 @@ pub mod canvas;
 pub mod fixed_regions;
 pub mod offline;
 pub mod scoring;
+mod seam;
 pub mod signature;
 pub mod stitcher;
 

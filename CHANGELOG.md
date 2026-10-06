@@ -2,6 +2,13 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.4]
+
+- Choose content-aware seams for online and offline long screenshots, avoiding text edges rather than joining at the viewport boundary or a fixed weight crossover. Keep complete rows from one frame and avoid reblending revisited content.
+- Limit background feathering to a short, fully checked smooth band; low-contrast glyphs and thin text edges veto blending. Keep matching thresholds, row geometry and bounded frame memory unchanged.
+- Add regressions for two-pixel text shifts, both scroll directions, revisits, low-contrast text, smooth backgrounds and incremental edge/index replacement.
+- Enlarge OCR/translation results to a screen-bounded 640×460 floating window with 15px text, retaining standalone close behavior.
+
 ## [0.2.3]
 
 - Keep standalone OCR/translation results separate from image previews; closing a text result no longer automatically opens a second workbench. Explicit image viewing/editing retains shared-session protection.

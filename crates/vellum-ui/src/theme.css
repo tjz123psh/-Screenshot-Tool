@@ -199,7 +199,7 @@ scrollbar slider:hover { background: rgba(202,188,159,0.46); }
   background-color: #594f3d; color: #eee6d5; border-color: rgba(236,219,181,0.35);
 }
 .vellum-result .vellum-text-shell { background: #232322; border-color: rgba(228,218,190,0.14); }
-.vellum-result .vellum-textview, .vellum-result .vellum-textview text { padding: 9px; font-size: 14px; }
+.vellum-result .vellum-textview, .vellum-result .vellum-textview text { padding: 11px; font-size: 15px; }
 
 /* Focus is deliberately LAST and independent of decorative shadows. */
 .vellum-window button:focus-visible, .vellum-card button:focus-visible,

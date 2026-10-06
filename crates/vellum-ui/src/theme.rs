@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 use std::cell::RefCell;
 use std::collections::HashSet;
-const CSS_VERSION: u32 = 17;
+const CSS_VERSION: u32 = 18;
 const CSS: &str = include_str!("theme.css");
 thread_local! {static INSTALLED:RefCell<HashSet<(usize,u32)>>=RefCell::new(HashSet::new());}
 pub fn install(display: &Display) {

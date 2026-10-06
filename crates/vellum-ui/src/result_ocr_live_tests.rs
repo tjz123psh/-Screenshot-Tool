@@ -16,8 +16,8 @@ fn native_ocr_compact_layout_coalesces_edits_and_closes_without_workspace() {
         Document::from_raster(Rgb8::new(32, 24)).unwrap(),
     ));
     let result = document_window(&app, document.clone(), false, ResultRoute::StandaloneText);
-    assert_eq!(result.window.default_width(), 480);
-    assert_eq!(result.window.default_height(), 340);
+    assert_eq!(result.window.default_width(), 640);
+    assert_eq!(result.window.default_height(), 460);
     assert_eq!(result.route.get(), ResultRoute::StandaloneText);
     let root = result.window.child().unwrap();
     let initial_minimum = root.measure(Orientation::Horizontal, -1).0;

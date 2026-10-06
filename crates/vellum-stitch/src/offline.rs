@@ -17,7 +17,7 @@ use std::io::Read;
 use vellum_core::image::Rgb8;
 
 use crate::fixed_regions::FixedBands;
-use crate::scoring::{FUSION_MAX_PIXEL_DELTA, MAX_PIXEL_DIFF, Mask, ROBUST_MAX_PIXEL_DIFF};
+use crate::scoring::{MAX_PIXEL_DIFF, Mask, ROBUST_MAX_PIXEL_DIFF};
 use crate::signature::{Cols, Sparse, is_static_view, matching_cols};
 
 /// Lossless keyframes retained for reconstruction. Excludes one pending raw
@@ -289,7 +289,8 @@ fn shortest_path(frames: &[Keyframe], ctx: &OfflineCtx<'_>) -> Option<Vec<(usize
     Some(reverse)
 }
 
-/// Blend the path's frames into one canvas with feathered viewport weights.
+/// Compose the path with content-aware, whole-row source ownership.
+/// Never average antialiased glyphs from different rendering states.
 fn fuse(frames: &[Keyframe], path: &[(usize, i64)], ctx: &OfflineCtx<'_>) -> Option<Rgb8> {
     fuse_with_decoder(frames, path, ctx, Keyframe::decode)
 }
@@ -367,19 +368,9 @@ fn fuse_with_decoder<D: Borrow<Rgb8>>(
     }
 
     let mut canvas = Rgb8::new(width, content_height);
-    // Triangular viewport weight: rows near the viewport centre dominate, rows
-    // entering/leaving at the edges taper to one. Without this a screen-fixed
-    // wallpaper behind a translucent window visibly jumps at frame boundaries.
-    let weights: Vec<u32> = (0..frame_height)
-        .map(|y| ((y + 1) as u32).min((frame_height - y) as u32))
-        .collect();
-    let content_weights = &weights[bands.top..frame_height - bands.bottom];
-    let mut weight_sum = vec![0u32; content_height];
-    let mut peak_weight = vec![0u32; content_height];
-
+    let mut covered: Option<(usize, usize)> = None;
     for &(index, position) in path {
-        // Reuse the retained first frame; every other decode drops at the end
-        // of this iteration, including early returns on invalid reconstruction.
+        // Keep at most the first reference plus one incoming decoded frame.
         let decoded;
         let frame = if index == first_index {
             first_frame
@@ -388,7 +379,7 @@ fn fuse_with_decoder<D: Borrow<Rgb8>>(
             decoded.borrow()
         };
         let content_rows = frame.height.checked_sub(bands.top + bands.bottom)?;
-        if content_rows != content_weights.len() {
+        if frame.width != width || content_rows != frame_height - bands.top - bands.bottom {
             return None;
         }
         let start = position + bands.top as i64 - min_position;
@@ -396,50 +387,70 @@ fn fuse_with_decoder<D: Borrow<Rgb8>>(
             return None;
         }
         let start = start as usize;
-
-        for (row, &incoming_weight) in content_weights.iter().enumerate().take(content_rows) {
-            let target_row = start + row;
-            let source = frame.row(bands.top + row);
-            let existing = weight_sum[target_row];
-            let prefer_incoming = incoming_weight >= peak_weight[target_row];
-            let target = canvas.row_mut(target_row);
-
-            if existing == 0 {
-                let range = center_start * 3..center_end * 3;
-                target[range.clone()].copy_from_slice(&source[range]);
-            } else {
-                let old_weight = u64::from(existing);
-                let new_weight = u64::from(incoming_weight);
-                let total = old_weight + new_weight;
-                for x in center_start..center_end {
-                    let base = x * 3;
-                    let old = [target[base], target[base + 1], target[base + 2]];
-                    let incoming = [source[base], source[base + 1], source[base + 2]];
-                    let delta = (0..3)
-                        .map(|c| (i16::from(old[c]) - i16::from(incoming[c])).abs())
-                        .max()
-                        .unwrap_or(0);
-                    if delta <= FUSION_MAX_PIXEL_DELTA {
-                        for c in 0..3 {
-                            let blended = (u64::from(old[c]) * old_weight
-                                + u64::from(incoming[c]) * new_weight
-                                + total / 2)
-                                / total;
-                            target[base + c] = blended as u8;
-                        }
-                    } else if prefer_incoming {
-                        // Keep one complete state for high-contrast local
-                        // change, so a caret or video tile is not ghosted.
-                        target[base..base + 3].copy_from_slice(&incoming);
-                    }
-                }
+        let end = start + content_rows;
+        let mut feather = None;
+        let (copy_start, copy_end) = match covered {
+            None => (start, end),
+            Some((low, high)) if start > high || end < low => return None,
+            Some((low, high)) if end > high => {
+                let overlap_start = start.max(low);
+                let cut = crate::seam::choose(
+                    &canvas,
+                    overlap_start,
+                    frame,
+                    bands.top + overlap_start - start,
+                    high - overlap_start,
+                    center_start..center_end,
+                );
+                feather = crate::seam::background_patch(
+                    (&canvas, overlap_start),
+                    (frame, bands.top + overlap_start - start),
+                    high - overlap_start,
+                    cut,
+                    true,
+                    center_start..center_end,
+                )
+                .map(|patch| (overlap_start + cut, patch));
+                (overlap_start + cut, end)
             }
-            weight_sum[target_row] += incoming_weight;
-            peak_weight[target_row] = peak_weight[target_row].max(incoming_weight);
+            Some((low, high)) if start < low => {
+                let cut = crate::seam::choose(
+                    &canvas,
+                    low,
+                    frame,
+                    bands.top + low - start,
+                    end.min(high) - low,
+                    center_start..center_end,
+                );
+                feather = crate::seam::background_patch(
+                    (&canvas, low),
+                    (frame, bands.top + low - start),
+                    end.min(high) - low,
+                    cut,
+                    false,
+                    center_start..center_end,
+                )
+                .map(|patch| (low + cut - patch.height, patch));
+                (start, low + cut)
+            }
+            // Revisiting known rows must not mix another animation/font state
+            // into already coherent text or repeatedly blur the same pixels.
+            Some(_) => continue,
+        };
+        let columns = center_start * 3..center_end * 3;
+        for target_row in copy_start..copy_end {
+            let source = frame.row(bands.top + target_row - start);
+            canvas.row_mut(target_row)[columns.clone()].copy_from_slice(&source[columns.clone()]);
         }
+        if let Some((at, patch)) = feather {
+            for y in 0..patch.height {
+                canvas.row_mut(at + y)[columns.clone()]
+                    .copy_from_slice(&patch.row(y)[columns.clone()]);
+            }
+        }
+        covered = Some(covered.map_or((start, end), |(low, high)| (low.min(start), high.max(end))));
     }
-
-    if weight_sum.contains(&0) {
+    if covered != Some((0, content_height)) {
         return None;
     }
 
@@ -654,8 +665,8 @@ mod tests {
 
     #[test]
     fn fusion_preserves_pixel_order_and_refined_fixed_bands() {
-        // Covers upward growth, revisits, low-delta blending, high-contrast
-        // replacement, an approximate sidebar boundary, and fixed chrome.
+        // Whole scrolling rows must come from one captured state, including
+        // low-contrast changes, upward growth, revisits and refined sidebars.
         let positions = [0, -3, 0, 3, 6, 9];
         let frames: Vec<_> = positions
             .iter()
@@ -686,28 +697,71 @@ mod tests {
             })
             .collect();
         let path: Vec<_> = positions.into_iter().enumerate().collect();
-        // Golden hashes recorded from the eager decoder before this refactor.
-        for (bands, expected_hash) in [
-            (FixedBands::default(), 0x2e86db71cfaf15f4),
-            (
-                FixedBands {
-                    top: 1,
-                    bottom: 1,
-                    left: 2,
-                    right: 2,
-                },
-                0xc56ed8cfa1ec3835,
-            ),
+        for bands in [
+            FixedBands::default(),
+            FixedBands {
+                top: 1,
+                bottom: 1,
+                left: 2,
+                right: 2,
+            },
         ] {
             let image = fuse(&frames, &path, &fusion_context(12, bands)).unwrap();
-            let hash = image
-                .data
-                .iter()
-                .fold(0xcbf29ce484222325u64, |hash, &byte| {
-                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-                });
             assert_eq!((image.width, image.height), (12, 22));
-            assert_eq!(hash, expected_hash, "fusion pixels changed for {bands:?}");
+            for y in bands.top..image.height - bands.bottom {
+                let document_y = y as i64 - 3;
+                assert!(
+                    path.iter().any(|&(index, position)| {
+                        let local = document_y - position;
+                        if local < bands.top as i64 || local >= (10 - bands.bottom) as i64 {
+                            return false;
+                        }
+                        let frame = frames[index].decode().unwrap();
+                        // The approximate two-column crop must refine to one:
+                        // otherwise scrolling pixels in columns 1/10 are destroyed.
+                        image.row(y)[3..33] == frame.row(local as usize)[3..33]
+                    }),
+                    "row {y} mixes frame states or crops scrolling pixels: {bands:?}"
+                );
+                assert_eq!(image.pixel(0, y), [240; 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn text_residuals_never_mix_two_halves_of_a_glyph() {
+        for positions in [[0i64, 24], [24, 0]] {
+            for residual in [-2i64, 2] {
+                for ink in [20, 220] {
+                    // high contrast and antialiased/low contrast
+                    let frames: Vec<_> = positions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &position)| {
+                            let mut image = Rgb8::from_raw(32, 64, vec![245; 32 * 64 * 3]);
+                            let glyph_top = 40 + if i == 0 { 0 } else { residual };
+                            for y in glyph_top..glyph_top + 8 {
+                                let row = (y - position) as usize;
+                                image.row_mut(row)[8 * 3..16 * 3].fill(ink);
+                            }
+                            image_keyframe(&image, i as u64)
+                        })
+                        .collect();
+                    let path = [(0, positions[0]), (1, positions[1]), (0, positions[0])];
+                    let image =
+                        fuse(&frames, &path, &fusion_context(32, FixedBands::default())).unwrap();
+                    assert_eq!(image.height, 88);
+                    let rows: Vec<_> = (0..image.height)
+                        .filter(|&y| image.pixel(12, y)[0] != 245)
+                        .collect();
+                    assert_eq!(rows.len(), 8, "a complete glyph became {rows:?}");
+                    assert_eq!(rows[7] - rows[0], 7, "glyph was split at a seam");
+                    assert!(
+                        image.data.iter().all(|&v| v == 245 || v == ink),
+                        "invented blended text pixels"
+                    );
+                }
+            }
         }
     }
 

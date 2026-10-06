@@ -34,8 +34,8 @@ use crate::{theme, ui_job};
 use vellum_text::api::RequestControl;
 
 const APP_ID: &str = "ai.vellum.result";
-const WIDTH: i32 = 480;
-const HEIGHT: i32 = 340;
+const WIDTH: i32 = 640;
+const HEIGHT: i32 = 460;
 /// Niri needs the window mapped before it can be floated.
 const FLOAT_DELAY: Duration = Duration::from_millis(60);
 

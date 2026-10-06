@@ -140,6 +140,93 @@ impl Canvas {
         true
     }
 
+    /// Copy only the bounded edge strip needed to choose a seam. Walking from
+    /// that edge avoids a canvas-height scan on every incoming frame.
+    pub(crate) fn edge_window(&self, rows: usize, side: Side) -> Option<Rgb8> {
+        if rows > self.height {
+            return None;
+        }
+        let mut out = Rgb8::new(self.width, rows);
+        let stride = self.width * 3;
+        let mut remaining = rows;
+        match side {
+            Side::Bottom => {
+                for block in self.blocks.iter().rev() {
+                    let count = remaining.min(block.height);
+                    out.data[(remaining - count) * stride..remaining * stride]
+                        .copy_from_slice(&block.data[(block.height - count) * stride..]);
+                    remaining -= count;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+            Side::Top => {
+                for block in &self.blocks {
+                    let count = remaining.min(block.height);
+                    let written = rows - remaining;
+                    out.data[written * stride..(written + count) * stride]
+                        .copy_from_slice(&block.data[..count * stride]);
+                    remaining -= count;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Replace a short overlapping edge plus append new rows in one admitted
+    /// operation. Rebuild only affected blocks/indices, never the whole canvas.
+    pub(crate) fn replace_edge(&mut self, rows: usize, block: Rgb8, side: Side) -> bool {
+        if rows > self.height
+            || rows > block.height
+            || self.check_append(block.width, block.height - rows).is_err()
+            || block
+                .width
+                .checked_mul(block.height)
+                .and_then(|n| n.checked_mul(3))
+                != Some(block.data.len())
+        {
+            return false;
+        }
+        let mut remaining = rows;
+        while remaining > 0 {
+            let old = match side {
+                Side::Bottom => {
+                    self.matches.pop_back();
+                    if self.preview_enabled {
+                        self.thumbs.pop_back();
+                    }
+                    self.blocks.pop_back()
+                }
+                Side::Top => {
+                    self.matches.pop_front();
+                    if self.preview_enabled {
+                        self.thumbs.pop_front();
+                    }
+                    self.blocks.pop_front()
+                }
+            }
+            .expect("admitted edge replacement");
+            self.height -= old.height;
+            if old.height > remaining {
+                let keep = match side {
+                    Side::Bottom => old.rows_slice(0, old.height - remaining),
+                    Side::Top => old.rows_slice(remaining, old.height),
+                };
+                if !self.push(keep, side) {
+                    return false;
+                }
+                remaining = 0;
+            } else {
+                remaining -= old.height;
+            }
+        }
+        self.push(block, side)
+    }
+
     /// Flatten the row signatures plus only the sparse columns used by the
     /// coarse full-canvas ranker. Exact sparse verification extracts one
     /// viewport with `matching_pixels_window`, so a miss never copies the whole
@@ -362,6 +449,46 @@ mod tests {
         assert_eq!(window.height, 2);
         assert_eq!(window.row(0)[0], 100);
         assert_eq!(window.row(1)[0], 200);
+    }
+
+    #[test]
+    fn replacing_an_edge_updates_pixels_matching_index_and_thumbnail() {
+        for side in [Side::Top, Side::Bottom] {
+            let mut canvas = Canvas::new(true);
+            for value in [10, 20, 30] {
+                assert!(canvas.push(band(8, 4, value), Side::Bottom));
+            }
+            let before = canvas.flatten().unwrap();
+            assert_eq!(
+                canvas.edge_window(6, Side::Top).unwrap(),
+                before.rows_slice(0, 6)
+            );
+            assert_eq!(
+                canvas.edge_window(6, Side::Bottom).unwrap(),
+                before.rows_slice(6, 12)
+            );
+            assert!(!canvas.replace_edge(13, band(8, 14, 90), side));
+            assert_eq!(canvas.flatten().unwrap(), before);
+            assert!(canvas.replace_edge(6, band(8, 10, 90), side));
+            let image = canvas.flatten().unwrap();
+            assert_eq!(image.height, 16);
+            let retained = match side {
+                Side::Top => image.rows_slice(10, 16),
+                Side::Bottom => image.rows_slice(0, 6),
+            };
+            assert_eq!(
+                retained,
+                match side {
+                    Side::Top => before.rows_slice(6, 12),
+                    Side::Bottom => before.rows_slice(0, 6),
+                }
+            );
+            assert_eq!(
+                canvas.matching_pixels_window(0, 16).unwrap(),
+                sample_pixels(&image)
+            );
+            assert!(canvas.preview(8, 16).is_some());
+        }
     }
 
     #[test]

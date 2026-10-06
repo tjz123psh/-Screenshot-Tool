@@ -853,15 +853,44 @@ impl Stitcher {
         }
         if over_bottom > 0 {
             let start = (h - over_bottom) as usize;
-            self.canvas
-                .push(arr.rows_slice(start, arr.height), Side::Bottom);
+            let overlap = start.min(self.canvas.height()).min(256);
+            let (replace, start) = if overlap >= 8 && added_top == 0 {
+                let Some(edge) = self.canvas.edge_window(overlap, Side::Bottom) else {
+                    return false;
+                };
+                let begin = start - overlap;
+                let cut = crate::seam::choose(&edge, 0, arr, begin, overlap, 0..arr.width);
+                (overlap - cut, begin + cut)
+            } else {
+                (0, start)
+            };
+            if !self
+                .canvas
+                .replace_edge(replace, arr.rows_slice(start, arr.height), Side::Bottom)
+            {
+                return false;
+            }
             self.last_added = over_bottom as usize;
         }
 
         let over_top = -new_pos;
         if over_top > 0 {
-            self.canvas
-                .push(arr.rows_slice(0, over_top as usize), Side::Top);
+            let start = over_top as usize;
+            let overlap = (arr.height - start).min(self.canvas.height()).min(256);
+            let replace = if overlap >= 8 && added_bottom == 0 {
+                let Some(edge) = self.canvas.edge_window(overlap, Side::Top) else {
+                    return false;
+                };
+                crate::seam::choose(&edge, 0, arr, start, overlap, 0..arr.width)
+            } else {
+                0
+            };
+            if !self
+                .canvas
+                .replace_edge(replace, arr.rows_slice(0, start + replace), Side::Top)
+            {
+                return false;
+            }
             for tracked in self.history.iter_mut() {
                 tracked.position += over_top;
             }
@@ -1518,6 +1547,39 @@ mod candidate_tests {
             }
         }
         image
+    }
+
+    #[test]
+    fn online_seams_keep_a_complete_glyph_at_both_viewport_edges() {
+        for upwards in [false, true] {
+            for residual in [-2i64, 2] {
+                let (first_pos, next_pos, glyph) = if upwards {
+                    (24i64, 0i64, 20i64)
+                } else {
+                    (0, 24, 60)
+                };
+                let frame = |position: i64, delta: i64| {
+                    let mut image = Rgb8::from_raw(96, 64, vec![245; 96 * 64 * 3]);
+                    for y in glyph + delta..glyph + delta + 8 {
+                        if (position..position + 64).contains(&y) {
+                            image.row_mut((y - position) as usize)[24..48].fill(20);
+                        }
+                    }
+                    image
+                };
+                let mut stitcher = Stitcher::with_options(9.0, 4, false, 0);
+                stitcher.add(&frame(first_pos, 0));
+                // Isolate composition from matching: the geometry is already known.
+                assert!(stitcher.extend_canvas(&frame(next_pos, residual), next_pos - first_pos));
+                let image = stitcher.result().unwrap().image;
+                assert_eq!(image.height, 88);
+                let rows: Vec<_> = (0..image.height)
+                    .filter(|&y| image.pixel(12, y)[0] == 20)
+                    .collect();
+                assert_eq!(rows.len(), 8, "online seam split glyph: {rows:?}");
+                assert_eq!(rows[7] - rows[0], 7);
+            }
+        }
     }
 
     #[test]
