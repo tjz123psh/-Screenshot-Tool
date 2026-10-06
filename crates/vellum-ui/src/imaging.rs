@@ -24,7 +24,12 @@ pub fn to_surface(image: &Rgb8) -> Result<ImageSurface> {
     for y in 0..image.height {
         let src = image.row(y);
         let dst = &mut data[y * stride as usize..][..image.width * 4];
-        for (pixel, out) in src.as_chunks::<3>().0.iter().zip(dst.as_chunks_mut::<4>().0.iter_mut()) {
+        for (pixel, out) in src
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+        {
             // Little-endian ARGB32 is B, G, R, A in memory order.
             out[0] = pixel[2];
             out[1] = pixel[1];
@@ -58,7 +63,12 @@ pub fn from_surface(surface: &mut ImageSurface) -> Result<Rgb8> {
     for y in 0..height {
         let src = &data[y * stride..][..width * 4];
         let dst = &mut out[y * width * 3..][..width * 3];
-        for (pixel, rgb) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<3>().0.iter_mut()) {
+        for (pixel, rgb) in src
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dst.as_chunks_mut::<3>().0.iter_mut())
+        {
             let alpha = pixel[3];
             if alpha == 0xff {
                 rgb[0] = pixel[2];

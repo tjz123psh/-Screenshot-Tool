@@ -102,7 +102,11 @@ impl Gray {
 /// Rec. 601 luma, matching Pillow's `convert("L")`.
 pub fn to_gray(image: &Rgb8) -> Gray {
     let mut out = Gray::new(image.width, image.height);
-    for (dst, src) in out.data.iter_mut().zip(image.data.as_chunks::<3>().0.iter()) {
+    for (dst, src) in out
+        .data
+        .iter_mut()
+        .zip(image.data.as_chunks::<3>().0.iter())
+    {
         let value =
             299 * u32::from(src[0]) + 587 * u32::from(src[1]) + 114 * u32::from(src[2]) + 500;
         *dst = (value / 1000) as u8;
@@ -595,7 +599,11 @@ fn clahe(gray: &Gray) -> Gray {
 
 fn max_channel(image: &Rgb8) -> Gray {
     let mut out = Gray::new(image.width, image.height);
-    for (dst, src) in out.data.iter_mut().zip(image.data.as_chunks::<3>().0.iter()) {
+    for (dst, src) in out
+        .data
+        .iter_mut()
+        .zip(image.data.as_chunks::<3>().0.iter())
+    {
         *dst = src[0].max(src[1]).max(src[2]);
     }
     out
@@ -619,7 +627,11 @@ fn strongest_channel_range(image: &Rgb8) -> u8 {
     (0..3)
         .map(|channel| {
             let mut gray = Gray::new(image.width, image.height);
-            for (dst, pixel) in gray.data.iter_mut().zip(image.data.as_chunks::<3>().0.iter()) {
+            for (dst, pixel) in gray
+                .data
+                .iter_mut()
+                .zip(image.data.as_chunks::<3>().0.iter())
+            {
                 *dst = pixel[channel];
             }
             robust_range(&gray)

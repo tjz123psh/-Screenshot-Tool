@@ -90,10 +90,12 @@ impl FixedRegionDetector {
         for y in 0..self.height {
             let (pr, cr) = (previous.row(y), current.row(y));
             let mut unchanged_in_row = 0usize;
-            for (count, (p, c)) in column_unchanged
-                .iter_mut()
-                .zip(pr.as_chunks::<3>().0.iter().zip(cr.as_chunks::<3>().0.iter()))
-            {
+            for (count, (p, c)) in column_unchanged.iter_mut().zip(
+                pr.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(cr.as_chunks::<3>().0.iter()),
+            ) {
                 let delta = (0..3)
                     .map(|i| (i16::from(p[i]) - i16::from(c[i])).abs())
                     .max()
