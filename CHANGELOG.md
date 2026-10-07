@@ -2,6 +2,10 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.7]
+
+- Open the pin window already at its final size. The compositor floats a window that declares a fixed size and hands it exactly the requested size, but tiles a resizable one at its own default width; the pin therefore opens fixed and only becomes resizable once it is on screen. Nothing visibly grows, shrinks or jumps on the first frame.
+
 ## [0.2.6]
 
 - Make a pinned window adopt the size its image needs. The size request now goes out after the compositor has moved the window into the floating layer, because that step replaces the size the window mapped with.

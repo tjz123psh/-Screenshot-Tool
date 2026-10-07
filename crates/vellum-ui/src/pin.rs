@@ -309,6 +309,12 @@ impl PinWindow {
             .title("vellum 钉图")
             .default_width(win_w)
             .default_height(win_h)
+            // A compositor floats a window that declares a fixed size and hands
+            // it exactly that size; a resizable one is tiled at the compositor's
+            // default width instead. Opening fixed is therefore what makes the
+            // first visible frame already the final one — no resize on screen.
+            // Resizing is enabled again in connect_map, once the window is up.
+            .resizable(false)
             .build();
         window.add_css_class("vellum-window");
 
@@ -513,26 +519,22 @@ impl PinWindow {
                 if this.closed.get() {
                     return;
                 }
-                // Moving this window into the floating layer can replace the
-                // size it mapped with, so the pinned size is requested only
-                // after the compositor has been told to float it. Otherwise the
-                // float wins and the pin opens far larger than its image.
+                // The window is on screen at its pinned size by now. Float it
+                // (a fixed-size window usually already is), then let the user
+                // resize it, and re-assert the size as a safety net for a
+                // compositor that floated it at a size of its own choosing.
                 let sized = Rc::clone(&this);
                 crate::own_window::float_own_window_then(move || {
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-                        if sized.closed.get() {
-                            return;
-                        }
-                        let handle = compositor::window_for_pid(std::process::id());
-                        if let Some(handle) = &handle {
-                            // Ask for the size the image actually wants. A
-                            // compositor that refuses is not fatal: the fitted
-                            // view adapts to whatever size the window did get.
-                            let (w, h) = sized.target.get();
-                            let _ = compositor::set_window_size(handle, w, h);
-                        }
-                        *sized.handle.borrow_mut() = handle;
-                    });
+                    if sized.closed.get() {
+                        return;
+                    }
+                    sized.window.set_resizable(true);
+                    let handle = compositor::window_for_pid(std::process::id());
+                    if let Some(handle) = &handle {
+                        let (w, h) = sized.target.get();
+                        let _ = compositor::set_window_size(handle, w, h);
+                    }
+                    *sized.handle.borrow_mut() = handle;
                 });
             });
         });
