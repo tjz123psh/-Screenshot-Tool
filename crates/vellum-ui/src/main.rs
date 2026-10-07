@@ -727,7 +727,7 @@ impl Session {
         }
         if opening::can_reuse(self.long_shot)
             && matches!(action.as_str(), "pin" | "ocr" | "translate")
-            && outcome.cropped.is_some()
+            && let Some(image) = outcome.cropped.as_ref()
         {
             // Keep GTK alive across the window-less gap. The old exclusive
             // overlay must be gone before the result or the next selection.
@@ -742,7 +742,6 @@ impl Session {
             FINISH_ARMED.store(false, Ordering::SeqCst);
             FINISH_PENDING.store(false, Ordering::SeqCst);
             trace::mark("selection-overlay-closed");
-            let image = outcome.cropped.as_ref().expect("checked crop");
             let window = if action == "pin" {
                 pin::open_in_process(app, std::sync::Arc::new(image.clone()))
             } else {
