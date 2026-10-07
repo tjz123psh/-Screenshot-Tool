@@ -2,6 +2,11 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.9]
+
+- Convert a pinned image to drawing pixels on a worker thread. Turning a 19-megapixel long screenshot into a cairo surface took over 100 ms on the interface thread — measured 113 ms from Ctrl+P to the window appearing, against 18 ms for a small image — and that freeze was the real "it stalls, then it appears". The window is on screen immediately now, and the pixels land as soon as they are ready.
+- Split the RGB→BGRA conversion out of the surface so it can run off the interface thread.
+
 ## [0.2.8]
 
 - Open a pin inside the image viewer's own process. Starting another GTK application cost about 390 ms regardless of image size (measured 391 ms for a 500×300 image and 452 ms for 1600×4000), and that was the stall between pressing 钉图 and seeing the image. The viewer already has a toolkit running, so its pin now appears right away.

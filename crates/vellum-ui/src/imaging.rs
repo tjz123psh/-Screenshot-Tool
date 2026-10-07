@@ -23,14 +23,27 @@ pub fn to_surface_rows(image: &Rgb8, start: usize, end: usize) -> Result<ImageSu
         start < end && end <= image.height,
         "invalid surface row range"
     );
-    let width = i32::try_from(image.width).context("surface width exceeds i32")?;
-    let height = i32::try_from(end - start).context("surface height exceeds i32")?;
+    let (bytes, stride) = argb32_bytes(image, start, end)?;
+    surface_from_bytes(bytes, image.width, end - start, stride)
+}
+
+/// Convert opaque RGB rows into cairo's premultiplied BGRA layout.
+///
+/// Split out from the surface so the per-pixel work can run on a worker thread:
+/// a long screenshot takes tens of milliseconds to convert, and doing that on the
+/// interface thread freezes the window that was just opened.
+pub fn argb32_bytes(image: &Rgb8, start: usize, end: usize) -> Result<(Vec<u8>, i32)> {
+    anyhow::ensure!(
+        start < end && end <= image.height,
+        "invalid surface row range"
+    );
     let stride = Format::ARgb32
         .stride_for_width(image.width as u32)
         .map_err(|err| anyhow::anyhow!("cairo rejected width {}: {err}", image.width))?;
+    let height = end - start;
 
-    let mut data = vec![0u8; stride as usize * height as usize];
-    for y in 0..height as usize {
+    let mut data = vec![0u8; stride as usize * height];
+    for y in 0..height {
         let src = image.row(start + y);
         let dst = &mut data[y * stride as usize..][..image.width * 4];
         for (pixel, out) in src
@@ -47,7 +60,19 @@ pub fn to_surface_rows(image: &Rgb8, start: usize, end: usize) -> Result<ImageSu
         }
     }
 
-    ImageSurface::create_for_data(data, Format::ARgb32, width, height, stride)
+    Ok((data, stride))
+}
+
+/// Build a cairo surface over bytes that argb32_bytes produced.
+pub fn surface_from_bytes(
+    bytes: Vec<u8>,
+    width: usize,
+    height: usize,
+    stride: i32,
+) -> Result<ImageSurface> {
+    let width = i32::try_from(width).context("surface width exceeds i32")?;
+    let height = i32::try_from(height).context("surface height exceeds i32")?;
+    ImageSurface::create_for_data(bytes, Format::ARgb32, width, height, stride)
         .context("failed to create cairo surface")
 }
 

@@ -17,7 +17,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use cairo::{Filter, ImageSurface};
 use gtk4::gdk::ModifierType;
@@ -53,7 +53,9 @@ const TOAST_MS: u32 = 1600;
 const SAVE_PREFIX: &str = "vellum-pin";
 
 struct View {
-    surface: ImageSurface,
+    /// None until the worker finishes converting the pixels. The window is shown
+    /// before that happens, so a long screenshot never freezes the interface.
+    surface: Option<ImageSurface>,
     image: Arc<Rgb8>,
     scale: f64,
     offset: (f64, f64),
@@ -357,10 +359,9 @@ impl PinWindow {
         overlay.add_overlay(&io_status);
         window.set_child(Some(&overlay));
 
-        let surface = imaging::to_surface(&image)?;
         let mut view = View {
-            surface,
-            image,
+            surface: None,
+            image: Arc::clone(&image),
             scale: 1.0,
             offset: (0.0, 0.0),
             win: (win_w, win_h),
@@ -404,6 +405,45 @@ impl PinWindow {
             }
             LIVE.with(|live| live.borrow_mut().retain(|pin| pin.window != *window));
             glib::Propagation::Proceed
+        });
+        // Convert the pixels on a worker thread. A 19-megapixel long screenshot
+        // takes over 100 ms to turn into a cairo surface, and doing that inside
+        // the click handler freezes the interface for exactly that long — which
+        // is what a stalled "then it appears" pin really was.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(imaging::argb32_bytes(&image, 0, image.height));
+        });
+        let weak = Rc::downgrade(&pin);
+        glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
+            let Some(pin) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            match rx.try_recv() {
+                Ok(Ok((bytes, stride))) => {
+                    let (width, height) = {
+                        let image = pin.view.borrow().image.clone();
+                        (image.width, image.height)
+                    };
+                    match imaging::surface_from_bytes(bytes, width, height, stride) {
+                        Ok(surface) => {
+                            pin.view.borrow_mut().surface = Some(surface);
+                            pin.area.queue_draw();
+                        }
+                        Err(error) => pin.toast(&format!("无法绘制图片：{error}"), true),
+                    }
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    pin.toast(&format!("无法绘制图片：{error}"), true);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pin.toast("图片转换未完成", true);
+                    glib::ControlFlow::Break
+                }
+            }
         });
         Ok(pin)
     }
@@ -784,20 +824,23 @@ fn draw(cr: &cairo::Context, view: &View, width: i32, height: i32) {
     }
     let _ = cr.fill();
 
-    let _ = cr.save();
-    cr.translate(view.offset.0, view.offset.1);
-    cr.scale(view.scale, view.scale);
-    if cr.set_source_surface(&view.surface, 0.0, 0.0).is_ok() {
-        // Enlarged screenshots should show honest pixels rather than a blurred
-        // guess, so past 3x the filter switches to nearest neighbour.
-        cr.source().set_filter(if view.scale >= NEAREST_ABOVE {
-            Filter::Nearest
-        } else {
-            Filter::Good
-        });
+    // Nothing to draw until the worker hands over the converted pixels.
+    if let Some(surface) = view.surface.as_ref() {
+        let _ = cr.save();
+        cr.translate(view.offset.0, view.offset.1);
+        cr.scale(view.scale, view.scale);
+        if cr.set_source_surface(surface, 0.0, 0.0).is_ok() {
+            // Enlarged screenshots should show honest pixels rather than a blurred
+            // guess, so past 3x the filter switches to nearest neighbour.
+            cr.source().set_filter(if view.scale >= NEAREST_ABOVE {
+                Filter::Nearest
+            } else {
+                Filter::Good
+            });
+            let _ = cr.paint();
+        }
+        let _ = cr.restore();
     }
-    let _ = cr.paint();
-    let _ = cr.restore();
 
     // The shipped window rules strip the compositor border here, so the pin draws
     // its own hairline to separate itself from whatever is behind it.
@@ -847,7 +890,7 @@ mod tests {
     /// A view whose framing follows its window, as a freshly opened pin has.
     fn test_view(pixels: Rgb8, win: (i32, i32)) -> View {
         let mut view = View {
-            surface: ImageSurface::create(cairo::Format::ARgb32, 10, 10).unwrap(),
+            surface: Some(ImageSurface::create(cairo::Format::ARgb32, 10, 10).unwrap()),
             image: Arc::new(pixels),
             scale: 1.0,
             offset: (0.0, 0.0),
