@@ -238,7 +238,9 @@ pub fn present(
 
 /// The single exit path out of an overlay session.
 struct Emitter {
-    window: ApplicationWindow,
+    // Controllers own the emitter. A strong window here would retain the
+    // entire captured desktop after destroy when a result keeps GTK alive.
+    window: glib::WeakRef<ApplicationWindow>,
     state: Rc<RefCell<State>>,
     handler: ResultHandler,
 }
@@ -250,7 +252,7 @@ impl Emitter {
         handler: ResultHandler,
     ) -> Rc<Self> {
         Rc::new(Self {
-            window,
+            window: window.downgrade(),
             state,
             handler,
         })
@@ -289,6 +291,15 @@ impl Emitter {
 
     /// Runs a toolbar action, cropping first when the action consumes pixels.
     fn invoke(&self, action: &str) {
+        if self.state.borrow().finished {
+            return;
+        }
+        crate::trace::mark(match action {
+            "pin" => "toolbar-pin-pressed",
+            "ocr" => "toolbar-ocr-pressed",
+            "translate" => "toolbar-translate-pressed",
+            _ => "toolbar-action-pressed",
+        });
         let (rect, cropped, document) = {
             let mut state = self.state.borrow_mut();
             let rect = state.selector.rect;
@@ -330,7 +341,9 @@ impl Emitter {
     }
 
     fn queue_draw(&self) {
-        if let Some(child) = self.window.child() {
+        if let Some(window) = self.window.upgrade()
+            && let Some(child) = window.child()
+        {
             child.queue_draw();
         }
     }
@@ -688,9 +701,8 @@ fn connect_keys(
     // is visible before it is committed.
     let preedit_state = state.clone();
     let preedit_emitter = emitter.clone();
-    let preedit_im = im.clone();
-    im.context.connect_preedit_changed(move |_| {
-        let (text, _, _) = preedit_im.context.preedit_string();
+    im.context.connect_preedit_changed(move |context| {
+        let (text, _, _) = context.preedit_string();
         preedit_state.borrow_mut().annotator.set_preedit(&text);
         preedit_emitter.queue_draw();
     });
@@ -703,10 +715,10 @@ fn connect_keys(
         commit_emitter.queue_draw();
     });
 
-    let key_im = im.clone();
+    let key_im = Rc::downgrade(im);
     let key_state = state.clone();
     let key_emitter = emitter.clone();
-    let key_canvas = canvas.clone();
+    let key_canvas = canvas.downgrade();
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let mut action: Option<String> = None;
         let handled;
@@ -725,8 +737,12 @@ fn connect_keys(
         // Committing a label or leaving annotate mode ends text entry, and the
         // input method has to be told or it stays attached and composes into
         // nothing.
-        key_im.sync(&key_state);
-        key_canvas.queue_draw();
+        if let Some(im) = key_im.upgrade() {
+            im.sync(&key_state);
+        }
+        if let Some(canvas) = key_canvas.upgrade() {
+            canvas.queue_draw();
+        }
         if handled {
             glib::Propagation::Stop
         } else {
@@ -1048,9 +1064,13 @@ fn connect_focus(window: &ApplicationWindow, state: &Rc<RefCell<State>>, emitter
 
 /// Starts the idle watchdog described in the module docs.
 fn install_watchdog(state: &Rc<RefCell<State>>, emitter: &Rc<Emitter>) {
-    let tick_state = state.clone();
-    let tick_emitter = emitter.clone();
+    let tick_state = Rc::downgrade(state);
+    let tick_emitter = Rc::downgrade(emitter);
     glib::timeout_add_seconds_local(IDLE_POLL_S, move || {
+        let (Some(tick_state), Some(tick_emitter)) = (tick_state.upgrade(), tick_emitter.upgrade())
+        else {
+            return glib::ControlFlow::Break;
+        };
         let expired = {
             let state = tick_state.borrow();
             if state.finished {

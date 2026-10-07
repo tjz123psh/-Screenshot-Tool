@@ -26,6 +26,7 @@ mod handoff;
 mod highlight;
 mod imaging;
 mod model_picker;
+mod opening;
 mod own_window;
 mod paint;
 mod panel;
@@ -169,6 +170,7 @@ fn main() -> std::process::ExitCode {
     }
     // Must run before GTK initialises: without a reachable display every later
     // step fails with the same warning the user was seeing.
+    opening::init();
     recover_display_environment();
     // The daemon can signal a freshly spawned long-shot process before GTK has
     // activated. Install the handler before any startup work so an early second
@@ -573,6 +575,7 @@ struct Session {
     /// Set when the finish signal arrives before the recorder exists, i.e.
     /// inside the 250 ms gap between closing the overlay and starting capture.
     finish_requested: Cell<bool>,
+    finish_poll: RefCell<Option<glib::SourceId>>,
 }
 
 impl Session {
@@ -594,6 +597,7 @@ impl Session {
             exit_code: Cell::new(0),
             recorder: RefCell::new(None),
             finish_requested: Cell::new(false),
+            finish_poll: RefCell::new(None),
         }
     }
 
@@ -661,7 +665,7 @@ impl Session {
     /// confirmation; a press while selecting is deliberately ignored.
     fn install_finish_poll(self: &Rc<Self>) {
         let session = self.clone();
-        glib::timeout_add_local(FINISH_POLL, move || {
+        let source = glib::timeout_add_local(FINISH_POLL, move || {
             if FINISH_PENDING.swap(false, Ordering::SeqCst) {
                 let target = if session.recorder.borrow().is_some() {
                     "active_recorder"
@@ -683,9 +687,10 @@ impl Session {
             }
             glib::ControlFlow::Continue
         });
+        *self.finish_poll.borrow_mut() = Some(source);
     }
 
-    fn on_result(self: &Rc<Self>, app: &gtk4::Application, outcome: Outcome) {
+    fn on_result(self: &Rc<Self>, app: &gtk4::Application, mut outcome: Outcome) {
         let action = if outcome.action == "confirm" && self.long_shot {
             // In long-shot mode a plain confirm means "record this region".
             "long".to_string()
@@ -719,6 +724,57 @@ impl Session {
                     }),
                 )],
             );
+        }
+        if opening::can_reuse(self.long_shot)
+            && matches!(action.as_str(), "pin" | "ocr" | "translate")
+            && outcome.cropped.is_some()
+        {
+            // Keep GTK alive across the window-less gap. The old exclusive
+            // overlay must be gone before the result or the next selection.
+            let _hold = app.hold();
+            for window in app.windows() {
+                window.destroy();
+            }
+            self.background.borrow_mut().take();
+            if let Some(source) = self.finish_poll.borrow_mut().take() {
+                source.remove();
+            }
+            FINISH_ARMED.store(false, Ordering::SeqCst);
+            FINISH_PENDING.store(false, Ordering::SeqCst);
+            trace::mark("selection-overlay-closed");
+            let image = outcome.cropped.as_ref().expect("checked crop");
+            let window = if action == "pin" {
+                pin::open_in_process(app, std::sync::Arc::new(image.clone()))
+            } else {
+                let document = outcome
+                    .document
+                    .take()
+                    .map(Ok)
+                    .unwrap_or_else(|| document::Document::from_raster(image.clone()));
+                document.map(|document| {
+                    result::open_captured_document(
+                        app,
+                        Rc::new(RefCell::new(document)),
+                        action == "translate",
+                    )
+                })
+            };
+            match window {
+                Ok(window) => {
+                    // The result owns the data. Release only after it has painted;
+                    // a still-open result must not keep the daemon Busy.
+                    opening::after_first_frame(&window, || {
+                        trace::mark("toolbar-result-first-frame");
+                        opening::release_capture();
+                    });
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("[vellum] 无法在当前进程建立结果窗口，改用可恢复交接");
+                    // The original crop is still owned below. Keep the existing
+                    // durable handoff / memory recovery path on failure.
+                }
+            }
         }
         self.exit_code
             .set(self.handle(outcome.cropped, &action, outcome.document));

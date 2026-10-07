@@ -1296,7 +1296,7 @@ impl Viewer {
             };
             let image = Arc::clone(&self.image.borrow());
             match crate::pin::open_in_process(&app, image) {
-                Ok(()) => {
+                Ok(_) => {
                     self.update_output(false, true, ExportState::Done);
                     self.status.set_text("已打开钉图");
                 }

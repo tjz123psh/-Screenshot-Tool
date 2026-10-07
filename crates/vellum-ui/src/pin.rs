@@ -454,6 +454,7 @@ impl PinWindow {
     }
 
     fn connect_draw(self: &Rc<Self>) {
+        let first_image = Cell::new(false);
         let this = Rc::clone(self);
         self.area.set_draw_func(move |_, cr, width, height| {
             {
@@ -465,6 +466,11 @@ impl PinWindow {
             }
             let view = this.view.borrow();
             draw(cr, &view, width, height);
+            if view.surface.is_some() && !first_image.replace(true) {
+                crate::opening::after_first_frame(&this.window, || {
+                    crate::trace::mark("pin-image-first-frame");
+                });
+            }
         });
     }
 
@@ -755,11 +761,14 @@ thread_local! { static LIVE: RefCell<Vec<Rc<PinWindow>>> = const { RefCell::new(
 /// already a live GTK process, so its pin is created here instead. The pinned
 /// window holds itself open, and the viewer's process therefore keeps running
 /// until every window it owns — pinned or not — is closed.
-pub(crate) fn open_in_process(app: &Application, image: Arc<Rgb8>) -> Result<(), String> {
+pub(crate) fn open_in_process(
+    app: &Application,
+    image: Arc<Rgb8>,
+) -> Result<ApplicationWindow, String> {
     let pin = PinWindow::new(app, image).map_err(|error| error.to_string())?;
     LIVE.with(|live| live.borrow_mut().push(Rc::clone(&pin)));
     pin.present();
-    Ok(())
+    Ok(pin.window.clone())
 }
 
 fn build_menu() -> gio::Menu {

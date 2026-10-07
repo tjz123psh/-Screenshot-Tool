@@ -16,6 +16,47 @@ fn arranged(width: i32, height: i32, rect: Rect) -> State {
 }
 
 #[test]
+fn closing_overlay_releases_full_screen_and_input_method_while_result_stays_alive() {
+    let ran = crate::test_support::with_gtk(|| {
+        let app = Application::builder()
+            .application_id("ai.vellum.overlay-release-test")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+        let result = ApplicationWindow::builder().application(&app).build();
+        let window = ApplicationWindow::builder().application(&app).build();
+        let state = Rc::new(RefCell::new(tests::overlay_state(true)));
+        let canvas = DrawingArea::new();
+        window.set_child(Some(&canvas));
+        let emitter = Emitter::new(window.clone(), state.clone(), Rc::new(|_| {}));
+        let keys = EventControllerKey::new();
+        let im = Rc::new(Im::new(keys.clone()));
+        im.context.set_client_widget(Some(&canvas));
+        connect_pointer(&canvas, &state, &emitter, &im);
+        connect_scroll(&canvas, &state, &emitter);
+        connect_keys(&window, &canvas, &state, &emitter, &keys, &im);
+        connect_focus(&window, &state, &emitter);
+        install_draw(&canvas, &state);
+        install_watchdog(&state, &emitter);
+        let old_state = Rc::downgrade(&state);
+        let old_im = Rc::downgrade(&im);
+        emitter.cancel();
+        window.destroy();
+        drop((window, canvas, state, emitter, keys, im));
+        assert!(old_im.upgrade().is_none(), "input-method ownership cycle");
+        assert!(
+            old_state.upgrade().is_none(),
+            "full desktop remains retained"
+        );
+        assert!(app.windows().contains(&result.clone().upcast()));
+        result.destroy();
+    });
+    if !ran {
+        eprintln!("GTK unavailable: overlay disposal not exercised");
+    }
+}
+
+#[test]
 fn editable_capture_retains_only_selected_pixels_and_visible_cover() {
     let mut state = arranged(640, 360, Rect::new(10, 12, 35, 25));
     let mut frame = Rgb8::new(640, 360);

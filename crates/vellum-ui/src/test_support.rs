@@ -50,6 +50,10 @@ pub fn with_gtk(body: impl FnOnce() + Send + 'static) -> bool {
     });
 
     let Some(worker) = worker else {
+        assert!(
+            std::env::var_os("VELLUM_REQUIRE_GTK_TESTS").is_none(),
+            "GTK was required for this explicit native test run"
+        );
         return false;
     };
     let (done_tx, done_rx) = mpsc::sync_channel::<Option<Box<dyn std::any::Any + Send>>>(1);

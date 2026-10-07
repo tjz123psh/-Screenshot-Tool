@@ -655,6 +655,18 @@ impl ResultWindow {
         });
     }
 
+    fn recognize_after_first_frame(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        crate::opening::after_first_frame(&self.window, move || {
+            crate::trace::mark("text-window-first-frame");
+            glib::idle_add_local_once(move || {
+                if let Some(window) = weak.upgrade().filter(|window| !window.closed.get()) {
+                    window.recognize();
+                }
+            });
+        });
+    }
+
     fn present(self: &Rc<Self>) {
         self.window.present();
         theme::snapshot_for_review(&self.window);
@@ -1135,8 +1147,8 @@ pub fn open_document(app: &Application, document: SharedDocument, translate: boo
         return;
     }
     let window = document_window(app, document, translate, ResultRoute::SharedImage);
+    window.recognize_after_first_frame();
     window.present();
-    window.recognize();
 }
 
 fn document_window(
@@ -1166,6 +1178,19 @@ fn document_window(
     )
 }
 
+/// A toolbar result in the capture's already running GTK application. Keep the
+/// standalone close semantics and never consume a process handoff receipt.
+pub(crate) fn open_captured_document(
+    app: &Application,
+    document: SharedDocument,
+    translate: bool,
+) -> ApplicationWindow {
+    let result = document_window(app, document, translate, ResultRoute::StandaloneText);
+    result.recognize_after_first_frame();
+    result.present();
+    result.window.clone()
+}
+
 /// Initial standalone entrypoint. Only this first window acknowledges the
 /// process handoff; additional same-session windows must never consume it.
 pub fn run_document(document: SharedDocument, translate: bool) -> i32 {
@@ -1177,8 +1202,8 @@ pub fn run_document(document: SharedDocument, translate: bool) -> i32 {
         };
         let window = document_window(app, document, translate, ResultRoute::StandaloneText);
         crate::handoff::connect_ready(&window.window);
+        window.recognize_after_first_frame();
         window.present();
-        window.recognize();
     });
     run(&app)
 }

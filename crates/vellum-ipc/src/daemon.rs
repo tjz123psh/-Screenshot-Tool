@@ -49,6 +49,7 @@ const TRANSIENT_ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::f
 
 struct Active {
     child: Child,
+    release: Option<vellum_core::capture_lifecycle::Receiver>,
     action: Action,
     trace: LongshotTrace,
 }
@@ -248,7 +249,7 @@ impl Service {
         let trace = trace_session
             .map(|session| LongshotTrace::with_session("daemon", session))
             .unwrap_or_default();
-        let child = match self.spawn_action(action, &child_args) {
+        let (child, release) = match self.spawn_action(action, &child_args) {
             Ok(child) => child,
             Err(err) => {
                 self.log
@@ -277,6 +278,7 @@ impl Service {
         if action.is_exclusive() {
             inner.active = Some(Active {
                 child,
+                release,
                 action,
                 trace,
             });
@@ -404,7 +406,11 @@ impl Service {
         resolved
     }
 
-    fn spawn_action(&self, action: Action, args: &[String]) -> std::io::Result<Child> {
+    fn spawn_action(
+        &self,
+        action: Action,
+        args: &[String],
+    ) -> std::io::Result<(Child, Option<vellum_core::capture_lifecycle::Receiver>)> {
         if let Some(parent) = self.log.path().parent() {
             let _ = create_private_dir(parent);
         }
@@ -441,7 +447,19 @@ impl Service {
                 Ok(())
             });
         }
+        // Only ordinary selections may become same-process result windows.
+        // Long-shot finish, cursor cleanup and delivery keep their existing contract.
+        command.env_remove(vellum_core::capture_lifecycle::ENV);
+        let channel = if action == Action::Region {
+            vellum_core::capture_lifecycle::channel().ok()
+        } else {
+            None
+        };
+        if let Some((_, sender)) = &channel {
+            sender.configure_child(&mut command);
+        }
         let mut child = command.spawn()?;
+        let release = channel.map(|(receiver, _sender)| receiver);
 
         // Never hand children a raw append fd for service.log: those writes skip
         // Log's 512 KiB rotation check. Dedicated readers preserve panic output
@@ -460,7 +478,7 @@ impl Service {
             let _ = child.wait();
             return Err(error);
         }
-        Ok(child)
+        Ok((child, release))
     }
 
     /// Poll the tracked child so `status` stays accurate and abnormal exits get
@@ -474,6 +492,36 @@ impl Service {
     /// Caller holds `lifecycle`, so completion cleanup cannot be overtaken by a
     /// newer launch or by shutdown.
     fn reap_finished_locked(&self) {
+        // A selector can relinquish its exclusive role while GTK stays alive
+        // for Pin/OCR. This receiver belongs to exactly this Active, so an old
+        // result can never release a newer screenshot. Check before try_wait:
+        // a result closing immediately after release is still a result exit.
+        let released = {
+            let mut inner = self.lock();
+            if inner.active.as_ref().is_some_and(|active| {
+                active.action == Action::Region
+                    && active
+                        .release
+                        .as_ref()
+                        .is_some_and(|release| release.released())
+            }) {
+                let active = inner.active.take();
+                set_event(&mut inner, "区域截图已完成，结果窗口已打开".into());
+                active
+            } else {
+                None
+            }
+        };
+        if let Some(mut active) = released {
+            let log = Arc::clone(&self.log);
+            // Do not call finish_action: a later result exit must not overwrite
+            // the next capture event or restore a new long-shot cursor.
+            std::thread::spawn(move || {
+                let pid = active.child.id();
+                let status = active.child.wait();
+                log.info(format!("result child={pid} exited status={status:?}"));
+            });
+        }
         let finished = {
             let mut inner = self.lock();
             match inner.active.as_mut() {
@@ -499,6 +547,7 @@ impl Service {
     /// orphaned over the screen and no zombie remains under the daemon.
     pub fn stop(&self) {
         let _lifecycle = self.lock_lifecycle();
+        self.reap_finished_locked();
         self.running.store(false, Ordering::SeqCst);
         let active = {
             let mut inner = self.lock();
@@ -909,6 +958,73 @@ mod tests {
         service.stop();
     }
 
+    fn release_active_for_test(service: &Service) {
+        let (receiver, sender) = vellum_core::capture_lifecycle::channel().unwrap();
+        service.lock().active.as_mut().unwrap().release = Some(receiver);
+        sender.release().unwrap();
+    }
+
+    fn wait_until_reaped(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {pid} was not reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_live_result_releases_busy_and_its_exit_cannot_change_the_next_capture() {
+        let service = busy_service("result-release");
+        let first = service.launch(Action::Region, &[]).pid.unwrap();
+        assert_eq!(service.snapshot().state, Some(State::Busy));
+        release_active_for_test(&service);
+        // Launch must drain the capability itself, not wait for the poll timer.
+        let second = service.launch(Action::Long, &[]);
+        assert!(second.accepted);
+        assert_ne!(second.pid, Some(first));
+        let before = service.snapshot();
+        assert_eq!(before.action_pid, second.pid);
+        assert!(signal_child(first, libc::SIGKILL));
+        wait_until_reaped(first);
+        let after = service.snapshot();
+        assert_eq!(after.action_pid, before.action_pid);
+        assert_eq!(after.state, Some(State::Busy));
+        assert_eq!(after.last_event, before.last_event);
+        service.stop();
+    }
+
+    #[test]
+    fn ipc_stop_preserves_a_released_result_and_only_stops_capture() {
+        let service = busy_service("result-stop");
+        let first = service.launch(Action::Region, &[]).pid.unwrap();
+        release_active_for_test(&service);
+        // No intervening status/poll: stop must recognize the pending release.
+        service.stop();
+        assert!(std::path::Path::new(&format!("/proc/{first}")).exists());
+        assert_eq!(service.snapshot().state, Some(State::Stopped));
+        assert!(signal_child(first, libc::SIGKILL));
+        wait_until_reaped(first);
+    }
+
+    #[test]
+    fn eof_never_releases_busy_and_long_capture_ignores_result_capabilities() {
+        let service = busy_service("result-invalid");
+        service.launch(Action::Region, &[]);
+        let (receiver, sender) = vellum_core::capture_lifecycle::channel().unwrap();
+        service.lock().active.as_mut().unwrap().release = Some(receiver);
+        drop(sender);
+        assert!(service.launch(Action::Region, &[]).busy);
+        service.stop();
+        let service = busy_service("long-result-invalid");
+        service.launch(Action::Long, &[]);
+        release_active_for_test(&service);
+        assert!(service.launch(Action::Region, &[]).busy);
+        service.stop();
+    }
+
     #[test]
     fn pin_last_is_not_exclusive() {
         let service = busy_service("pin");
@@ -1056,7 +1172,7 @@ mod tests {
         let service =
             Service::new(log, PathBuf::from("/bin/sh")).with_test_prefix_args(&["-c", &script]);
 
-        let mut child = service.spawn_action(Action::Region, &[]).unwrap();
+        let (mut child, _release) = service.spawn_action(Action::Region, &[]).unwrap();
         assert!(child.wait().unwrap().success());
 
         let mut backup_name = OsString::from_vec(path.as_os_str().as_encoded_bytes().to_vec());

@@ -7,6 +7,7 @@
 pub mod autostart;
 pub mod build_info;
 pub mod capture;
+pub mod capture_lifecycle;
 pub mod compositor;
 pub mod config;
 pub mod geom;
