@@ -128,6 +128,10 @@ pub struct PinWindow {
     area: DrawingArea,
     view: RefCell<View>,
     menu: PopoverMenu,
+    /// Size this pin asked the compositor for. Kept separate from `view.win`,
+    /// which tracks the allocation the window really got: asking for the size
+    /// we already have would leave a too-large floating window untouched.
+    target: Cell<(i32, i32)>,
     /// Compositor handle for this window, learned shortly after mapping.
     /// `None` means "no compositor control", which is a supported degraded
     /// mode: the pin still works, it just cannot float or resize itself.
@@ -359,6 +363,7 @@ impl PinWindow {
             area,
             view: RefCell::new(view),
             menu,
+            target: Cell::new((win_w, win_h)),
             handle: RefCell::new(None),
             closed: Cell::new(false),
             copy_job: RefCell::new(JobState::default()),
@@ -508,16 +513,27 @@ impl PinWindow {
                 if this.closed.get() {
                     return;
                 }
-                crate::own_window::float_own_window_soon();
-                let handle = compositor::window_for_pid(std::process::id());
-                if let Some(handle) = &handle {
-                    // Ask for the size the image actually wants. A compositor
-                    // that refuses it is not fatal: the fitted view then adapts
-                    // to whatever size the window did get.
-                    let (w, h) = this.view.borrow().win;
-                    let _ = compositor::set_window_size(handle, w, h);
-                }
-                *this.handle.borrow_mut() = handle;
+                // Moving this window into the floating layer can replace the
+                // size it mapped with, so the pinned size is requested only
+                // after the compositor has been told to float it. Otherwise the
+                // float wins and the pin opens far larger than its image.
+                let sized = Rc::clone(&this);
+                crate::own_window::float_own_window_then(move || {
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+                        if sized.closed.get() {
+                            return;
+                        }
+                        let handle = compositor::window_for_pid(std::process::id());
+                        if let Some(handle) = &handle {
+                            // Ask for the size the image actually wants. A
+                            // compositor that refuses is not fatal: the fitted
+                            // view adapts to whatever size the window did get.
+                            let (w, h) = sized.target.get();
+                            let _ = compositor::set_window_size(handle, w, h);
+                        }
+                        *sized.handle.borrow_mut() = handle;
+                    });
+                });
             });
         });
     }
@@ -546,6 +562,7 @@ impl PinWindow {
             // An explicit window resize is the user's framing from now on.
             view.fitted = false;
         }
+        self.target.set((new_w, new_h));
 
         let resized = match self.handle.borrow().as_ref() {
             Some(handle) => compositor::set_window_size(handle, new_w, new_h),

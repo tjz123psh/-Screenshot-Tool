@@ -2,6 +2,11 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.6]
+
+- Make a pinned window adopt the size its image needs. The size request now goes out after the compositor has moved the window into the floating layer, because that step replaces the size the window mapped with.
+- Keep the requested size separate from the allocation the window really received, so a pin no longer asks for the size it already has, and Ctrl+scroll resizing still updates the request.
+
 ## [0.2.5]
 
 - Keep a pinned screenshot fitted to the window it actually received. A floating window's size belongs to the compositor, so a small image no longer sits in the top-left corner of a much larger window with the transparency checkerboard filling the rest.

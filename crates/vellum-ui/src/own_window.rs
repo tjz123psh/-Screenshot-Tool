@@ -21,16 +21,30 @@ const ATTEMPTS: u32 = 5;
 ///
 /// Returns immediately; the attempts happen on the main loop.
 pub fn float_own_window_soon() {
-    attempt(ATTEMPTS, None);
+    attempt(ATTEMPTS, None, None);
 }
 
 /// Keep the fixed-size first-map hint so tiling desktops do not move existing
 /// windows. Allow manual resizing only after our own window is floated.
 pub fn float_and_resize(window: &ApplicationWindow) {
-    attempt(ATTEMPTS, Some(window.downgrade()));
+    attempt(ATTEMPTS, Some(window.downgrade()), None);
 }
 
-fn attempt(remaining: u32, resize: Option<glib::WeakRef<ApplicationWindow>>) {
+/// Float this process's window and hand control back once the compositor has
+/// been asked to do it.
+///
+/// Moving a window into the floating layer can replace the size it mapped
+/// with, so a caller that wants a specific size must wait for this callback
+/// instead of requesting one in the same turn.
+pub fn float_own_window_then(after: impl FnOnce() + 'static) {
+    attempt(ATTEMPTS, None, Some(Box::new(after)));
+}
+
+fn attempt(
+    remaining: u32,
+    resize: Option<glib::WeakRef<ApplicationWindow>>,
+    after: Option<Box<dyn FnOnce()>>,
+) {
     if resize
         .as_ref()
         .is_some_and(|window| window.upgrade().is_none())
@@ -41,10 +55,17 @@ fn attempt(remaining: u32, resize: Option<glib::WeakRef<ApplicationWindow>>) {
         if let Some(window) = resize.and_then(|window| window.upgrade()) {
             window.set_resizable(true);
         }
+        if let Some(after) = after {
+            after();
+        }
         return;
     }
     if remaining > 1 {
-        glib::timeout_add_local_once(RETRY, move || attempt(remaining - 1, resize));
+        glib::timeout_add_local_once(RETRY, move || attempt(remaining - 1, resize, after));
+    } else if let Some(after) = after {
+        // Floating failed: another compositor, or none at all. Still hand
+        // control back exactly once so the caller is never left mid-setup.
+        after();
     }
 }
 
