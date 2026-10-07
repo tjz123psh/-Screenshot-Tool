@@ -507,7 +507,11 @@ impl Viewer {
             "将完整图片另存为 PNG（Ctrl+S）",
         );
         save.add_css_class("suggested-action");
-        let pin = button("view-pin-symbolic", "钉图", "将完整图片作为浮动参考图");
+        let pin = button(
+            "view-pin-symbolic",
+            "钉图",
+            "将完整图片作为浮动参考图（Ctrl+P）",
+        );
 
         let session_bar = GtkBox::new(Orientation::Horizontal, 8);
         session_bar.add_css_class("vellum-preview-toolbar");
@@ -882,6 +886,7 @@ impl Viewer {
                 }
                 Key::c | Key::C if ctrl => v.export(None, false),
                 Key::s | Key::S if ctrl => v.save_as(),
+                Key::p | Key::P if ctrl => v.export(None, true),
                 Key::Home => {
                     v.view.borrow_mut().y = 0.0;
                     v.sync();
@@ -1272,6 +1277,36 @@ impl Viewer {
         }
         for button in &self.actions {
             button.set_sensitive(false);
+        }
+        // A pin opens in this process. Spawning another GTK application costs
+        // several hundred milliseconds, which the user sees as a stall between
+        // pressing 钉图 and the image appearing; this viewer is already running
+        // one, and the pinned window keeps it alive until it is closed.
+        if pin && path.is_none() {
+            let restored = || {
+                self.busy.set(false);
+                for button in &self.actions {
+                    button.set_sensitive(true);
+                }
+            };
+            let Some(app) = self.window.application() else {
+                restored();
+                self.status.set_text("无法打开钉图窗口");
+                return;
+            };
+            let image = Arc::clone(&self.image.borrow());
+            match crate::pin::open_in_process(&app, image) {
+                Ok(()) => {
+                    self.update_output(false, true, ExportState::Done);
+                    self.status.set_text("已打开钉图");
+                }
+                Err(error) => {
+                    self.update_output(false, true, ExportState::Failed);
+                    self.status.set_text(&format!("钉图失败：{error}"));
+                }
+            }
+            restored();
+            return;
         }
         self.status.set_text("正在处理完整图片…");
         let image = self.image.borrow().clone();

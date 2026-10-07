@@ -110,6 +110,25 @@ pub(super) fn window_for_pid(pid: u32) -> Option<String> {
     })
 }
 
+/// Finds the most recently mapped window owned by `pid`.
+///
+/// Hyprland lists a newly opened client after the ones already there, so the
+/// last match is the window that was just mapped. This matters when one process
+/// owns several windows: opening a pin from the image viewer puts the pin and
+/// the viewer in the same process.
+pub(super) fn newest_window_for_pid(pid: u32) -> Option<String> {
+    clients()?
+        .iter()
+        .filter(|client| client.get("pid").and_then(Value::as_u64) == Some(u64::from(pid)))
+        .filter_map(|client| {
+            client
+                .get("address")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .next_back()
+}
+
 /// Formats a window selector for the Lua dispatchers.
 fn selector(address: &str) -> String {
     format!("address:{address}")

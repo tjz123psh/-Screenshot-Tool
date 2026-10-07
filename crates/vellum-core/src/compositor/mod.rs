@@ -126,6 +126,20 @@ pub fn window_for_pid(pid: u32) -> Option<Window> {
     }
 }
 
+/// Finds the newest window owned by `pid`.
+///
+/// Prefer this to [`window_for_pid`] whenever the process may own more than one
+/// window: opening a pin from the image viewer puts the pin and the viewer in
+/// the same process, and acting on the viewer by mistake would resize the very
+/// window the user is reading.
+pub fn newest_window_for_pid(pid: u32) -> Option<Window> {
+    match detect() {
+        Compositor::Niri => niri::newest_window_for_pid(pid).map(Window::Niri),
+        Compositor::Hyprland => hyprland::newest_window_for_pid(pid).map(Window::Hyprland),
+        Compositor::Unknown => None,
+    }
+}
+
 /// Moves a specific window to the floating layer.
 ///
 /// Both compositors tile by default, and a tiled pin window is no longer a
@@ -138,7 +152,7 @@ pub fn float(window: &Window) -> bool {
     }
 }
 
-/// Moves this process's own window to the floating layer.
+/// Moves the newest window this process owns to the floating layer.
 ///
 /// Single-shot: the caller retries on its own main loop, because a window that
 /// was just mapped may not be in the compositor's client list yet, and sleeping
@@ -151,7 +165,10 @@ pub fn float(window: &Window) -> bool {
 /// identify its window keeps the tiled position instead, which is a cosmetic
 /// loss rather than a side effect on somebody else's window.
 pub fn float_own_window(pid: u32) -> bool {
-    window_for_pid(pid).is_some_and(|window| float(&window))
+    // The newest window is the one the caller just mapped. A process with a
+    // viewer open may already own older windows, and moving one of those would
+    // touch a window the user is not opening right now.
+    newest_window_for_pid(pid).is_some_and(|window| float(&window))
 }
 
 /// Reads a window's current size in logical pixels.

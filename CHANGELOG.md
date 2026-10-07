@@ -2,6 +2,12 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.8]
+
+- Open a pin inside the image viewer's own process. Starting another GTK application cost about 390 ms regardless of image size (measured 391 ms for a 500×300 image and 452 ms for 1600×4000), and that was the stall between pressing 钉图 and seeing the image. The viewer already has a toolkit running, so its pin now appears right away.
+- Look up the newest window a process owns before moving or resizing it. The viewer and the pins opened from it now share one process, and acting on the older window by mistake would resize the very window being read.
+- Add Ctrl+P in the viewer for pinning, and mention it in the toolbar tooltip.
+
 ## [0.2.7]
 
 - Open the pin window already at its final size. The compositor floats a window that declares a fixed size and hands it exactly the requested size, but tiles a resizable one at its own default width; the pin therefore opens fixed and only becomes resizable once it is on screen. Nothing visibly grows, shrinks or jumps on the first frame.

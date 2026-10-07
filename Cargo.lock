@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-cli"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-ipc"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "chrono",
  "libc",
@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-stitch"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "flate2",
  "rayon",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-text"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "image",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-tray"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "ksni",
  "libc",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "vellum-ui"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "cairo-rs",

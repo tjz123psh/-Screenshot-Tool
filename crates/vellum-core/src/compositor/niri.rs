@@ -90,6 +90,20 @@ pub(super) fn window_for_pid(pid: u32) -> Option<u64> {
     })
 }
 
+/// Finds the most recently mapped window owned by `pid`.
+///
+/// niri window ids increase, so the largest matching id is the window that was
+/// just mapped. This matters when one process owns several windows: opening a
+/// pin from the image viewer puts the pin and the viewer in the same process,
+/// and acting on the viewer by mistake would resize the window being read.
+pub(super) fn newest_window_for_pid(pid: u32) -> Option<u64> {
+    windows()?
+        .iter()
+        .filter(|window| window.get("pid").and_then(Value::as_u64) == Some(u64::from(pid)))
+        .filter_map(|window| window.get("id").and_then(Value::as_u64))
+        .max()
+}
+
 /// Moves one window to the floating layer.
 pub(super) fn float(id: u64) -> bool {
     if request(&json!({"Action": {"MoveWindowToFloating": {"id": id}}})).is_some() {

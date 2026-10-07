@@ -159,8 +159,13 @@ pub fn run(image: Rgb8) -> i32 {
         let Some(image) = image.borrow_mut().take() else {
             return;
         };
-        match PinWindow::new(app, image) {
-            Ok(pin) => pin.present(),
+        match PinWindow::new(app, Arc::new(image)) {
+            Ok(pin) => {
+                pin.present();
+                // A process that was spawned for this image owns the handoff
+                // receipt; a pin opened inside a live viewer must not claim it.
+                crate::handoff::connect_ready(&pin.window);
+            }
             Err(err) => {
                 activation_failed.set(true);
                 crate::handoff::reject_current("window");
@@ -281,10 +286,13 @@ fn read_clipboard(
             let result = result
                 .map_err(|error| error.to_string())
                 .and_then(|result| result.map_err(|error| error.to_string()))
-                .and_then(|image| PinWindow::new(&app, image).map_err(|error| error.to_string()));
+                .and_then(|image| {
+                    PinWindow::new(&app, Arc::new(image)).map_err(|error| error.to_string())
+                });
             match result {
                 Ok(pin) => {
                     pin.present();
+                    crate::handoff::connect_ready(&pin.window);
                     succeeded.set(true);
                     window.close();
                 }
@@ -299,7 +307,7 @@ fn read_clipboard(
 }
 
 impl PinWindow {
-    fn new(app: &Application, image: Rgb8) -> anyhow::Result<Rc<Self>> {
+    fn new(app: &Application, image: Arc<Rgb8>) -> anyhow::Result<Rc<Self>> {
         theme::install_default();
 
         let (win_w, win_h) = initial_window_size(&image);
@@ -352,7 +360,7 @@ impl PinWindow {
         let surface = imaging::to_surface(&image)?;
         let mut view = View {
             surface,
-            image: Arc::new(image),
+            image,
             scale: 1.0,
             offset: (0.0, 0.0),
             win: (win_w, win_h),
@@ -385,7 +393,7 @@ impl PinWindow {
         pin.connect_menu();
         pin.connect_map();
         let weak = Rc::downgrade(&pin);
-        pin.window.connect_close_request(move |_| {
+        pin.window.connect_close_request(move |window| {
             if let Some(pin) = weak.upgrade() {
                 pin.closed.set(true);
                 pin.copy_job.borrow_mut().close();
@@ -394,9 +402,9 @@ impl PinWindow {
                     source.remove();
                 }
             }
+            LIVE.with(|live| live.borrow_mut().retain(|pin| pin.window != *window));
             glib::Propagation::Proceed
         });
-        crate::handoff::connect_ready(&pin.window);
         Ok(pin)
     }
 
@@ -511,11 +519,13 @@ impl PinWindow {
             // moved to the floating layer or looked up by pid.
             let this = Rc::clone(&this);
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
-                // Look the window up by pid rather than acting on "the focused
-                // window": between mapping and this callback the user may have
-                // focused something else, and floating their window instead
-                // would be a visible, confusing side effect. Retried on the main
-                // loop because the compositor's client list can lag the map.
+                // Look this window up by pid and take the newest match rather
+                // than acting on "the focused window": between mapping and this
+                // callback the user may have focused something else, and floating
+                // their window instead would be a visible, confusing side
+                // effect. The newest match is this pin even when the process
+                // already owns an older viewer window. Retried on the main loop
+                // because the compositor's client list can lag the map.
                 if this.closed.get() {
                     return;
                 }
@@ -529,7 +539,7 @@ impl PinWindow {
                         return;
                     }
                     sized.window.set_resizable(true);
-                    let handle = compositor::window_for_pid(std::process::id());
+                    let handle = compositor::newest_window_for_pid(std::process::id());
                     if let Some(handle) = &handle {
                         let (w, h) = sized.target.get();
                         let _ = compositor::set_window_size(handle, w, h);
@@ -694,6 +704,22 @@ impl PinWindow {
         self.view.borrow_mut().toast_source = Some(source);
         self.area.queue_draw();
     }
+}
+
+thread_local! { static LIVE: RefCell<Vec<Rc<PinWindow>>> = const { RefCell::new(Vec::new()) }; }
+
+/// Open a pin inside an already running viewer process.
+///
+/// Starting another GTK application costs several hundred milliseconds, which is
+/// exactly the pause between pressing 钉图 and seeing the image. A viewer is
+/// already a live GTK process, so its pin is created here instead. The pinned
+/// window holds itself open, and the viewer's process therefore keeps running
+/// until every window it owns — pinned or not — is closed.
+pub(crate) fn open_in_process(app: &Application, image: Arc<Rgb8>) -> Result<(), String> {
+    let pin = PinWindow::new(app, image).map_err(|error| error.to_string())?;
+    LIVE.with(|live| live.borrow_mut().push(Rc::clone(&pin)));
+    pin.present();
+    Ok(())
 }
 
 fn build_menu() -> gio::Menu {
