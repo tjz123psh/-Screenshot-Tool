@@ -102,9 +102,9 @@ jobs:
           GSK_RENDERER: cairo
           VELLUM_REQUIRE_GTK_TESTS: "1"
         run: |
-          xvfb-run -a cargo test --locked -p vellum-ui first_frame_work_runs_once_after_paint_not_during_present -- --test-threads=1
-          xvfb-run -a cargo test --locked -p vellum-ui closing_overlay_releases_full_screen_and_input_method_while_result_stays_alive -- --test-threads=1
-          xvfb-run -a cargo test --locked -p vellum-ui native_ocr_compact_layout_coalesces_edits_and_closes_without_workspace -- --ignored --test-threads=1
+          xvfb-run -a -s "-screen 0 1280x800x24" cargo test --locked -p vellum-ui first_frame_work_runs_once_after_paint_not_during_present -- --test-threads=1
+          xvfb-run -a -s "-screen 0 1280x800x24" cargo test --locked -p vellum-ui closing_overlay_releases_full_screen_and_input_method_while_result_stays_alive -- --test-threads=1
+          xvfb-run -a -s "-screen 0 1280x800x24" cargo test --locked -p vellum-ui native_ocr_compact_layout_coalesces_edits_and_closes_without_workspace -- --ignored --test-threads=1
 
       - name: Build all four binaries together
         run: cargo build --locked --release --workspace
