@@ -47,9 +47,13 @@ fn native_ocr_compact_layout_coalesces_edits_and_closes_without_workspace() {
     result.flash(&"synthetic very long status ".repeat(100), true);
     assert_eq!(root.measure(Orientation::Horizontal, -1).0, initial_minimum);
     let cancel_slot = result.cancel_button.parent().unwrap();
-    assert!(!gtk4::prelude::WidgetExt::is_visible(&cancel_slot));
-    assert!(gtk4::prelude::WidgetExt::is_visible(&result.view_button));
-    assert!(gtk4::prelude::WidgetExt::is_visible(&result.edit_button));
+    // This test deliberately never maps the window. gtk_widget_is_visible
+    // also checks ancestors, so it would report false for every child here.
+    // Assert each action's own visible property, including the FlowBox wrapper.
+    assert!(!result.window.property::<bool>("visible"));
+    assert!(!cancel_slot.property::<bool>("visible"));
+    assert!(result.view_button.property::<bool>("visible"));
+    assert!(result.edit_button.property::<bool>("visible"));
     let copy_ticket = result.copy_job.borrow_mut().begin().unwrap();
     // Exercise the same signal as title-bar close and Escape, without mapping
     // windows or invoking compositor floating commands in a native unit test.
