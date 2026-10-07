@@ -2,6 +2,11 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.2.5]
+
+- Keep a pinned screenshot fitted to the window it actually received. A floating window's size belongs to the compositor, so a small image no longer sits in the top-left corner of a much larger window with the transparency checkerboard filling the rest.
+- Ask the compositor for the size the pinned image wants, and re-fit when the window really gets a different allocation. An explicit zoom is still preserved across later size changes.
+
 ## [0.2.4]
 
 - Choose content-aware seams for online and offline long screenshots, avoiding text edges rather than joining at the viewport boundary or a fixed weight crossover. Keep complete rows from one frame and avoid reblending revisited content.

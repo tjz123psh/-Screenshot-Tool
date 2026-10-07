@@ -58,6 +58,11 @@ struct View {
     scale: f64,
     offset: (f64, f64),
     win: (i32, i32),
+    /// True while the framing follows the window allocation. A floating
+    /// window's geometry belongs to the compositor, so the size we request can
+    /// be replaced by a different one; a fitted view re-adapts to it instead of
+    /// stranding the image in a corner over the transparency checkerboard.
+    fitted: bool,
     toast: Option<(String, bool)>,
     toast_source: Option<glib::SourceId>,
 }
@@ -73,12 +78,41 @@ impl View {
         let img_y = (pointer.1 - self.offset.1) / self.scale;
         self.offset = (pointer.0 - img_x * new_scale, pointer.1 - img_y * new_scale);
         self.scale = new_scale;
+        self.fitted = false;
         new_scale
     }
 
     fn reset(&mut self) {
         self.scale = 1.0;
+        self.fitted = false;
         self.center();
+    }
+
+    /// Scale the image down to the whole window and centre it.
+    fn fit(&mut self) {
+        self.scale = (f64::from(self.win.0) / self.image.width as f64)
+            .min(f64::from(self.win.1) / self.image.height as f64)
+            .min(1.0);
+        self.center();
+    }
+
+    /// Adopt the allocation the window really received. A fitted view rescales
+    /// to it; a view the user zoomed keeps its scale and only follows the
+    /// centre, so an explicit zoom is never silently undone.
+    fn resize(&mut self, width: i32, height: i32) {
+        if self.win == (width, height) {
+            return;
+        }
+        let shift = (
+            f64::from(width - self.win.0) / 2.0,
+            f64::from(height - self.win.1) / 2.0,
+        );
+        self.win = (width, height);
+        if self.fitted {
+            self.fit();
+        } else {
+            self.offset = (self.offset.0 + shift.0, self.offset.1 + shift.1);
+        }
     }
 
     fn center(&mut self) {
@@ -265,9 +299,6 @@ impl PinWindow {
         theme::install_default();
 
         let (win_w, win_h) = initial_window_size(&image);
-        let scale = (win_w as f64 / image.width as f64)
-            .min(win_h as f64 / image.height as f64)
-            .min(1.0);
 
         let window = ApplicationWindow::builder()
             .application(app)
@@ -312,13 +343,16 @@ impl PinWindow {
         let mut view = View {
             surface,
             image: Arc::new(image),
-            scale,
+            scale: 1.0,
             offset: (0.0, 0.0),
             win: (win_w, win_h),
+            fitted: true,
             toast: None,
             toast_source: None,
         };
-        view.center();
+        // The requested size is only a request: this window may be mapped at a
+        // different one, and View::resize re-fits it as soon as that is known.
+        view.fit();
 
         let pin = Rc::new(Self {
             window,
@@ -357,6 +391,7 @@ impl PinWindow {
 
     fn present(self: &Rc<Self>) {
         self.window.present();
+        theme::snapshot_for_review(&self.window);
     }
 
     fn connect_draw(self: &Rc<Self>) {
@@ -364,9 +399,10 @@ impl PinWindow {
         self.area.set_draw_func(move |_, cr, width, height| {
             {
                 let mut view = this.view.borrow_mut();
-                // Track allocation so window-relative maths (centre, toast
-                // placement) stays correct after a compositor-driven resize.
-                view.win = (width, height);
+                // Track the real allocation so window-relative maths (centre,
+                // toast placement) and the framing stay correct after a
+                // compositor-driven resize.
+                view.resize(width, height);
             }
             let view = this.view.borrow();
             draw(cr, &view, width, height);
@@ -473,7 +509,15 @@ impl PinWindow {
                     return;
                 }
                 crate::own_window::float_own_window_soon();
-                *this.handle.borrow_mut() = compositor::window_for_pid(std::process::id());
+                let handle = compositor::window_for_pid(std::process::id());
+                if let Some(handle) = &handle {
+                    // Ask for the size the image actually wants. A compositor
+                    // that refuses it is not fatal: the fitted view then adapts
+                    // to whatever size the window did get.
+                    let (w, h) = this.view.borrow().win;
+                    let _ = compositor::set_window_size(handle, w, h);
+                }
+                *this.handle.borrow_mut() = handle;
             });
         });
     }
@@ -499,6 +543,8 @@ impl PinWindow {
             view.scale = (view.scale * ratio).clamp(MIN_SCALE, MAX_SCALE);
             view.offset = (view.offset.0 * ratio, view.offset.1 * ratio);
             view.win = (new_w, new_h);
+            // An explicit window resize is the user's framing from now on.
+            view.fitted = false;
         }
 
         let resized = match self.handle.borrow().as_ref() {
@@ -753,17 +799,25 @@ mod tests {
         Rgb8::new(w, h)
     }
 
-    #[test]
-    fn zooming_keeps_the_point_under_the_cursor() {
+    /// A view whose framing follows its window, as a freshly opened pin has.
+    fn test_view(pixels: Rgb8, win: (i32, i32)) -> View {
         let mut view = View {
             surface: ImageSurface::create(cairo::Format::ARgb32, 10, 10).unwrap(),
-            image: Arc::new(image(400, 400)),
+            image: Arc::new(pixels),
             scale: 1.0,
             offset: (0.0, 0.0),
-            win: (200, 200),
+            win,
+            fitted: true,
             toast: None,
             toast_source: None,
         };
+        view.fit();
+        view
+    }
+
+    #[test]
+    fn zooming_keeps_the_point_under_the_cursor() {
+        let mut view = test_view(image(400, 400), (200, 200));
         let pointer = (50.0, 60.0);
         let before = (
             (pointer.0 - view.offset.0) / view.scale,
@@ -780,15 +834,7 @@ mod tests {
 
     #[test]
     fn zoom_is_clamped() {
-        let mut view = View {
-            surface: ImageSurface::create(cairo::Format::ARgb32, 10, 10).unwrap(),
-            image: Arc::new(image(40, 40)),
-            scale: 1.0,
-            offset: (0.0, 0.0),
-            win: (200, 200),
-            toast: None,
-            toast_source: None,
-        };
+        let mut view = test_view(image(40, 40), (200, 200));
         for _ in 0..200 {
             view.zoom_content(ZOOM_STEP, (0.0, 0.0));
         }
@@ -803,5 +849,39 @@ mod tests {
     fn a_small_image_opens_at_one_to_one() {
         let (w, h) = initial_window_size(&image(300, 200));
         assert_eq!((w, h), (300, 200));
+    }
+
+    #[test]
+    fn a_compositor_forced_size_refits_instead_of_stranding_the_image() {
+        // 800x1200 asks for 648x972, but niri maps the floating window at
+        // 942x1012. The image must follow the size it really got.
+        let mut view = test_view(image(800, 1200), (648, 972));
+        view.resize(942, 1012);
+
+        let drawn = (800.0 * view.scale, 1200.0 * view.scale);
+        assert!(drawn.0 <= 942.5 && drawn.1 <= 1012.5, "{drawn:?}");
+        assert!((view.offset.0 - (942.0 - drawn.0) / 2.0).abs() < 0.5);
+        assert!((view.offset.1 - (1012.0 - drawn.1) / 2.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_small_pin_is_centred_in_an_oversized_window() {
+        // The reported bug: a small image in a much larger window sat in the
+        // top-left corner with the checkerboard filling everything else.
+        let mut view = test_view(image(625, 280), (625, 280));
+        view.resize(942, 1012);
+        assert_eq!(view.scale, 1.0);
+        assert!((view.offset.0 - (942.0 - 625.0) / 2.0).abs() < 0.5);
+        assert!((view.offset.1 - (1012.0 - 280.0) / 2.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn an_explicit_zoom_survives_a_later_allocation_change() {
+        let mut view = test_view(image(800, 1200), (648, 972));
+        view.zoom_content(2.0, (100.0, 100.0));
+        let scale = view.scale;
+        assert!(!view.fitted);
+        view.resize(1000, 1000);
+        assert_eq!(view.scale, scale, "an allocation change must not undo zoom");
     }
 }
