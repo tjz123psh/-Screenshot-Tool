@@ -178,6 +178,17 @@ pub fn float_own_window(pid: u32) -> bool {
     newest_window_for_pid(pid).is_some_and(|window| float(&window))
 }
 
+/// Places the newest window of a pid at an exact screen rectangle.
+///
+/// This is used by the KDE long-shot panel when layer-shell is unavailable.
+/// Other platforms keep their compositor-owned geometry.
+pub fn place_window(pid: u32, x: i32, y: i32, width: i32, height: i32, keep_above: bool) -> bool {
+    if detect() != Compositor::Kde || width <= 0 || height <= 0 {
+        return false;
+    }
+    kde::place_window(pid, x, y, width, height, keep_above)
+}
+
 /// Reads a window's current size in logical pixels.
 ///
 /// KWin exposes size asynchronously through scripting, while GTK already knows
