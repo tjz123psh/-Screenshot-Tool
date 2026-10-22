@@ -59,7 +59,7 @@ fn apply_script(
     // still the right default for a file KWin reads on behalf of another client.
     let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     let plugin = format!("vellum-window-{pid}-{sequence}");
-    let path_arg = gvariant_string(&path.to_string_lossy());
+    let path_arg = gvariant_string(path.to_string_lossy().as_ref());
     let plugin_arg = gvariant_string(&plugin);
     if !dbus_call(
         &gdbus,

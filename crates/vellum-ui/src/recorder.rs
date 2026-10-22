@@ -1098,10 +1098,10 @@ impl Recorder {
         window.set_title(Some("Vellum 长截图控制"));
         let output = single_output_for_selection(screen, rect);
         let safe_screen = output.as_ref().map(|(_, screen)| *screen);
-        if let Some((monitor, _)) = output.as_ref() {
-            if gtk4_layer_shell::is_supported() {
-                window.set_monitor(Some(monitor));
-            }
+        if let Some((monitor, _)) = output.as_ref()
+            && gtk4_layer_shell::is_supported()
+        {
+            window.set_monitor(Some(monitor));
         }
         // Anchoring happens after the panel is populated: the side is chosen
         // from the panel's measured size, which is not known yet.

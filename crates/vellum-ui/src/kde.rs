@@ -83,7 +83,8 @@ fn capture(area: Option<Rect>) -> Result<Rgb8, CaptureError> {
             None::<&gio::Cancellable>,
         )
         .map_err(|error| CaptureError::Failed(format!("KWin {method}: {error}")))?;
-    let metadata = reply.0.child_value(0);
+    let metadata_variant = reply.0.child_value(0);
+    let metadata = glib::VariantDict::new(Some(&metadata_variant));
     let width = metadata_u32(&metadata, "width")?;
     let height = metadata_u32(&metadata, "height")?;
     let stride = metadata_u32(&metadata, "stride")?;
@@ -97,9 +98,8 @@ fn capture(area: Option<Rect>) -> Result<Rgb8, CaptureError> {
             "KWin returned invalid frame metadata: type={kind} {width}x{height} stride={stride} format={format}"
         )));
     }
-    let expected = usize::try_from(stride)
-        .ok()
-        .and_then(|stride| stride.checked_mul(height as usize))
+    let expected = (stride as usize)
+        .checked_mul(height as usize)
         .ok_or_else(|| CaptureError::Failed("KWin frame size overflow".into()))?;
     let bytes = read_frame(&read, expected)?;
     decode_frame(
@@ -118,7 +118,7 @@ fn options() -> glib::Variant {
     dict.end()
 }
 
-fn metadata_u32(dict: &glib::Variant, key: &str) -> Result<u32, CaptureError> {
+fn metadata_u32(dict: &glib::VariantDict, key: &str) -> Result<u32, CaptureError> {
     dict.lookup_value(key, None)
         .and_then(|value| value.get::<u32>())
         .ok_or_else(|| CaptureError::Failed(format!("KWin frame metadata is missing {key}")))
@@ -136,9 +136,14 @@ fn pipe() -> Result<(File, File), String> {
 
 fn read_frame(file: &File, expected: usize) -> Result<Vec<u8>, CaptureError> {
     let fd = file.as_raw_fd();
-    // SAFETY: fcntl only changes flags on this pipe; failure leaves it blocking,
-    // and the loop still has an overall deadline.
-    unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    // SAFETY: fcntl only changes flags on this pipe. A failure would leave the
+    // read blocking, so fail instead of pretending the deadline still applies.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
+        return Err(CaptureError::Failed(format!(
+            "KWin pipe nonblocking setup: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     let deadline = Instant::now() + READ_TIMEOUT;
     let mut bytes = Vec::with_capacity(expected);
     let mut chunk = [0u8; 65536];
@@ -210,11 +215,9 @@ fn decode_frame(
                 for pixel in source.as_chunks::<4>().0 {
                     let alpha = u32::from(pixel[3]);
                     let channel = |value: u8| {
-                        if alpha == 0 {
-                            0
-                        } else {
-                            ((u32::from(value) * 255 + alpha / 2) / alpha).min(255) as u8
-                        }
+                        (u32::from(value) * 255 + alpha / 2)
+                            .checked_div(alpha)
+                            .map_or(0, |channel| channel.min(255) as u8)
                     };
                     data.extend_from_slice(&[
                         channel(pixel[2]),
