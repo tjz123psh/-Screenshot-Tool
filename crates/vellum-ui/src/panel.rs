@@ -30,6 +30,7 @@ use gtk4::{
     Stack, StackTransitionType, Switch, ToggleButton, gio, glib,
 };
 use pango::EllipsizeMode;
+use vellum_core::compositor::{self, Compositor};
 use vellum_core::config::{
     ApiConfig, Config, DEFAULT_API_BASE_URL, DEFAULT_API_KEY_ENV, DEFAULT_API_TIMEOUT_S,
     DEFAULT_LLM_MODEL, DEFAULT_OCR_LANGS, DEFAULT_TARGET_LANG, OCR_ENGINE_API, OCR_ENGINE_BUILTIN,
@@ -730,7 +731,11 @@ impl Panel {
         // with the long-shot panel, so translucency lives on a class only this
         // window carries.
         window.add_css_class("vellum-glass");
-        crate::background_blur::attach(&window);
+        // KWin does not implement ext-background-effect-v1; attaching the
+        // guest Wayland backend there causes a protocol error before the panel maps.
+        if compositor::detect() != Compositor::Kde {
+            crate::background_blur::attach(&window);
+        }
 
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.add_css_class("vellum-panel-shell");
