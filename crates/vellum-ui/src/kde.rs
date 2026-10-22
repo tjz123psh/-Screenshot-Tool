@@ -6,7 +6,7 @@
 //! caller's point of view and safe to use from the capture worker.
 
 use std::fs::File;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant};
 
 use gtk4::gio::{self, prelude::*};
@@ -135,7 +135,7 @@ fn pipe() -> Result<(File, File), String> {
 }
 
 fn read_frame(file: &File, expected: usize) -> Result<Vec<u8>, CaptureError> {
-    let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+    let fd = file.as_raw_fd();
     // SAFETY: fcntl only changes flags on this pipe; failure leaves it blocking,
     // and the loop still has an overall deadline.
     unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };

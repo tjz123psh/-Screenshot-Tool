@@ -9,8 +9,9 @@
 //! 4. set its size exactly.
 //!
 //! The selection overlay and long-shot panel remain layer-shell surfaces on
-//! both targets. KWin 6.8 implements that protocol; the screenshot backend is
-//! separate and uses KWin's own ScreenShot2 API.
+//! niri. KWin 6.8 does not expose layer-shell to ordinary GTK clients, so KDE
+//! uses a decorated-less fullscreen toplevel and a script-positioned panel; its
+//! screenshot backend is KWin's own ScreenShot2 API.
 //!
 //! Two rules hold for every entry point here:
 //!

@@ -35,7 +35,7 @@ vellum logs               # 查看服务日志
 | `Mod+Shift+Print` | 开始或完成长截图 |
 | `Mod+Ctrl+Print` | 钉住剪贴板图片 |
 
-Vellum 通过 XDG GlobalShortcuts 注册并处理全局按键，首次在应用“快捷键”页启用，系统可能要求授权。应用显示系统实际绑定的组合键，不把建议值当作已生效。**桌面后端必须支持此接口；仅能枚举接口不等于能成功绑定。** 本机 niri + GNOME portal 的真实绑定被拒绝，详见[兼容性与高速滚动记录](<SHORTCUTS_AND_SPEED.md>)。
+Vellum 通过 XDG GlobalShortcuts 注册并处理全局按键，首次在应用“快捷键”页启用，系统可能要求授权。应用显示系统实际绑定的组合键，不把建议值当作已生效。**桌面后端必须支持此接口；仅能枚举接口不等于能成功绑定。** KDE 由 xdg-desktop-portal-kde 提供该接口；本机 niri + GNOME portal 的历史拒绝记录见[兼容性与高速滚动记录](<SHORTCUTS_AND_SPEED.md>)。
 
 旧配置不会自动删除。`vellum shortcuts legacy-list` 只读检查旧绑定；`install` / `remove` 子命令仅保留为显式传统兼容入口。版本化安装器不再自动写旧配置，即使环境中残留旧安装开关也不会恢复已移除的绑定。兼容示例在 `contrib/`：
 

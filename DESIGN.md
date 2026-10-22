@@ -327,7 +327,7 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 3. 读它当前的真实尺寸
 4. 精确设置它的尺寸
 
-选区 overlay、长截图面板、选区高亮仍是 layer-shell surface，不需要合成器专属代码。KWin 6.8 实现了 wlr-layer-shell，所以选区界面可以复用。抽象实现放在 vellum-core/src/compositor/，因为 doctor 也要报告检测结果。
+niri 的选区 overlay、长截图面板、选区高亮仍是 layer-shell surface，不需要合成器专属代码。KWin 6.8 不向普通 GTK 客户端暴露 wlr-layer-shell，因此 KDE 的选区改用无装饰全屏 toplevel，长截图面板用 KWin 脚本定位；高亮在 KDE 省略，避免普通窗口进入采样区。抽象实现放在 vellum-core/src/compositor/，因为 doctor 也要报告检测结果。
 
 ### 两条铁律
 
