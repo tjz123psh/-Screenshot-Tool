@@ -561,9 +561,13 @@ fn manage_shortcuts(command: Option<ShortcutsCommand>) -> anyhow::Result<u8> {
 }
 
 fn list_shortcuts() -> u8 {
+    if shortcuts::target() == vellum_core::compositor::Compositor::Kde {
+        println!("KDE Plasma 使用系统快捷键授权；请运行 vellum shortcuts enable，或在设置页启用");
+        return 0;
+    }
     let root = shortcuts::config_dir();
-    // Name the compositor we actually detected. Telling a Hyprland user that
-    // their "Niri shortcuts" are missing is a bug report waiting to happen.
+    // Name the compositor we actually detected. Telling a niri user that their
+    // shortcuts are missing is a bug report waiting to happen.
     println!(
         "{} 快捷键配置：{}",
         shortcuts::target().label(),
@@ -600,8 +604,8 @@ fn report_shortcuts(result: shortcuts::InstallResult) -> u8 {
     if let Some(target) = &result.target {
         println!("目标文件：{}", target.display());
     }
-    // A Lua Hyprland config cannot be edited safely, so the snippet is the
-    // whole deliverable in that case: print it verbatim, ready to paste.
+    // A read-only backend may return text for the user to paste manually.
+    // Print it verbatim so no quoting or truncation survives the trip.
     if let Some(snippet) = &result.snippet {
         println!("\n把下面的内容加入你的配置：\n");
         println!("{snippet}");

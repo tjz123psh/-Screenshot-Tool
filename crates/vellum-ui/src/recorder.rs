@@ -31,7 +31,7 @@ use gtk4::{
     Label, Orientation,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use vellum_core::compositor;
+use vellum_core::compositor::{self, Compositor};
 use vellum_core::config::LongshotConfig;
 use vellum_core::geom::Rect;
 use vellum_core::image_limits::CAPTURE_FRAME_LIMITS;
@@ -1061,12 +1061,6 @@ pub struct Recorder {
     panel_available: Cell<bool>,
     capture_retry_notified: Cell<bool>,
     daemon_managed: bool,
-    /// Hides the pointer for the duration of sampling.
-    ///
-    /// grim copies the pointer into every frame it appears in, so without this
-    /// the stitched image collects one arrow per scroll step. Held as a guard so
-    /// the pointer comes back on every exit path, including a panic.
-    cursor: RefCell<Option<compositor::CursorGuard>>,
 }
 
 impl Recorder {
@@ -1086,19 +1080,28 @@ impl Recorder {
             .application(app)
             .decorated(false)
             .build();
-        window.init_layer_shell();
-        window.set_layer(Layer::Overlay);
-        window.set_namespace(Some("vellum-longshot"));
-        window.set_keyboard_mode(KeyboardMode::OnDemand);
-        // Match the full-output screenshot coordinate origin instead of being
-        // shifted inward by bars/docks with exclusive zones.
-        window.set_exclusive_zone(-1);
+        if gtk4_layer_shell::is_supported() {
+            window.init_layer_shell();
+            window.set_layer(Layer::Overlay);
+            window.set_namespace(Some("vellum-longshot"));
+            window.set_keyboard_mode(KeyboardMode::OnDemand);
+            // Match the full-output screenshot coordinate origin instead of
+            // being shifted inward by bars/docks with exclusive zones.
+            window.set_exclusive_zone(-1);
+        } else {
+            // KWin has no layer-shell for ordinary clients. Use a fixed normal
+            // window and place it after map through KWin scripting; it must not
+            // take focus from the window the user is scrolling.
+            window.set_focusable(false);
+        }
         window.set_resizable(false);
         window.set_title(Some("Vellum 长截图控制"));
         let output = single_output_for_selection(screen, rect);
         let safe_screen = output.as_ref().map(|(_, screen)| *screen);
         if let Some((monitor, _)) = output.as_ref() {
-            window.set_monitor(Some(monitor));
+            if gtk4_layer_shell::is_supported() {
+                window.set_monitor(Some(monitor));
+            }
         }
         // Anchoring happens after the panel is populated: the side is chosen
         // from the panel's measured size, which is not known yet.
@@ -1603,7 +1606,6 @@ impl Recorder {
                 seam_area,
             }),
             worker: RefCell::new(None),
-            cursor: RefCell::new(None),
             on_done,
             trace,
             rect,
@@ -1628,6 +1630,14 @@ impl Recorder {
                             ("actual_height", TraceField::I64(i64::from(window.height()))),
                         ],
                     );
+                    if !gtk4_layer_shell::is_supported() {
+                        let weak = Rc::downgrade(&recorder);
+                        glib::timeout_add_local_once(Duration::from_millis(60), move || {
+                            if let Some(recorder) = weak.upgrade() {
+                                recorder.place_kde_panel();
+                            }
+                        });
+                    }
                 }
             });
         }
@@ -1810,6 +1820,46 @@ impl Recorder {
         }
     }
 
+    /// Places the panel through KWin when layer-shell is unavailable. The
+    /// placement arithmetic still guarantees that the rectangle is outside the
+    /// selection; KWin only receives the final screen coordinates.
+    fn place_kde_panel(&self) {
+        if gtk4_layer_shell::is_supported() {
+            return;
+        }
+        let (Some(edge), Some(screen)) = (self.placement.edge(), self.screen) else {
+            return;
+        };
+        let (width, height) = self
+            .expected_panel_size
+            .unwrap_or_else(|| (self.window.width(), self.window.height()));
+        if width <= 0 || height <= 0 || width > screen.0 || height > screen.1 {
+            return;
+        }
+        let (x, y) = match edge {
+            Edge::Top => (
+                (self.rect.x + self.rect.w / 2 - width / 2).clamp(0, screen.0 - width),
+                PANEL_MARGIN,
+            ),
+            Edge::Bottom => (
+                (self.rect.x + self.rect.w / 2 - width / 2).clamp(0, screen.0 - width),
+                screen.1 - height - PANEL_MARGIN,
+            ),
+            Edge::Left => (
+                PANEL_MARGIN,
+                (self.rect.y + self.rect.h / 2 - height / 2).clamp(0, screen.1 - height),
+            ),
+            Edge::Right => (
+                screen.0 - width - PANEL_MARGIN,
+                (self.rect.y + self.rect.h / 2 - height / 2).clamp(0, screen.1 - height),
+            ),
+            _ => return,
+        };
+        if !compositor::place_window(std::process::id(), x, y, width, height, true) {
+            eprintln!("[vellum] KDE panel placement unavailable; continuing without it");
+        }
+    }
+
     fn record_panel_feedback(&self, feedback: PanelFeedback) {
         let (reason, _, _) = panel_feedback(feedback);
         self.trace
@@ -1831,19 +1881,6 @@ impl Recorder {
             return;
         }
         self.trace.emit("capture_thread_starting", &[]);
-
-        // Hide the pointer for exactly as long as we sample. Doing it here rather
-        // than in `present` keeps it visible while the overlay is still fading
-        // out, and means a cancelled session never touches the pointer at all.
-        // `None` just means the compositor cannot do it; sampling proceeds.
-        *self.cursor.borrow_mut() = compositor::hide_cursor();
-        self.trace.emit(
-            "cursor_hide_result",
-            &[(
-                "guard_created",
-                TraceField::Bool(self.cursor.borrow().is_some()),
-            )],
-        );
 
         let shared = Arc::clone(&self.shared);
         let rect = self.rect;
@@ -1937,7 +1974,6 @@ impl Recorder {
             self.trace
                 .emit("capture_worker_joined", &[("ok", TraceField::Bool(joined))]);
         }
-        self.cursor.borrow_mut().take();
         self.emit_summary("failed", None, false, 1);
         (self.on_done)(None, vec![warning.to_string()]);
     }
@@ -2097,7 +2133,6 @@ impl Recorder {
 
         if cancel {
             // Nothing is kept, so the pointer can come back immediately.
-            self.cursor.borrow_mut().take();
             self.emit_summary("cancelled", None, false, 0);
             (self.on_done)(None, Vec::new());
             return;
@@ -2167,7 +2202,6 @@ impl Recorder {
 
         // Only now: every captured frame has been consumed, so restoring the
         // pointer can no longer put it into the output.
-        self.cursor.borrow_mut().take();
 
         if self.shared.resource_limited() {
             self.state.borrow_mut().stitcher.stop_at_resource_limit();
@@ -2296,6 +2330,7 @@ enum FrameSource {
         capturer: Box<ScreencopyCapturer>,
         consecutive_timeouts: u32,
     },
+    Kde,
     Grim,
 }
 
@@ -2308,6 +2343,14 @@ impl FrameSource {
             );
             eprintln!("[vellum] long-shot backend forced to bounded grim fallback");
             return Self::Grim;
+        }
+        if compositor::detect() == Compositor::Kde {
+            shared.trace.emit(
+                "capture_backend_selected",
+                &[("backend", TraceField::Static("kwin_screenshot2"))],
+            );
+            eprintln!("[vellum] long-shot backend: KWin ScreenShot2");
+            return Self::Kde;
         }
         match ScreencopyCapturer::new(rect, shared.stop_fd(), || shared.aborting()) {
             Ok(capturer) => {
@@ -2335,10 +2378,13 @@ impl FrameSource {
     }
 
     fn discard_first_frame(&self) -> bool {
-        matches!(self, Self::Grim)
+        matches!(self, Self::Grim | Self::Kde)
     }
 
     fn grab(&mut self, shared: &Shared, rect: Rect) -> Result<Rgb8, capture::CaptureError> {
+        if matches!(self, Self::Kde) {
+            return crate::kde::capture_area(rect);
+        }
         if let Self::Screencopy {
             capturer,
             consecutive_timeouts,

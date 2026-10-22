@@ -353,8 +353,9 @@ Target: {build['target']}; profile: {build['profile']}; source dirty: {str(build
 
 This is a binary bundle, not a source/developer backup. It contains no screenshots,
 user configuration, editable source images, recovery assets or compositor bindings.
-Requires Arch Linux / Wayland, GTK >= 4.12 and gtk4-layer-shell. Capture/clipboard/
-notifications/OCR also use grim, wl-clipboard, libnotify and Tesseract language data.
+Requires Arch Linux / Wayland, GTK >= 4.12 and gtk4-layer-shell. Capture uses
+KWin ScreenShot2 on KDE or grim on wlroots/niri; clipboard, notifications and OCR
+also use wl-clipboard, libnotify and Tesseract language data.
 No dependency is installed automatically by this bundle.
 
 Verify the adjacent archive .sha256 before extracting, then review manifest.json.
@@ -369,7 +370,7 @@ replace a supported old installation. Default user settings and screenshots are
 preserved. To inspect options: ./bin/vellum release install --help
 
 Resources retain @VELLUM_LAUNCHER@ / @VELLUM_TRAY@ placeholders; the manager renders
-per-version generated resources. This bundle does not alter niri/Hyprland bindings.
+per-version generated resources. This bundle does not alter niri/KDE bindings.
 License: MIT; see LICENSE.
 """
         (bundle / "README.md").write_text(readme, encoding="utf-8")

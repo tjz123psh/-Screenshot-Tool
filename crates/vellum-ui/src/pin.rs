@@ -12,7 +12,7 @@
 //!   on a tiling compositor a floating window's geometry belongs to the
 //!   compositor, so the resize goes through compositor IPC with GTK as the
 //!   fallback.
-//! * "Always on top" on niri and Hyprland alike means "floating". A tiled pin
+//! * "Always on top" means keepAbove on KDE and floating on niri. A tiled pin
 //!   window would join the layout and stop being a reference overlay.
 
 use std::cell::{Cell, RefCell};

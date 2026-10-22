@@ -708,11 +708,11 @@ impl Panel {
         // resizable(false) is not cosmetic: it is what makes the panel an
         // independent window instead of a layout participant.
         //
-        // MEASURED on Hyprland with the scrolling layout: a resizable panel maps
+        // MEASURED on a scrolling tiling layout: a resizable panel maps
         // as a tiling COLUMN (926x996) first, which scrolls the whole desktop
         // sideways (firefox moved 940px), and the float requested 60ms later
         // removes the column but leaves the scroll. With resizable(false) the
-        // window declares a fixed size, and both Hyprland and niri open a
+        // window declares a fixed size, and both niri and KWin open a
         // fixed-size window floating from its first frame: no tiled frame, no
         // scroll, and no compositor window rule needed. Same shape as the
         // layer-shell surfaces, without giving up a normal toplevel (drag,

@@ -12,7 +12,7 @@
 // tiled flash before that call lands, and lets you pin down a default size.
 //
 // The settings panel needs none of this: it is built as a fixed-size window,
-// which Niri (like Hyprland) opens floating from the first frame, so it never
+// which Niri opens floating from the first frame, so it never
 // joins a column and never scrolls the layout.
 //
 // Match on app-id, not title: the titles are localized ("vellum 钉图",

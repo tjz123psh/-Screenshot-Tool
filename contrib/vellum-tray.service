@@ -1,7 +1,7 @@
 [Unit]
 Description=vellum system tray
 # Stopping with the session is right on niri, where graphical-session.target is
-# activated. Hyprland sessions do not have to activate that target at all, so
+# activated. Some sessions do not activate that target at all, so
 # installation also ships default.target as an entry point; the tray retries
 # until the shell's StatusNotifierWatcher exists.
 PartOf=graphical-session.target

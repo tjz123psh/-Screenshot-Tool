@@ -11,7 +11,7 @@ chrono.workspace = true
 image.workspace = true
 libc.workspace = true
 serde.workspace = true
-# The compositor backends speak JSON to niri and Hyprland.
+# niri uses JSON over its socket; KDE uses D-Bus and a small gdbus helper.
 serde_json.workspace = true
 toml.workspace = true
 

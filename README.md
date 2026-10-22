@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/tjz123psh/-Screenshot-Tool/actions/workflows/ci.yml/badge.svg)](https://github.com/tjz123psh/-Screenshot-Tool/actions/workflows/ci.yml)
 
-面向 Arch Linux / Wayland 的原生截图工具，使用 Rust、GTK4 和 layer-shell，适配 niri 与 Hyprland。
+面向 Arch Linux / Wayland 的原生截图工具，使用 Rust、GTK4 和 layer-shell，适配 niri 与 KDE Plasma。
 
 [使用手册](<docs/USAGE.md>) · [全部文档](<docs/README.md>) · [开发与发布](<docs/DEVELOPMENT.md>) · [贡献约定](<CONTRIBUTING.md>) · [更新记录](<CHANGELOG.md>)
 
@@ -28,8 +28,8 @@
 ## 系统要求
 
 - 当前发行目标：Arch Linux x86_64、Wayland、GTK 4.12 及以上。
-- 本机验证以 niri 为准；Hyprland 有适配代码，尚不等于已实机验收。其他桌面/发行版不承诺兼容。
-- 运行库包括 gtk4、gtk4-layer-shell、grim、wl-clipboard、libnotify；本地 OCR 另需 Tesseract 与相应语言包。应用全局快捷键还依赖桌面 portal 后端支持。
+- 支持 niri 与 KDE Plasma（KWin）；KDE 当前适配范围是单输出 1920×1080、scale 1，其他组合尚未实机验证。KDE 截图使用 KWin ScreenShot2，不需要 wlr-screencopy。
+- 运行库包括 gtk4、gtk4-layer-shell、grim、wl-clipboard、libnotify；KDE 会话使用系统自带的 KWin ScreenShot2，不依赖 grim 截屏。本地 OCR 另需 Tesseract 与相应语言包。应用全局快捷键还依赖桌面 portal 后端支持。
 - 普通用户无需 Rust 工具链，无需在本机编译。API OCR 与翻译需要自行配置兼容服务；本地 OCR 不需要外部服务。
 
 ## 安装与版本管理

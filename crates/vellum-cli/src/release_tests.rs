@@ -50,7 +50,7 @@ impl Sandbox {
                 b"// existing niri bindings, no installer ownership\n".as_slice(),
             ),
             (
-                "home/.config/hypr/hyprland.conf",
+                "home/.config/kde/kwinrc",
                 b"# existing compositor settings\n".as_slice(),
             ),
             (

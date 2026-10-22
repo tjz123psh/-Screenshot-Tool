@@ -25,6 +25,7 @@ mod editor;
 mod handoff;
 mod highlight;
 mod imaging;
+mod kde;
 mod model_picker;
 mod opening;
 mod own_window;
@@ -59,6 +60,7 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use vellum_core::capture::CaptureError;
+use vellum_core::compositor::{self, Compositor};
 use vellum_core::longshot_trace::{LongshotTrace, TraceField};
 use vellum_core::{Config, Rgb8};
 
@@ -427,6 +429,15 @@ fn load_image(path: &Path, _cleanup: bool) -> anyhow::Result<Rgb8> {
     }
 }
 
+/// Captures the full workspace with the backend this session actually supports.
+fn capture_screen() -> Result<Rgb8, CaptureError> {
+    if compositor::detect() == Compositor::Kde {
+        kde::capture_workspace()
+    } else {
+        vellum_core::capture::grab_full()
+    }
+}
+
 /// A screen grab running while GTK starts up, collected in `activate`.
 type PendingCapture = std::thread::JoinHandle<Result<Rgb8, CaptureError>>;
 
@@ -449,7 +460,7 @@ fn run_region(
     trace::mark("capture-start");
     let capture_trace = longshot_trace.clone();
     let capture = std::thread::spawn(move || {
-        let frame = vellum_core::capture::grab_full();
+        let frame = capture_screen();
         trace::mark("capture-done");
         match &frame {
             Ok(image) => capture_trace.emit(
@@ -529,7 +540,7 @@ fn capture_error_kind(error: &CaptureError) -> &'static str {
 /// Captures the full screen without any UI. Useful for checking that `grim`
 /// and the PPM decoder agree on geometry.
 fn debug_capture(flags: OutputFlags) -> anyhow::Result<i32> {
-    let image = vellum_core::capture::grab_full()?;
+    let image = capture_screen()?;
     println!("captured: {}x{}", image.width, image.height);
     Ok(keep_image(image, flags, "vellum-debug", false))
 }

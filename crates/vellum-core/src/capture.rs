@@ -32,11 +32,11 @@ pub enum CaptureError {
 impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound => write!(f, "grim not found; install grim"),
-            Self::Failed(detail) => write!(f, "grim failed: {detail}"),
+            Self::NotFound => write!(f, "capture backend not found"),
+            Self::Failed(detail) => write!(f, "capture failed: {detail}"),
             Self::Decode(detail) => write!(f, "cannot decode capture: {detail}"),
-            Self::Timeout => write!(f, "grim capture timed out"),
-            Self::Cancelled => write!(f, "grim capture cancelled"),
+            Self::Timeout => write!(f, "capture timed out"),
+            Self::Cancelled => write!(f, "capture cancelled"),
         }
     }
 }

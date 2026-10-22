@@ -126,7 +126,7 @@ info "校验四个程序的构建身份并生成完整版本包"
 
 # --- Transactional user-level deployment ---------------------------------
 # Legacy desktop keybindings are a separate explicit action, never an install side effect.
-info "安装不修改 niri/Hyprland 快捷键；保留用户设置、截图与恢复资料"
+info "安装不修改 niri/KDE 快捷键；保留用户设置、截图与恢复资料"
 manager=(release install --bundle "$BUNDLE_TMP/bundle" --bin-dir "$BIN_DIR" \
     --config-dir "${XDG_CONFIG_HOME:-$HOME/.config}" --data-dir "${XDG_DATA_HOME:-$HOME/.local/share}")
 if [[ -n "${VELLUM_INSTALL_ROOT:-}" ]]; then manager+=(--root "$VELLUM_INSTALL_ROOT"); fi

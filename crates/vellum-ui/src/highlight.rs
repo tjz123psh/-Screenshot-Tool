@@ -52,6 +52,14 @@ impl SelectionHighlight {
         screen: Option<(i32, i32)>,
         monitor: Option<&gtk4::gdk::Monitor>,
     ) -> Self {
+        // KWin does not expose layer-shell to ordinary clients. A normal
+        // toplevel cannot be positioned outside the selection reliably, so the
+        // outline is omitted rather than risking it being captured.
+        if !gtk4_layer_shell::is_supported() {
+            return Self {
+                windows: Vec::new(),
+            };
+        }
         let Some(screen) = screen else {
             return Self {
                 windows: Vec::new(),

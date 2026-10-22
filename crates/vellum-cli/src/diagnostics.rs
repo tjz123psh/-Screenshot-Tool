@@ -194,19 +194,18 @@ fn ocr_languages_check() -> Check {
 
 /// Reports which compositor this session is actually running.
 ///
-/// Neither niri nor Hyprland is required: capture, clipboard, OCR and the
-/// layer-shell overlay work on any wlroots-style compositor. What a recognised
-/// compositor buys is window control for the long-lived windows (floating the
-/// pin and result windows, and resizing the pin precisely). Reporting the
-/// unrecognised case as a warning rather than an error keeps `doctor` honest
-/// about that difference without pretending a plain session is broken.
+/// niri and KDE have separate capture and window-control paths. What a
+/// recognised compositor buys is window control for the long-lived windows
+/// (keeping the pin/result above ordinary windows and resizing the pin
+/// precisely). Reporting the unrecognised case as a warning rather than an error
+/// keeps `doctor` honest without pretending a plain session is broken.
 fn compositor_check() -> Check {
     match compositor::detect() {
         Compositor::Unknown => check(
             "compositor",
             "合成器",
             Level::Warning,
-            "未识别（截图可用；钉图窗口无法自动浮动或精确改尺寸）",
+            "未识别（仅 wlroots 合成器可用 grim；钉图无法自动置顶或精确改尺寸）",
         ),
         found => check(
             "compositor",
@@ -214,6 +213,19 @@ fn compositor_check() -> Check {
             Level::Ok,
             format!("{}（支持窗口控制）", found.label()),
         ),
+    }
+}
+
+fn capture_backend_check() -> Check {
+    if compositor::detect() == Compositor::Kde {
+        check(
+            "grim",
+            "屏幕捕获",
+            Level::Ok,
+            "KWin ScreenShot2（KDE Plasma）",
+        )
+    } else {
+        required_binary("grim", "屏幕捕获", "grim")
     }
 }
 
@@ -413,7 +425,7 @@ fn run_with(mut inspect: impl FnMut(&'static str, fn() -> Check) -> Check) -> Re
             ),
         }),
         ("compositor", compositor_check),
-        ("grim", || required_binary("grim", "屏幕捕获", "grim")),
+        ("grim", capture_backend_check),
         ("wl-copy", || {
             required_binary("wl-copy", "剪贴板", "wl-copy")
         }),

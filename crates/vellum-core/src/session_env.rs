@@ -160,7 +160,7 @@ pub fn display_environment() -> Vec<(String, String)> {
 /// Reconstructs the display variables from the running session.
 ///
 /// A compositor is free to skip `systemctl --user import-environment`
-/// altogether - Hyprland does, which is exactly why this unit also ships
+/// altogether, which is exactly why this unit also ships
 /// `default.target`. In that case no amount of asking the manager will produce
 /// a `WAYLAND_DISPLAY`, but the socket is still sitting in `XDG_RUNTIME_DIR`
 /// and can be found directly.

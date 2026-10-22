@@ -1,29 +1,15 @@
 //! Inspect and manage vellum's hotkeys in the running compositor's config.
 //!
-//! Both supported compositors keep their bindings in user-owned text files, but
-//! what vellum may safely *do* with those files differs, and the difference is
-//! not cosmetic:
+//! Only niri uses a text file that vellum can safely own: its KDL config is
+//! validated with `niri validate`, and a managed block is rolled back on
+//! failure. KDE Plasma uses the standard XDG GlobalShortcuts portal instead;
+//! vellum must not write KDE's system shortcut configuration, so the legacy
+//! install/remove commands explain the supported in-app path.
 //!
-//! * niri's config is KDL. A managed block can be inserted between marker
-//!   comments, validated with `niri validate`, and rolled back on failure. So
-//!   `install`/`remove` genuinely write there.
-//! * Hyprland's Lua config (0.5x) is code, not settings: editing it means
-//!   generating and splicing code into a program, and this build refuses
-//!   `hyprctl keyword` outright ("keyword can't work with non-legacy
-//!   parsers"), so there is no validation step to catch a bad edit either.
-//! * The classic `hyprland.conf` (hyprlang) path is writable with the same
-//!   safety net as niri: back up, write a managed block, `hyprctl reload`,
-//!   then check `hyprctl configerrors` and roll back on failure.
-//!
-//! So `install` writes niri KDL and classic hyprlang, and only prints a
-//! snippet for the Hyprland Lua dialect.
-//!
-//! Discovery is read-only and works for both. It has to parse config text
-//! rather than ask the compositor: `hyprctl binds` reports every Lua binding as
-//! `dispatcher: __lua` with an opaque numeric `arg`, so the live compositor
-//! cannot say which key spawns vellum.
+//! Discovery for niri is read-only and parses the config text rather than
+//! asking the compositor, because the live IPC cannot reliably name the chord
+//! that spawns vellum.
 
-mod hyprland;
 mod niri;
 
 use std::path::{Path, PathBuf};
@@ -47,9 +33,9 @@ pub(crate) fn action_alternation() -> String {
 
 /// The chords vellum installs by default, as `(chord, action, title)`.
 ///
-/// Written in niri's syntax because that is the one vellum actually writes;
-/// `hyprland::chord` translates it. Deliberately conservative: these leave the
-/// compositors' own `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone.
+/// Written in niri's syntax because that is the one vellum actually writes.
+/// Deliberately conservative: these leave the desktop's own
+/// `Print`/`Alt+Print`/`Ctrl+Print` screenshot bindings alone.
 ///
 /// The spawned command is `vellumctl`, not `vellum`: this runs on every
 /// keypress and the thin client avoids the argument parser and the GUI stack.
@@ -110,7 +96,7 @@ impl InstallResult {
 ///
 /// Detection is by environment, so an unknown session reports `Unknown` rather
 /// than guessing at whichever config directory happens to exist. A user with
-/// both niri and Hyprland installed is the normal case, not an edge case.
+/// niri installed alongside another desktop is the normal case, not an edge case.
 pub fn target() -> Compositor {
     compositor::detect()
 }
@@ -118,7 +104,7 @@ pub fn target() -> Compositor {
 /// The config directory of the active compositor.
 pub fn config_dir() -> PathBuf {
     match target() {
-        Compositor::Hyprland => hyprland::config_dir(),
+        Compositor::Kde => PathBuf::from("KDE 系统快捷键（由应用内授权管理）"),
         // Falling back to niri keeps `shortcuts list` useful in a plain
         // Wayland session, where the user is likely preparing a config.
         _ => niri::config_dir(),
@@ -128,7 +114,11 @@ pub fn config_dir() -> PathBuf {
 /// Writes the default bindings, or explains why it will not.
 pub fn install(directory: Option<&Path>) -> InstallResult {
     match target() {
-        Compositor::Hyprland => hyprland::install(directory),
+        Compositor::Kde => InstallResult::new(
+            Status::Unavailable,
+            None,
+            "KDE 使用系统快捷键授权；请运行 vellum shortcuts enable，或在设置页启用",
+        ),
         _ => niri::install(directory),
     }
 }
@@ -136,7 +126,11 @@ pub fn install(directory: Option<&Path>) -> InstallResult {
 /// Removes the managed block. Manual bindings are never touched.
 pub fn remove(directory: Option<&Path>) -> InstallResult {
     match target() {
-        Compositor::Hyprland => hyprland::remove(directory),
+        Compositor::Kde => InstallResult::new(
+            Status::Unavailable,
+            None,
+            "KDE 快捷键由系统授权管理；请运行 vellum shortcuts disable，或在设置页停用",
+        ),
         _ => niri::remove(directory),
     }
 }
@@ -144,7 +138,7 @@ pub fn remove(directory: Option<&Path>) -> InstallResult {
 /// Every vellum binding found anywhere in the config directory.
 pub fn discover(directory: Option<&Path>) -> Vec<Binding> {
     match target() {
-        Compositor::Hyprland => hyprland::discover(directory),
+        Compositor::Kde => Vec::new(),
         _ => niri::discover(directory),
     }
 }
@@ -152,7 +146,7 @@ pub fn discover(directory: Option<&Path>) -> Vec<Binding> {
 /// Only the bindings in files the compositor actually loads.
 pub fn discover_active(directory: Option<&Path>) -> Vec<Binding> {
     match target() {
-        Compositor::Hyprland => hyprland::discover_active(directory),
+        Compositor::Kde => Vec::new(),
         _ => niri::discover_active(directory),
     }
 }
@@ -170,12 +164,12 @@ pub fn action_label(action: &str) -> &str {
 ///
 /// Compositors do not spawn with the user's shell PATH, so a bare `vellumctl`
 /// silently fails to launch. `$HOME` is left unexpanded for niri's `spawn-sh`,
-/// which runs through a shell; Hyprland's generator expands it.
+/// which runs through a shell.
 pub(crate) fn launcher_path() -> String {
     "$HOME/.local/bin/vellumctl".to_string()
 }
 
-/// Minimal scratch directory helper shared by both backends' tests; avoids a
+/// Minimal scratch directory helper shared by the niri backend tests; avoids a
 /// dev-dependency for one need.
 #[cfg(test)]
 pub(crate) mod tempdir {

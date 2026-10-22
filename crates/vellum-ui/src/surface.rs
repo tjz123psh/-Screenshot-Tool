@@ -33,7 +33,7 @@ use gtk4::{
     EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, GestureClick,
     IMMulticontext,
 };
-use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell, is_supported};
 use vellum_core::geom::Rect;
 use vellum_core::image::Rgb8;
 use vellum_core::io::ClipboardError;
@@ -200,16 +200,25 @@ pub fn present(
         .build();
     window.add_css_class("vellum-transparent");
 
-    window.init_layer_shell();
-    window.set_layer(Layer::Overlay);
-    window.set_namespace(Some(NAMESPACE));
-    window.set_keyboard_mode(KeyboardMode::Exclusive);
-    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
-        window.set_anchor(edge, true);
+    if is_supported() {
+        window.init_layer_shell();
+        window.set_layer(Layer::Overlay);
+        window.set_namespace(Some(NAMESPACE));
+        window.set_keyboard_mode(KeyboardMode::Exclusive);
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            window.set_anchor(edge, true);
+        }
+        // Ignore other clients' exclusive zones: the overlay must cover panels
+        // too, otherwise screenshot geometry and visible dimming disagree.
+        window.set_exclusive_zone(-1);
+    } else {
+        // KWin 6.8 does not expose wlr-layer-shell to regular clients. A
+        // decorated-less fullscreen toplevel still covers the output and holds
+        // keyboard focus; it keeps the same drawing and selection code.
+        window.set_default_size(screen_w, screen_h);
+        window.set_resizable(false);
+        window.fullscreen();
     }
-    // Ignore other clients' exclusive zones: the overlay must cover panels too,
-    // otherwise the screenshot geometry and the visible dimming disagree.
-    window.set_exclusive_zone(-1);
 
     let canvas = DrawingArea::new();
     canvas.set_hexpand(true);
