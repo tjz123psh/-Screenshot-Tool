@@ -146,6 +146,14 @@ fn prefer_cairo_renderer() {
 /// only happens when the display is genuinely unreachable, so the hot path
 /// never pays for it.
 fn recover_display_environment() {
+    // The input-method module is not a display variable and must be settled
+    // before GTK initialises: a KDE session exports only XMODIFIERS and
+    // QT_IM_MODULES, and without a module the annotation text tool never
+    // reaches fcitx5.
+    let im = vellum_core::session_env::adopt_im_environment();
+    if !im.is_empty() {
+        eprintln!("[vellum] input method: {}", im.join(", "));
+    }
     if vellum_core::session_env::display_is_reachable() {
         return;
     }

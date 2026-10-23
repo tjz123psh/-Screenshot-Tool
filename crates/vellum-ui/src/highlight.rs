@@ -149,4 +149,48 @@ mod tests {
         let sel = Rect::new(0, 0, 1920, 1080);
         assert!(edge_rects(sel, (1920, 1080), EDGE_WIDTH).is_empty());
     }
+
+    #[test]
+    fn recording_frame_windows_are_built_and_mapped() {
+        // The strips are the only indicator of what a long shot is capturing.
+        // A compositor without layer-shell omits them by design, so this only
+        // asserts where the protocol exists.
+        let ran = crate::test_support::with_gtk(|| {
+            if !gtk4_layer_shell::is_supported() {
+                return;
+            }
+            let app = Application::builder()
+                .application_id("ai.vellum.highlight-test")
+                .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk4::gio::Cancellable>).unwrap();
+            let monitor = gtk4::gdk::Display::default()
+                .and_then(|display| display.monitors().item(0))
+                .and_then(|item| item.downcast::<gtk4::gdk::Monitor>().ok());
+            let highlight = SelectionHighlight::new(
+                &app,
+                Rect::new(300, 200, 600, 400),
+                Some((1920, 1080)),
+                monitor.as_ref(),
+            );
+            assert_eq!(highlight.windows.len(), 4);
+            highlight.present();
+            let context = gtk4::glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
+            while std::time::Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                highlight.windows.iter().all(|window| window.is_mapped()),
+                "every frame strip must map"
+            );
+            for window in &highlight.windows {
+                window.close();
+            }
+        });
+        if !ran {
+            eprintln!("GTK unavailable: recording frame not exercised");
+        }
+    }
 }

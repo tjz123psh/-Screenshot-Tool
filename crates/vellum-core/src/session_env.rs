@@ -157,6 +157,126 @@ pub fn display_environment() -> Vec<(String, String)> {
     recovered
 }
 
+/// GTK's input-method module, when the session only names its IM the X11/Qt way.
+///
+/// KDE exports `XMODIFIERS=@im=fcitx` and `QT_IM_MODULES`, but not
+/// `GTK_IM_MODULE`. Without a module GTK falls back to the Wayland text-input
+/// protocol, and KWin does not route that to layer-shell surfaces - so the
+/// annotation text tool, whose editor is a drawing area inside a layer-shell
+/// overlay, never reaches fcitx5 and Chinese composition is lost. Naming the
+/// module makes GTK talk to fcitx5 directly over D-Bus instead.
+///
+/// Nothing is supplied when the session already chose a module, and nothing is
+/// supplied when the module is not installed, so a machine without fcitx5-gtk
+/// keeps GTK's own default instead of a broken setting.
+pub fn im_environment() -> Vec<(String, String)> {
+    if std::env::var("GTK_IM_MODULE")
+        .ok()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Vec::new();
+    }
+    let Some(module) = im_module_from(
+        std::env::var("XMODIFIERS").ok().as_deref(),
+        std::env::var("QT_IM_MODULES").ok().as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    if !installed_im_modules()
+        .iter()
+        .any(|name| name.starts_with(&format!("libim-{module}")))
+    {
+        return Vec::new();
+    }
+    vec![("GTK_IM_MODULE".to_string(), module.to_string())]
+}
+
+/// The input-method modules GTK 4 can actually load, as file names.
+///
+/// GTK resolves modules from `$GTK_PATH` first and then its compiled-in library
+/// dirs; the same order is used here so a module outside the standard prefix is
+/// still found.
+fn installed_im_modules() -> Vec<String> {
+    let mut roots: Vec<std::path::PathBuf> =
+        ["/usr/local/lib", "/usr/lib", "/usr/lib64", "/app/lib"]
+            .into_iter()
+            .map(|root| std::path::Path::new(root).join("gtk-4.0"))
+            .collect();
+    if let Some(path) = std::env::var_os("GTK_PATH") {
+        for part in std::env::split_paths(&path) {
+            roots.push(part.join("gtk-4.0"));
+        }
+    }
+    installed_im_modules_in(&roots)
+}
+
+/// The file-name half of [`installed_im_modules`], over explicit roots.
+fn installed_im_modules_in(roots: &[std::path::PathBuf]) -> Vec<String> {
+    let mut names = Vec::new();
+    for root in roots {
+        let Ok(versions) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for version in versions.flatten() {
+            let Ok(modules) = std::fs::read_dir(version.path().join("immodules")) else {
+                continue;
+            };
+            for module in modules.flatten() {
+                if let Some(name) = module.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Picks the module a session expects, from the variables it exports.
+///
+/// `@im=fcitx` and `wayland;fcitx;ibus` both spell the name as a separate
+/// token, so the comparison is on tokens rather than substrings.
+fn im_module_from(xmodifiers: Option<&str>, qt_modules: Option<&str>) -> Option<&'static str> {
+    fn mentions(value: Option<&str>, module: &str) -> bool {
+        value.is_some_and(|value| {
+            value
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|token| token.eq_ignore_ascii_case(module))
+        })
+    }
+    ["fcitx", "ibus"]
+        .into_iter()
+        .find(|module| mentions(xmodifiers, module))
+        .or_else(|| {
+            ["fcitx", "ibus"]
+                .into_iter()
+                .find(|module| mentions(qt_modules, module))
+        })
+}
+
+/// Display variables plus the input-method module, for a child that needs GTK.
+pub fn process_environment() -> Vec<(String, String)> {
+    let mut environment = display_environment();
+    for (name, value) in im_environment() {
+        if !environment.iter().any(|(known, _)| *known == name) {
+            environment.push((name, value));
+        }
+    }
+    environment
+}
+
+/// Adopts the input-method module into this process, before GTK initialises.
+///
+/// Only valid from the single-threaded start of a binary; see
+/// [`adopt_display_environment`].
+pub fn adopt_im_environment() -> Vec<String> {
+    let adopted = im_environment();
+    for (name, value) in &adopted {
+        // SAFETY: the binaries call this before GTK and before any thread.
+        unsafe { std::env::set_var(name, value) };
+    }
+    adopted.into_iter().map(|(name, _)| name).collect()
+}
+
 /// Reconstructs the display variables from the running session.
 ///
 /// A compositor is free to skip `systemctl --user import-environment`
@@ -258,7 +378,7 @@ pub fn adopt_display_environment() -> Vec<String> {
 /// own environment, so it is safe on a multiplexing service thread and cannot
 /// surprise unrelated code. Returns the names applied, for logging.
 pub fn apply_to_command(command: &mut std::process::Command) -> Vec<String> {
-    let recovered = display_environment();
+    let recovered = process_environment();
     for (name, value) in &recovered {
         command.env(name, value);
     }
@@ -540,6 +660,42 @@ mod tests {
         let _display = EnvGuard::clear("WAYLAND_DISPLAY");
         let _x11 = EnvGuard::set("DISPLAY", ":0");
         assert!(display_is_reachable());
+    }
+
+    #[test]
+    fn im_module_follows_the_tokens_the_session_exports() {
+        assert_eq!(im_module_from(Some("@im=fcitx"), None), Some("fcitx"));
+        assert_eq!(
+            im_module_from(None, Some("wayland;fcitx;ibus")),
+            Some("fcitx")
+        );
+        assert_eq!(
+            im_module_from(Some("@im=ibus"), Some("wayland;fcitx")),
+            Some("ibus")
+        );
+        assert_eq!(im_module_from(Some("@im=none"), Some("wayland")), None);
+        assert_eq!(im_module_from(None, None), None);
+        // A longer name that merely contains the module name is not a match.
+        assert_eq!(im_module_from(Some("@im=notfcitx"), None), None);
+    }
+
+    #[test]
+    fn module_discovery_reads_every_installed_version_directory() {
+        let root = std::env::temp_dir().join(format!("vellum-immodules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("4.0.0/immodules")).unwrap();
+        std::fs::write(root.join("4.0.0/immodules/libim-fcitx5.so"), b"").unwrap();
+        let names = installed_im_modules_in(std::slice::from_ref(&root));
+        assert!(names.iter().any(|name| name.starts_with("libim-fcitx5")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_gtk_module_is_never_overridden() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _module = EnvGuard::set("GTK_IM_MODULE", "wayland");
+        let _xmodifiers = EnvGuard::set("XMODIFIERS", "@im=fcitx");
+        assert!(im_environment().is_empty());
     }
 
     #[test]

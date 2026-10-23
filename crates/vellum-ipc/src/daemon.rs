@@ -411,6 +411,10 @@ impl Service {
         // Set before the caller's explicit spawn variables so an action can
         // still override them, and inherited by every descendant of the action.
         command.envs(self.display_env());
+        // GTK reads its input-method module once, at init: the annotation text
+        // editor only reaches fcitx5 when the overlay process is told which
+        // module to use.
+        command.envs(vellum_core::session_env::im_environment());
         command
             .arg(action.as_str())
             .args(args)

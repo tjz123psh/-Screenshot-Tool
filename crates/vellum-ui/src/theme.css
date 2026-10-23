@@ -52,8 +52,15 @@
 .vellum-glass .vellum-caption, .vellum-glass .vellum-section-hint, .vellum-glass .vellum-row-sub { font-size: 12px; }
 .vellum-glass .vellum-general-row { min-height: 32px; }
 
-.vellum-transparent, .vellum-highlight-window, .vellum-highlight-edge {
+.vellum-transparent, .vellum-highlight-window {
   background: transparent; border: none; box-shadow: none;
+}
+/* The long-shot recording frame. Its strips live strictly outside the sampled
+   rectangle, so they are the only thing telling the user what is still being
+   captured; a transparent rule here means no frame at all. */
+.vellum-highlight-edge {
+  background-color: alpha(@vellum_accent, 0.95);
+  box-shadow: 0 0 8px alpha(@vellum_accent, 0.55);
 }
 .vellum-card { border: 1px solid rgba(255,255,255,0.11); border-radius: 12px; box-shadow: 0 8px 20px rgba(0,0,0,0.28); }
 .vellum-card.vellum-micro { border-radius: 9px; box-shadow: none; }

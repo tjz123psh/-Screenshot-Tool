@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 use std::cell::RefCell;
 use std::collections::HashSet;
-const CSS_VERSION: u32 = 18;
+const CSS_VERSION: u32 = 19;
 const CSS: &str = include_str!("theme.css");
 thread_local! {static INSTALLED:RefCell<HashSet<(usize,u32)>>=RefCell::new(HashSet::new());}
 pub fn install(display: &Display) {
@@ -124,6 +124,30 @@ mod tests {
         }
         assert!(focus.contains("outline: 2px solid @vellum_accent"));
         assert!(!focus.contains("outline: none"));
+    }
+    #[test]
+    fn the_long_shot_recording_frame_is_not_transparent() {
+        // Regression: the edge windows were folded into the transparent rule,
+        // so a recording ran with an invisible frame and no indication of the
+        // region being captured.
+        let start = CSS.find(".vellum-highlight-edge {").unwrap();
+        let rule = &CSS[start..CSS[start..].find('}').unwrap() + start];
+        assert!(
+            rule.contains("background-color:"),
+            "no visible fill: {rule}"
+        );
+        assert!(
+            !rule.contains("transparent"),
+            "the recording frame must be visible: {rule}"
+        );
+        let transparent = CSS
+            .find(".vellum-transparent, .vellum-highlight-window")
+            .unwrap();
+        let group = &CSS[transparent..CSS[transparent..].find('}').unwrap() + transparent];
+        assert!(
+            !group.contains(".vellum-highlight-edge"),
+            "the frame must not be grouped with transparent windows"
+        );
     }
     #[test]
     fn component_roles_have_style_rules() {

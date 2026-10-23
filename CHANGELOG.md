@@ -2,6 +2,11 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.3.2] - 2026-10-23
+
+- Restore the long-shot recording frame. When the stylesheet moved out of `theme.rs` into `theme.css`, the four edge strips were folded into the transparent-window rule, so a recording ran with an invisible frame and nothing marked the region being captured. The strips carry the accent colour again, and a test fails if they are made transparent.
+- Make the annotation text tool reach the input method on KDE. The session exports only `XMODIFIERS=@im=fcitx` and `QT_IM_MODULES`, not `GTK_IM_MODULE`, so GTK fell back to the Wayland text-input protocol — which KWin does not route to layer-shell surfaces, leaving pinyin composition with nothing to show. The module is now supplied to every UI process before GTK initialises and to every action the service spawns, but only when the session did not choose one and the module is actually installed. Verified on this machine with only `XMODIFIERS` set: the UI process maps `libim-fcitx5.so`.
+
 ## [0.3.1] - 2026-10-23
 
 - Keep a saved file's identity when `另存为` replaces it: a symbolic link is written through instead of being replaced by a regular file, and the existing permission bits are kept instead of silently tightening a 0644 file to 0600. New files stay 0600, and setuid/setgid bits are never inherited.
