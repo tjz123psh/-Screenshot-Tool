@@ -2,6 +2,7 @@
 
 mod atomic_file;
 mod clipboard_process;
+pub(crate) use atomic_file::resolve_destination;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

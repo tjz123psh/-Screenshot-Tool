@@ -1,7 +1,7 @@
 //! Publish only fully written screenshots. Temporary files are private and local.
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -90,14 +90,58 @@ pub(super) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     replace_with(path, |file| file.write_all(bytes))
 }
 fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
-    let dir = path
+    let target = resolve_destination(path)?;
+    let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    let mode = existing_mode(&target)?;
     let mut pending = prepare(dir, write)?;
-    pending.replace(path)?;
+    if let Some(mode) = mode {
+        pending.file.set_permissions(Permissions::from_mode(mode))?;
+        pending.file.sync_all()?;
+    }
+    pending.replace(&target)?;
     // The rename is the commit point. Do not claim rollback if directory sync fails.
-    sync_committed(dir, path)
+    sync_committed(dir, &target)
+}
+/// Follow a chain of links so a user-chosen destination keeps its link.
+///
+/// Desktop shortcuts and dotfile checkouts are commonly links; renaming over
+/// the link itself would silently detach it. A dangling link resolves to its
+/// final path, where the file is then created.
+pub(crate) fn resolve_destination(path: &Path) -> io::Result<PathBuf> {
+    const MAX_LINKS: usize = 32;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = std::fs::read_link(&current)?;
+                current = if link.is_absolute() {
+                    link
+                } else {
+                    current.parent().unwrap_or(Path::new(".")).join(link)
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "destination has too many symbolic links",
+    ))
+}
+/// Keep the permission bits of the file being replaced; new files stay 0600.
+/// Special bits are dropped: a replaced file must not inherit setuid/setgid.
+fn existing_mode(target: &Path) -> io::Result<Option<u32>> {
+    match std::fs::metadata(target) {
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.permissions().mode() & 0o777)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 fn sync_committed(dir: &Path, path: &Path) -> io::Result<()> {
     File::open(dir)
@@ -304,6 +348,70 @@ mod tests {
         std::fs::write(&p, b"old").unwrap();
         replace(&p, b"new").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"new");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn new_files_stay_private_and_replace_keeps_existing_permissions() {
+        let dir = dir();
+        let fresh = dir.join("fresh.png");
+        replace(&fresh, b"new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let shared = dir.join("shared.png");
+        std::fs::write(&shared, b"old").unwrap();
+        std::fs::set_permissions(&shared, Permissions::from_mode(0o644)).unwrap();
+        replace(&shared, b"new").unwrap();
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn replace_writes_through_a_symbolic_link_and_keeps_the_link() {
+        let dir = dir();
+        let real = dir.join("real.png");
+        std::fs::write(&real, b"old").unwrap();
+        let link = dir.join("shortcut.png");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace(&link, b"new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn dangling_link_creates_its_target_instead_of_replacing_the_link() {
+        let dir = dir();
+        let missing = dir.join("later.png");
+        let link = dir.join("pending.png");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        replace(&link, b"new").unwrap();
+        assert_eq!(std::fs::read(&missing).unwrap(), b"new");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn link_cycles_are_rejected_without_touching_anything() {
+        let dir = dir();
+        let first = dir.join("first.png");
+        let second = dir.join("second.png");
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        std::os::unix::fs::symlink(&first, &second).unwrap();
+        let error = replace(&first, b"new").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -168,6 +168,32 @@ fn settings_isolated_regression() {
     std::fs::create_dir(&preference_path).unwrap();
     assert!(edited.save_settings(&base, &defaults, &defaults).is_err());
     assert_eq!(std::fs::read(paths::config_path()).unwrap(), before);
+    std::fs::remove_dir(&preference_path).unwrap();
+    std::fs::rename(preference_path.with_extension("backup"), &preference_path).unwrap();
+    // A dotfile checkout links config.toml: saving keeps the link and writes its target.
+    use std::os::unix::fs::PermissionsExt as _;
+    let linked_target = paths::home().join("dotfiles-config.toml");
+    std::fs::rename(paths::config_path(), &linked_target).unwrap();
+    std::os::unix::fs::symlink(&linked_target, paths::config_path()).unwrap();
+    let mut linked = base.clone();
+    linked.api.timeout_s = 7;
+    linked.save().unwrap();
+    assert!(
+        std::fs::symlink_metadata(paths::config_path())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(Config::load().api.timeout_s, 7);
+    // Writes stay private because the file can hold an API key.
+    assert_eq!(
+        std::fs::metadata(&linked_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 fn output_preferences_regression(base: &Config, defaults: &Preferences) {

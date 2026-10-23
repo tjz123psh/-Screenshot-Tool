@@ -2,6 +2,12 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [Unreleased]
+
+- Keep a saved file's identity when `另存为` replaces it: a symbolic link is written through instead of being replaced by a regular file, and the existing permission bits are kept instead of silently tightening a 0644 file to 0600. New files stay 0600, and setuid/setgid bits are never inherited.
+- Write `config.toml` through a symbolic link, so a dotfile-managed settings file keeps its link. The cross-process lock and the atomic replacement still apply.
+- Re-check the compact-UI audit's loose ends: atomic replacement, cross-process settings merging and the viewer ready receipt were already implemented; the audit page now records the evidence and the one remaining gap (the panel's 查看图片 still reports only that a process started).
+
 ## [0.3.0]
 
 - Replace Hyprland support with KDE Plasma. KDE capture uses KWin's `org.kde.KWin.ScreenShot2` raw-pixel pipe instead of grim/wlr-screencopy, and long shots capture each frame through `CaptureArea`. KWin auto-excludes the calling process's own windows, so the panel and outline cannot enter the result.

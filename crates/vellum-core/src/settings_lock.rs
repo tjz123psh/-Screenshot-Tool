@@ -62,6 +62,9 @@ fn atomic_write_with_sync(
     body: &[u8],
     sync: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    // A dotfile checkout usually links this path; write through the link so the
+    // settings file keeps its link instead of being replaced by a regular file.
+    let target = crate::io::resolve_destination(target)?;
     let dir = target
         .parent()
         .ok_or_else(|| io::Error::other("settings path has no parent"))?;
@@ -85,7 +88,7 @@ fn atomic_write_with_sync(
     let result = (|| {
         file.write_all(body)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, target)
+        std::fs::rename(&temporary, &target)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
