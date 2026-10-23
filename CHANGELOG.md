@@ -2,7 +2,7 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
-## [Unreleased]
+## [0.3.1] - 2026-10-23
 
 - Keep a saved file's identity when `另存为` replaces it: a symbolic link is written through instead of being replaced by a regular file, and the existing permission bits are kept instead of silently tightening a 0644 file to 0600. New files stay 0600, and setuid/setgid bits are never inherited.
 - Write `config.toml` through a symbolic link, so a dotfile-managed settings file keeps its link. The cross-process lock and the atomic replacement still apply.
@@ -186,7 +186,8 @@ All notable changes to vellum are documented here. The Rust rewrite starts a new
 - Approximately 0.15 seconds for the 101-frame 900×700 long-shot benchmark.
 - Approximately 0.04 milliseconds p50 for local control-socket ping/status round trips.
 
-[Unreleased]: https://github.com/tjz123psh/-Screenshot-Tool/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/tjz123psh/-Screenshot-Tool/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.3.1
 [0.1.2]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.2
 [0.1.1]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tjz123psh/-Screenshot-Tool/releases/tag/v0.1.0
