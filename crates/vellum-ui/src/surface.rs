@@ -169,6 +169,7 @@ pub fn present(
     daemon_managed: bool,
     on_result: ResultHandler,
 ) -> anyhow::Result<ApplicationWindow> {
+    crate::trace::mark("overlay-build-start");
     let screen_w = background.width as i32;
     let screen_h = background.height as i32;
     let state = Rc::new(RefCell::new(State {
@@ -243,6 +244,7 @@ pub fn present(
     install_watchdog(&state, &emitter);
 
     window.present();
+    crate::trace::mark("overlay-presented");
     Ok(window)
 }
 

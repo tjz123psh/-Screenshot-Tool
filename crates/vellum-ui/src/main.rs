@@ -496,6 +496,7 @@ fn run_region(
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
+    trace::mark("gtk-app-built");
     let session = Rc::new(Session::new(
         capture,
         flags,
@@ -503,9 +504,11 @@ fn run_region(
         daemon_managed,
         longshot_trace,
     ));
+    app.connect_startup(|_| trace::mark("gtk-startup"));
     let activate = session.clone();
     app.connect_activate(move |app| activate.start(app));
 
+    trace::mark("app-run-enter");
     let empty: [String; 0] = [];
     app.run_with_args(&empty);
     Ok(session.exit_code.get())
@@ -621,6 +624,7 @@ impl Session {
     }
 
     fn start(self: &Rc<Self>, app: &gtk4::Application) {
+        trace::mark("session-start");
         if let Some(capture) = self.pending.borrow_mut().take() {
             // A panicked grab thread is reported the same way as a failed grab:
             // either way there is no frame to annotate.
@@ -650,6 +654,7 @@ impl Session {
             }
         }
 
+        trace::mark("session-capture-joined");
         let Some(background) = self.background.borrow().clone() else {
             return;
         };

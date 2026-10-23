@@ -21,7 +21,10 @@ const OBJECT: &str = "/org/kde/KWin/ScreenShot2";
 const IFACE: &str = "org.kde.KWin.ScreenShot2";
 const CALL_TIMEOUT_MS: i32 = 3_000;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
-const READ_POLL: Duration = Duration::from_millis(2);
+/// Wake-up slice while waiting for the producer; poll returns earlier on data.
+const READ_WAIT_SLICE: Duration = Duration::from_millis(50);
+const READ_CHUNK_BYTES: usize = 1 << 18;
+const READ_BUFFER_BYTES: usize = 1 << 20;
 
 pub fn capture_workspace() -> Result<Rgb8, CaptureError> {
     capture(None)
@@ -69,6 +72,7 @@ fn capture(area: Option<Rect>) -> Result<Rgb8, CaptureError> {
             glib::Variant::tuple_from_iter([options, glib::variant::Handle(index).to_variant()]),
         ),
     };
+    crate::trace::mark("kde-capture-call");
     let reply = connection
         .call_with_unix_fd_list_sync(
             Some(SERVICE),
@@ -83,6 +87,7 @@ fn capture(area: Option<Rect>) -> Result<Rgb8, CaptureError> {
             None::<&gio::Cancellable>,
         )
         .map_err(|error| CaptureError::Failed(format!("KWin {method}: {error}")))?;
+    crate::trace::mark("kde-capture-reply");
     let metadata_variant = reply.0.child_value(0);
     let metadata = glib::VariantDict::new(Some(&metadata_variant));
     let width = metadata_u32(&metadata, "width")?;
@@ -102,13 +107,16 @@ fn capture(area: Option<Rect>) -> Result<Rgb8, CaptureError> {
         .checked_mul(height as usize)
         .ok_or_else(|| CaptureError::Failed("KWin frame size overflow".into()))?;
     let bytes = read_frame(&read, expected)?;
-    decode_frame(
+    crate::trace::mark("kde-frame-read");
+    let image = decode_frame(
         width as usize,
         height as usize,
         stride as usize,
         format,
         &bytes,
-    )
+    )?;
+    crate::trace::mark("kde-frame-decoded");
+    Ok(image)
 }
 
 fn options() -> glib::Variant {
@@ -144,9 +152,17 @@ fn read_frame(file: &File, expected: usize) -> Result<Vec<u8>, CaptureError> {
             std::io::Error::last_os_error()
         )));
     }
+    // KWin writes an 8 MiB frame through this pipe. The default 64 KiB capacity
+    // blocks the producer on every chunk and makes the reader wake hundreds of
+    // times; asking for the largest unprivileged buffer keeps the capture to one
+    // burst. Ignoring the result is fine: the default capacity still works.
+    // SAFETY: F_SETPIPE_SZ only resizes this pipe.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETPIPE_SZ, READ_BUFFER_BYTES as libc::c_int);
+    }
     let deadline = Instant::now() + READ_TIMEOUT;
     let mut bytes = Vec::with_capacity(expected);
-    let mut chunk = [0u8; 65536];
+    let mut chunk = vec![0u8; READ_CHUNK_BYTES];
     while bytes.len() < expected {
         let remaining = expected - bytes.len();
         let want = remaining.min(chunk.len());
@@ -164,10 +180,32 @@ fn read_frame(file: &File, expected: usize) -> Result<Vec<u8>, CaptureError> {
         }
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            if Instant::now() >= deadline {
+            // Wait for the producer instead of polling on a fixed 2 ms tick;
+            // every artificial wake-up was latency on the hotkey path.
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(CaptureError::Timeout);
             }
-            std::thread::sleep(READ_POLL);
+            let slice = deadline
+                .saturating_duration_since(now)
+                .min(READ_WAIT_SLICE)
+                .as_millis()
+                .max(1) as libc::c_int;
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd; poll only writes revents.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, slice) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(CaptureError::Failed(format!(
+                        "waiting for the KWin image: {error}"
+                    )));
+                }
+            }
         } else if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(CaptureError::Failed(format!("reading KWin image: {error}")));
         }

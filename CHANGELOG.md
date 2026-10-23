@@ -2,6 +2,11 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.3.3] - 2026-10-23
+
+- Cut the hotkey-to-overlay latency. KWin delivers each frame through a pipe that defaults to 64 KiB while the reader woke up on a fixed 2 ms tick, so an 8.3 MB frame cost 120-206 ms in pure waiting. The pipe buffer is raised to 1 MiB, reads use 256 KiB chunks, and a `poll()` wait replaces the tick. Measured on this machine (KDE Plasma 6.8.1, 1920x1080): frame read 120-206 ms -> 5-8 ms, first overlay frame 150-226 ms -> 80-90 ms, daemon-dispatched end to end about 105 ms.
+- Record the capture and startup phases (`kde-capture-call/reply`, `kde-frame-read/decoded`, `gtk-startup`, `overlay-build-start`, `overlay-presented`) in the opt-in `VELLUM_TRACE` stream, so the next regression is attributed instead of guessed.
+
 ## [0.3.2] - 2026-10-23
 
 - Restore the long-shot recording frame. When the stylesheet moved out of `theme.rs` into `theme.css`, the four edge strips were folded into the transparent-window rule, so a recording ran with an invisible frame and nothing marked the region being captured. The strips carry the accent colour again, and a test fails if they are made transparent.
