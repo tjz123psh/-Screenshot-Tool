@@ -1302,26 +1302,39 @@ impl Panel {
                 match result {
                     Ok(file) => {
                         let Some(path) = file.path() else {
-                            panel.flash("请选择本地 PNG 图片", Flash::Error);
+                            panel.flash("请选择本地图片", Flash::Error);
                             return;
                         };
-                        use std::os::unix::process::CommandExt;
-                        let spawned = std::env::current_exe().and_then(|exe| {
-                            std::process::Command::new(exe)
-                                .arg("preview-file")
-                                .arg(path)
-                                .stdin(std::process::Stdio::null())
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::inherit())
-                                .process_group(0)
-                                .spawn()
-                        });
-                        match spawned {
-                            Ok(child) => vellum_core::proc::reap_in_background(child),
-                            Err(error) => {
-                                panel.flash(&format!("无法打开查看器：{error}"), Flash::Error)
-                            }
-                        }
+                        let Some(app) = panel.window.application() else {
+                            panel.flash("无法打开查看器：设置窗口尚未就绪", Flash::Error);
+                            return;
+                        };
+                        // Decode on a worker so a large image cannot freeze the
+                        // panel. The window itself is built on the main loop and
+                        // exists when `open_external` returns, so a failure is
+                        // reported as a failure rather than "a process started".
+                        let weak_panel = Rc::downgrade(&panel);
+                        let still_open = weak_panel.clone();
+                        crate::ui_job::run(
+                            move || vellum_core::image::Rgb8::load(&path),
+                            move || still_open.upgrade().is_some(),
+                            move |result| {
+                                let Some(panel) = weak_panel.upgrade() else {
+                                    return;
+                                };
+                                match result {
+                                    Ok(Ok(image)) => {
+                                        if let Err(error) =
+                                            crate::preview::open_external(&app, image)
+                                        {
+                                            panel.flash(&error, Flash::Error);
+                                        }
+                                    }
+                                    Ok(Err(message)) => panel.flash(&message, Flash::Error),
+                                    Err(error) => panel.flash(&error.to_string(), Flash::Error),
+                                }
+                            },
+                        );
                     }
                     Err(error)
                         if error.matches(gtk4::DialogError::Dismissed)

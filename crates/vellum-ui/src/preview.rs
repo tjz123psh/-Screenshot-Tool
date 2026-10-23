@@ -317,6 +317,32 @@ pub(crate) fn open_document(app: &Application, document: SharedDocument) -> Resu
         Err(_) => Err("无法建立图片查看窗口；请保留现有窗口后重试".into()),
     }
 }
+/// Open a user-chosen file in a viewer window of the caller's Application.
+///
+/// The window exists when this returns, so callers can report a real failure
+/// instead of treating a started process as a shown window.
+pub(crate) fn open_external(app: &Application, image: Rgb8) -> Result<(), String> {
+    let document = raster_document(&image);
+    if let Some(document) = &document {
+        let mut document = document.borrow_mut();
+        let revision = document.revision();
+        document.mark_saved(revision);
+    }
+    match Viewer::new(
+        app,
+        Arc::new(image),
+        document,
+        false,
+        OutputReport::default(),
+        false,
+    ) {
+        Ok(viewer) => {
+            present(viewer, false);
+            Ok(())
+        }
+        Err(_) => Err("无法建立图片查看窗口；请保留现有窗口后重试".into()),
+    }
+}
 fn present(viewer: Rc<Viewer>, acknowledge: bool) {
     LIVE.with(|live| live.borrow_mut().push(viewer.clone()));
     if acknowledge {
@@ -1566,6 +1592,40 @@ mod tests {
         for row in (0..image.height).step_by(TILE_ROWS) {
             assert!(cache.get(&image, row).unwrap().height() <= TILE_ROWS as i32);
             assert!(cache.bytes <= CACHE_BYTES);
+        }
+    }
+    #[test]
+    fn externally_opened_image_reports_a_real_window_not_a_started_process() {
+        let ran = crate::test_support::with_gtk(|| {
+            let app = Application::builder()
+                .application_id("ai.vellum.open-external-test")
+                .flags(gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gio::Cancellable>).unwrap();
+            assert!(open_external(&app, Rgb8::new(24, 16)).is_ok());
+            let windows: Vec<_> = app.windows();
+            assert_eq!(
+                windows.len(),
+                1,
+                "the viewer window must exist before open_external returns"
+            );
+            assert!(windows[0].is_visible());
+            assert!(
+                windows[0]
+                    .application()
+                    .is_some_and(|owner| owner == app.clone()),
+                "the viewer must belong to the calling application"
+            );
+            for window in windows {
+                window.close();
+            }
+            let context = glib::MainContext::default();
+            for _ in 0..10 {
+                context.iteration(false);
+            }
+        });
+        if !ran {
+            eprintln!("GTK unavailable: external viewer window not exercised");
         }
     }
 }
