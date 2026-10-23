@@ -1089,7 +1089,7 @@ impl Recorder {
             // being shifted inward by bars/docks with exclusive zones.
             window.set_exclusive_zone(-1);
         } else {
-            // KWin has no layer-shell for ordinary clients. Use a fixed normal
+            // Fallback for a compositor without layer-shell. Use a fixed normal
             // window and place it after map through KWin scripting; it must not
             // take focus from the window the user is scrolling.
             window.set_focusable(false);

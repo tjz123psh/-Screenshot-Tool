@@ -35,7 +35,7 @@ vellum logs               # 查看服务日志
 | `Mod+Shift+Print` | 开始或完成长截图 |
 | `Mod+Ctrl+Print` | 钉住剪贴板图片 |
 
-Vellum 通过 XDG GlobalShortcuts 注册并处理全局按键，首次在应用“快捷键”页启用，系统可能要求授权。应用显示系统实际绑定的组合键，不把建议值当作已生效。**桌面后端必须支持此接口；仅能枚举接口不等于能成功绑定。** KDE 由 xdg-desktop-portal-kde 提供该接口；本机 niri + GNOME portal 的历史拒绝记录见[兼容性与高速滚动记录](<SHORTCUTS_AND_SPEED.md>)。
+Vellum 通过 XDG GlobalShortcuts 注册并处理全局按键，首次在应用“快捷键”页启用，系统可能要求授权。应用显示系统实际绑定的组合键，不把建议值当作已生效。**桌面后端必须支持此接口；仅能枚举接口不等于能成功绑定。** KDE 由 xdg-desktop-portal-kde 提供该接口；KDE Plasma 6.8.1 实测 portal 返回版本 2，授权后 `vellum-shortcuts.service` 保持 active，组合键为 `Meta+Print` / `Meta+Shift+Print` / `Meta+Ctrl+Print`（以 `vellum shortcuts status` 为准）。本机 niri + GNOME portal 的历史拒绝记录见[兼容性与高速滚动记录](<SHORTCUTS_AND_SPEED.md>)。
 
 旧配置不会自动删除。`vellum shortcuts legacy-list` 只读检查旧绑定；`install` / `remove` 子命令仅保留为显式传统兼容入口。版本化安装器不再自动写旧配置，即使环境中残留旧安装开关也不会恢复已移除的绑定。兼容示例在 `contrib/`：
 
@@ -51,7 +51,7 @@ Wayland 普通应用无法安全合成全局滚轮事件，所以 vellum 不做�
 4. 再次执行同一动作完成，或在控制面板聚焦时按 Enter；Esc 取消。
 5. 完成后按原有偏好保存/复制，并自动打开独立图片查看器。普通滚轮上下浏览，Ctrl+滚轮缩放，Shift+滚轮横移；`+`/`-` 缩放、`1` 原始大小、`Ctrl+0` 适应宽度，`Home`/`End` 与 `PageUp`/`PageDown` 导航。右侧全文概览可点击、拖动定位；复制和另存为始终输出完整图片，而非屏幕上可见的一部分。关闭查看器前可继续发起下一次截图。
 
-控制面板按选区外空间依次降级为完整面板、无预览 compact 面板、横向/纵向微型控制条；微型条仍保留采集状态、累计高度、取消和完成。只有连微型条都无法安全放置时才完全隐藏；正常由控制服务管理时再次按同一长截图快捷键仍可完成，direct 降级则会在采样前要求缩小选区。采样期间请保持选区和窗口尺寸不变。vellum 会处理短暂停顿、往返滚动、周期重复的列表页、突然跳回已捕获内容、固定页眉/页脚、局部动画和半透明窗口；控制面板与选区高亮不会进入结果图。长截图在 niri 优先复用一条可中断的 `wlr-screencopy` 连接；KDE 使用 KWin ScreenShot2 逐帧抓取，不依赖 grim；其他 wlroots 会话在协议不可用时会切到有 2 秒 deadline 的 grim，不会无限显示“采集中”却没有新帧。
+控制面板按选区外空间依次降级为完整面板、无预览 compact 面板、横向/纵向微型控制条；微型条仍保留采集状态、累计高度、取消和完成。只有连微型条都无法安全放置时才完全隐藏；正常由控制服务管理时再次按同一长截图快捷键仍可完成，direct 降级则会在采样前要求缩小选区。采样期间请保持选区和窗口尺寸不变。vellum 会处理短暂停顿、往返滚动、周期重复的列表页、突然跳回已捕获内容、固定页眉/页脚、局部动画和半透明窗口；控制面板与选区高亮不会进入结果图。长截图在 niri 优先复用一条可中断的 `wlr-screencopy` 连接；KDE 使用 KWin ScreenShot2 逐帧抓取，不依赖 grim；其他 wlroots 会话在协议不可用时会切到有 2 秒 deadline 的 grim，不会无限显示“采集中”却没有新帧。2026-10-23 在 KDE Plasma 6.8.1 / KWin 6.8.1 单输出 1920×1080、scale 1 上实测区域截图（996×611）和长截图（1402×3163）均完成并打开预览。
 
 透明终端的文字可以拼接，但桌面壁纸属于视口固定背景，并不存在可恢复的“下一屏壁纸”；输出中可能按每次滚动步长出现背景重复条带。需要干净长图时请临时关闭终端透明度，并尽量把滚动条/minimap 排除在选区外。这与文字滚动被误判为静止是两件事：后者由 96 列 RGB 二次确认防止，前者是合成后的 Wayland RGB 截图无法反推出窗口 alpha 的信息边界。
 
@@ -127,7 +127,7 @@ $XDG_RUNTIME_DIR/vellum/control.sock    用户私有控制 socket
 | `VELLUM_TRACE` | 输出 `vellum-ui` 启动阶段打点；**变量存在即启用**（写成 `0` 也生效） |
 | `VELLUM_OCR_TRACE=1` | 输出 OCR 候选、PSM、耗时和置信度（不输出识别文本）；**必须精确为 `1`** |
 | `VELLUM_LONGSHOT_TRACE=1` | 输出长截图生命周期、队列和拼接数值 trace；不记录像素或运行期文本；**必须精确为 `1`** |
-| `VELLUM_LONGSHOT_BACKEND=grim` | 禁用长截图 screencopy，强制使用有界 grim 回退 |
+| `VELLUM_LONGSHOT_BACKEND=grim` | 仅 niri/其他 wlroots 调试用；KDE 固定走 ScreenShot2，设置后 grim 不可用，不要使用 |
 | `VELLUM_ICON_PATH` | 覆盖托盘图标目录 |
 | `VELLUM_API_KEY` | 模型接口密钥（默认读取的名字；也可在 `[api] api_key_env` 里改成别的变量） |
 | `OPENAI_API_KEY` | 后备密钥变量，兼容只设置了它的旧配置 |

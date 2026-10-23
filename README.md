@@ -28,8 +28,8 @@
 ## 系统要求
 
 - 当前发行目标：Arch Linux x86_64、Wayland、GTK 4.12 及以上。
-- 支持 niri 与 KDE Plasma（KWin）；KDE 当前适配范围是单输出 1920×1080、scale 1，其他组合尚未实机验证。KDE 截图使用 KWin ScreenShot2，不需要 wlr-screencopy。
-- 运行库包括 gtk4、gtk4-layer-shell、grim、wl-clipboard、libnotify；KDE 会话使用系统自带的 KWin ScreenShot2，不依赖 grim 截屏。本地 OCR 另需 Tesseract 与相应语言包。应用全局快捷键还依赖桌面 portal 后端支持。
+- 支持 niri 与 KDE Plasma（KWin）。KDE Plasma 6.8.1 已实测区域截图和长截图；当前验收范围是单输出 1920×1080、scale 1，多输出、混合缩放与 HDR 尚未实机验证。KDE 截图使用 KWin ScreenShot2，不需要 wlr-screencopy。
+- 运行库包括 gtk4、gtk4-layer-shell、wl-clipboard、libnotify；niri 另需 grim，KDE 截图不依赖 grim。本地 OCR 另需 Tesseract 与相应语言包；应用全局快捷键还需要桌面 portal 支持，KDE Plasma 6.8.1 的 GlobalShortcuts 已实测可授权。
 - 普通用户无需 Rust 工具链，无需在本机编译。API OCR 与翻译需要自行配置兼容服务；本地 OCR 不需要外部服务。
 
 ## 安装与版本管理
@@ -75,7 +75,7 @@ vellum status             # 当前截图服务状态
 vellum doctor             # 环境诊断
 ```
 
-“通用 → 开机后自启”需要点击“保存更改”才生效，不会中断当前截图。快捷键以系统实际授权结果为准；安装与升级不会恢复用户已移除的 niri 绑定。完整命令、快捷键、恢复图片与模型配置见 [使用手册](<docs/USAGE.md>)。
+“通用 → 开机后自启”需要点击“保存更改”才生效，不会中断当前截图。快捷键以系统实际授权结果为准；安装与升级不会恢复用户已移除的 niri 绑定，KDE 的快捷键由桌面 portal 授权、不写入配置文件。完整命令、快捷键、恢复图片与模型配置见 [使用手册](<docs/USAGE.md>)。
 
 ## 长截图
 

@@ -6,9 +6,9 @@ All notable changes to vellum are documented here. The Rust rewrite starts a new
 
 - Replace Hyprland support with KDE Plasma. KDE capture uses KWin's `org.kde.KWin.ScreenShot2` raw-pixel pipe instead of grim/wlr-screencopy, and long shots capture each frame through `CaptureArea`. KWin auto-excludes the calling process's own windows, so the panel and outline cannot enter the result.
 - Keep pin/result windows above ordinary windows and resize them through a one-shot KWin script matched by the vellum process pid. The script never operates on the focused window and is unloaded after use.
-- KWin 6.8 does not expose layer-shell to ordinary clients. Use a decorated-less fullscreen toplevel for the selection overlay and a normal fixed-size panel positioned by KWin for long shots; niri keeps layer-shell. The long-shot outline is omitted on KDE rather than risking it being captured.
+- KDE Plasma 6.8.1 exposes wlr-layer-shell to ordinary clients in the tested session, so the selection overlay and long-shot panel use layer-shell there. A decorated-less fullscreen toplevel and a KWin-script-positioned panel remain as fallbacks for a compositor without layer-shell; in that fallback the long-shot outline is omitted rather than risking it being captured.
 - Remove the Hyprland compositor backend, Hyprland shortcut writer, and `contrib/hyprland-vellum.*` examples. KDE shortcuts use the standard XDG GlobalShortcuts portal; vellum does not write KDE shortcut configuration.
-- Not yet verified on KDE: multi-output, mixed scale, HDR. Single-output 1920x1080 scale 1 is the current acceptance scope.
+- Verified on KDE Plasma 6.8.1 / KWin 6.8.1 (single 1920x1080 output, scale 1): a real selection saved and copied a 996x611 PNG, a long shot captured 1402x3163 through ScreenShot2 and opened its preview, and the preview window received keepAbove through KWin scripting. Not yet verified on KDE: multi-output, mixed scale, HDR.
 
 ## [0.2.9]
 

@@ -9,6 +9,8 @@ ARCHITECTURE.md §6 要求性能结论必须来自实测，不能凭「Rust 应�
 - Python 3.14.6 + numpy 2.5.1 + Pillow 12.3.0（对照基线）
 - 历史 overlay/窗口主表：Hyprland 0.56.0；2026-08-01 的 screencopy 与最终 smoke：niri
 
+> 0.3.0 起 Hyprland 后端已移除；下文所有 Hyprland 条目（包括验收表）仅为历史记录，不代表当前支持。当前 KDE Plasma 6.8.1 的 ScreenShot2 验收见 `DESIGN.md` §8：2026-10-23 区域截图 996×611、长截图 1402×3163 均成功。
+
 Debug 构建的数字不要用来比较：形态学与拼接热路径在 debug 下比 release 慢一个量级，实测 OCR debug 比 Python 慢约 2 倍、release 反而更快。
 
 ---
@@ -158,7 +160,7 @@ fixture 使用 Overlay 而不是 Top：用户 shell 可能常驻透明 OSD/notif
 
 可访问性定向 smoke 也沿用同一纯色/零像素 fixture：`GTK_THEME=Adwaita:hc` 下 micro 竖条 exit 0；`VELLUM_TEST_LONGSHOT_LARGE_TEXT=1` 在 USER CSS priority 注入 26px 字体（约为正文 13px 的 200% 压力条件），400×300 选区仍保留全部状态与主操作，测得 full 464×555、compact 406×301、micro 横条 484×74、竖条 166×251，map 后安全校验、零污染和 layer 清理均通过。确定性 fixture 截图的原尺寸视觉检查确认大字状态文案换行但不遮挡实时画面、累计高度或取消/完成按钮；这不替代真实桌面的 Orca 手工验收。
 
-该证据覆盖当前 niri 单输出/scale 1。多输出或 capture/GDK scale/geometry 不一致时生产代码 fail closed：daemon 管理的 capture 不映射无法证明安全的 recorder UI，只写 trace；direct capture 则在采样前失败。桌面通知不会在采样前或采样中作为 fallback，因为它同样可能入镜。不能把单屏证据外推成未经验证的多屏安全结论。Hyprland 的相同纯色 live test 仍需切换会话后执行，不能用 niri 结果代替。
+该证据覆盖当前 niri 单输出/scale 1。多输出或 capture/GDK scale/geometry 不一致时生产代码 fail closed：daemon 管理的 capture 不映射无法证明安全的 recorder UI，只写 trace；direct capture 则在采样前失败。桌面通知不会在采样前或采样中作为 fallback，因为它同样可能入镜。不能把单屏证据外推成未经验证的多屏安全结论。Hyprland 支持已在 0.3.0 移除，其历史测试不再作为当前支持依据。
 
 ### 输出逐位等价
 
@@ -277,7 +279,7 @@ vellum 用 `-t ppm` 加手写 P6 解码，相比 Python 版的 `-t png`**每帧�
 
 长截图现已独立实现持久 `wlr-screencopy` 后端：一条 Wayland 连接、xdg-output 逻辑几何、复用 wl_shm buffer，事件等待同时 poll Wayland fd 与 stop eventfd。2026-08-01 在当前 niri 会话用 release 构建强制连续执行 31 次普通 copy、每次 900×700（像素只在内存中校验后丢弃），总计 62.44 ms，均值 **2.01 ms/帧**；同区域逐帧 `grim -t ppm` 为 16 ms，原始 copy 约快 8 倍。实际采样在首帧后用 `copy_with_damage`，只在内容变化时交付帧，并每 1 秒普通 copy 一次作为静止画面 heartbeat，避免 2 ms 原语反过来制造数百张重复帧。协议不可用、跨输出或运行时错误时回退 grim；fallback 通过 memfd 接收 PPM、每次最多等待 2 秒并整组杀死超时子进程，因此稳定性不依赖 screencopy 一定可用。
 
-这里优化的重点不是只省 14 ms，而是消除“每帧新建一个无 timeout 子进程”的无界状态：持久连接可被完成信号立即唤醒，连续失败有 UI 状态，输出变化最多触发一次降级。当前 niri 已用 3 帧 2×2 与 31 帧 900×700 两种真机路径验证 buffer 复用；Hyprland 仍需在切换到该会话后做同一真机 smoke，不能用 niri 的通过替代。
+这里优化的重点不是只省 14 ms，而是消除“每帧新建一个无 timeout 子进程”的无界状态：持久连接可被完成信号立即唤醒，连续失败有 UI 状态，输出变化最多触发一次降级。当前 niri 已用 3 帧 2×2 与 31 帧 900×700 两种真机路径验证 buffer 复用；Hyprland 已移除，不再补做该 smoke。
 
 #### 2026-09-18 复测：copy 原语与 `capture()` 语义（niri 26.04、144 Hz、1920×1080 scale 1）
 
@@ -424,14 +426,14 @@ python3 tools/ocr-regression.py --json
 15. `anno.done` 在标注内容为空时**只返回选区工具栏，不完成截图**。这与 Python `_exit_annotate(apply=True)` 的 `has_content()` 判断一致；Rust 版初稿曾无条件 confirm，是移植缺陷，已修。
 16. `zoom_window` 优先从 `compositor::window_size` 读当前尺寸，而不是从自己记账的值推算。用户用合成器键位改过窗口大小后，自记账会漂移。
 
-17. **同时支持 niri 与 Hyprland**（Python 版是 niri-only）。合成器在运行期按环境变量识别，两边都不在时退化为普通 Wayland 客户端。见 `DESIGN.md` §8。
+17. **同时支持 niri 与 KDE Plasma**（Python 版是 niri-only；Hyprland 已在 0.3.0 移除）。合成器在运行期按环境变量识别，两边都不在时退化为普通 Wayland 客户端。见 `DESIGN.md` §8。
 18. **`pin-last` 不接受 `--no-save`/`--no-copy`**（`ARCHITECTURE.md` §2.10 把三个动作写成同形）。钉图只把剪贴板图片贴到屏幕上，既不保存也不复制，这两个开关在它身上没有作用对象。
 
 ---
 
 ## 6. 验收覆盖与环境限制
 
-核心合成器集成已分别在 Hyprland 0.56.0 与 niri 真机验收。以下区分既有窗口/快捷键路径与本轮新增的长截图采集路径，不能用一个合成器的结果替代另一个。
+历史上核心合成器集成曾在 Hyprland 0.56.0 与 niri 上验收；Hyprland 已在 0.3.0 移除，以下 Hyprland 内容仅为历史记录。以下区分既有窗口/快捷键路径与本轮新增的长截图采集路径，不能用一个合成器的结果替代另一个。
 
 **Hyprland 既有路径：已真机验收。** 用 vellum 自己的 pin 窗口跑通了完整代码路径（不是裸 IPC 探测）：
 

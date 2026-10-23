@@ -316,7 +316,7 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 
 ## 8. 合成器抽象（niri + KDE Plasma）
 
-用户要求同时支持 niri 与 KDE Plasma。两者共享 layer-shell 选区界面，但截图与窗口控制路径完全不同。
+用户要求同时支持 niri 与 KDE Plasma。两者共享同一套选区/标注代码；KDE Plasma 6.8.1 实测提供 wlr-layer-shell，因此选区覆盖层和长截图面板也走 layer-shell。截图与窗口控制路径仍不同。
 
 ### vellum 到底需要合成器做什么
 
@@ -327,7 +327,7 @@ accept 循环用 `poll()` 阻塞等待而不是 sleep 轮询。**这曾是一个
 3. 读它当前的真实尺寸
 4. 精确设置它的尺寸
 
-niri 的选区 overlay、长截图面板、选区高亮仍是 layer-shell surface，不需要合成器专属代码。KWin 6.8 不向普通 GTK 客户端暴露 wlr-layer-shell，因此 KDE 的选区改用无装饰全屏 toplevel，长截图面板用 KWin 脚本定位；高亮在 KDE 省略，避免普通窗口进入采样区。抽象实现放在 vellum-core/src/compositor/，因为 doctor 也要报告检测结果。
+niri 的选区 overlay、长截图面板、选区高亮仍是 layer-shell surface。KDE Plasma 6.8.1 实测同样向普通 GTK 客户端暴露 wlr-layer-shell，因此 KDE 的选区覆盖层和长截图面板优先使用 layer-shell；只有合成器不提供该协议时，选区才退回无装饰全屏 toplevel，长截图面板由 KWin 脚本定位，高亮也省略，避免普通窗口进入采样区。抽象实现放在 vellum-core/src/compositor/，因为 doctor 也要报告检测结果。
 
 ### 两条铁律
 
@@ -353,7 +353,7 @@ KWin 不实现 wlr-screencopy，所以 KDE 会话不能调用 grim。KWin 自带
 - 长截图逐帧调用 CaptureArea；KWin 会自动排除调用进程自己的窗口，面板和高亮不会进入结果图；
 - native-resolution=false，保持与 overlay 的逻辑坐标一致。
 
-当前实机验证范围是单输出 1920×1080、scale 1；多输出、混合缩放和 HDR 尚未验证，不能由单屏结果外推。
+2026-10-23 在 KDE Plasma 6.8.1 / KWin 6.8.1、单输出 1920×1080、scale 1 上实测：区域截图保存并复制 996×611，长截图经 ScreenShot2 保存 1402×3163 并打开预览。多输出、混合缩放和 HDR 尚未验证，不能由单屏结果外推。
 
 ### KDE 窗口控制：KWin 脚本
 

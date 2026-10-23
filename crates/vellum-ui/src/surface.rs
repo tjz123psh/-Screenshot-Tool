@@ -212,7 +212,8 @@ pub fn present(
         // too, otherwise screenshot geometry and visible dimming disagree.
         window.set_exclusive_zone(-1);
     } else {
-        // KWin 6.8 does not expose wlr-layer-shell to regular clients. A
+        // Fallback for a compositor that does not expose wlr-layer-shell. KDE
+        // Plasma 6.8.1 does expose it, so this path is not used there. A
         // decorated-less fullscreen toplevel still covers the output and holds
         // keyboard focus; it keeps the same drawing and selection code.
         window.set_default_size(screen_w, screen_h);
