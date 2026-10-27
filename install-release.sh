@@ -145,13 +145,52 @@ if [ -n "$missing" ]; then
     [ -z "$remaining" ] || die "仍有运行库缺失：$remaining；未开始安装"
 fi
 
-# --- Runtime tools the bundle shells out to -------------------------------
-# The GTK libraries above are linked into the binaries; these are not. OCR needs
-# tesseract plus its language data, copying needs wl-copy/wl-paste, notifications
-# need notify-send, and wlroots sessions capture through grim. Tools are
-# detected directly, so a program installed outside pacman (an AUR variant, a
-# manual build) is never reinstalled over. The language data is checked
-# separately: `command -v tesseract` cannot see a missing language pack.
+# --- The session decides what has to be installed --------------------------
+# What the bundle needs depends on the compositor: KDE captures through KWin's
+# ScreenShot2 and never calls grim, while niri and the other wlroots desktops
+# capture through grim. Installing both "to be safe" would put a package for a
+# desktop the user does not run on their machine, so the session is detected
+# first and only the matching pieces are requested.
+detect_session() {
+    desktop=$(printf '%s' "${XDG_CURRENT_DESKTOP:-}" | tr '[:upper:]' '[:lower:]')
+    case "$desktop" in
+        *kde*) printf 'kde'; return ;;
+        *gnome*) printf 'gnome'; return ;;
+    esac
+    case "$desktop" in
+        *niri*) printf 'niri'; return ;;
+        *sway*) printf 'sway'; return ;;
+        *hyprland*) printf 'hyprland'; return ;;
+    esac
+    if [ -n "${NIRI_SOCKET:-}" ]; then
+        printf 'niri'; return
+    fi
+    if [ -n "${SWAYSOCK:-}" ]; then
+        printf 'sway'; return
+    fi
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+        printf 'hyprland'; return
+    fi
+    printf 'unknown'
+}
+SESSION=$(detect_session)
+case "$SESSION" in
+    kde) SESSION_LABEL='KDE Plasma（KWin ScreenShot2，不需要 grim）' ;;
+    gnome) SESSION_LABEL='GNOME' ;;
+    niri) SESSION_LABEL='niri（wlroots，grim 抓屏）' ;;
+    sway) SESSION_LABEL='sway（wlroots，grim 抓屏）' ;;
+    hyprland) SESSION_LABEL='Hyprland（wlroots，grim 抓屏）' ;;
+    *) SESSION_LABEL='未识别的桌面' ;;
+esac
+say "检测到桌面会话：$SESSION_LABEL"
+
+# Tools every session needs; the capture tool is added per compositor.
+TOOLS=(wl-copy wl-paste notify-send tesseract)
+case "$SESSION" in
+    kde|gnome) ;;
+    *) TOOLS+=(grim) ;;
+esac
+
 package_for_tool() {
     case "$1" in
         wl-copy|wl-paste) printf 'wl-clipboard' ;;
@@ -169,13 +208,12 @@ add_package() {
         *) missing_packages+=("$1") ;;
     esac
 }
-for tool in wl-copy wl-paste notify-send tesseract grim; do
+for tool in "${TOOLS[@]}"; do
     command -v "$tool" >/dev/null 2>&1 && continue
     package=$(package_for_tool "$tool")
     [ -n "$package" ] && add_package "$package"
 done
-# grim stays on the list even on KDE: the same install must keep working if the
-# user later logs into a wlroots session, where the app captures through grim.
+# A missing language pack is invisible to `command -v tesseract`.
 if command -v tesseract >/dev/null 2>&1; then
     available_languages=$(tesseract --list-langs 2>/dev/null || true)
     for language in eng chi_sim; do
@@ -203,27 +241,17 @@ fi
 # A package manager that claimed success still has to have produced the tools;
 # report the gap instead of failing an install that otherwise works.
 missing_tools=()
-for tool in wl-copy wl-paste notify-send tesseract grim; do
+for tool in "${TOOLS[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
 done
 if [ "${#missing_tools[@]}" -gt 0 ]; then
     say "提示：仍未找到 ${missing_tools[*]}，相关功能会受限"
 fi
-# Desktops differ in what turns a hotkey into a granted binding, and guessing
-# the session at build time is wrong: the same package is installed on niri, KDE
-# and GNOME machines. The portal binary also lives in /usr/lib, so a PATH lookup
-# reports it missing even when it is installed.
+
+# Shortcut backends are desktop-specific. The portal binary lives in /usr/lib,
+# so a PATH lookup reports it missing even when it is installed.
 PORTAL_BIN=/usr/lib/xdg-desktop-portal
 PORTAL_DIR=/usr/share/xdg-desktop-portal/portals
-desktop_session() {
-    case "${XDG_CURRENT_DESKTOP:-}" in
-        *KDE*|*kde*) printf 'kde' ;;
-        *GNOME*|*gnome*) printf 'gnome' ;;
-        *niri*|*Niri*|*sway*|*river*|*Hyprland*) printf 'wlroots' ;;
-        *) if [ -n "${NIRI_SOCKET:-}" ]; then printf 'wlroots'; else printf 'unknown'; fi ;;
-    esac
-}
-SESSION=$(desktop_session)
 if [ ! -e "$PORTAL_BIN" ]; then
     say '提示：未安装 xdg-desktop-portal，桌面文件对话框与快捷键授权会受限（sudo pacman -S xdg-desktop-portal）'
 fi
@@ -236,10 +264,8 @@ case "$SESSION" in
         [ -e "$PORTAL_DIR/gnome.portal" ] \
             || say '提示：GNOME 缺少 portal 后端 xdg-desktop-portal-gnome，应用全局快捷键无法授权'
         ;;
-    wlroots)
-        # niri and friends expose no GlobalShortcuts backend; binding the
-        # command in the compositor configuration is the supported route.
-        say '提示：当前是 wlroots 会话（niri 等），没有 GlobalShortcuts 后端；请在合成器配置中绑定 vellum region（工作台「快捷键」页的兼容方式会写出同样的条目）'
+    niri|sway|hyprland)
+        say '提示：当前 wlroots 会话没有 GlobalShortcuts 后端；请在合成器配置中绑定 vellum region（工作台「快捷键」页的兼容方式会写出同样的条目）'
         ;;
 esac
 

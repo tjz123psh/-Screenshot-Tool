@@ -81,6 +81,19 @@ for package in wl-clipboard libnotify tesseract tesseract-data-eng tesseract-dat
 done
 [[ $(< "$TMP/installed") == installed ]] || { echo 'bundle was not installed after dependencies' >&2; exit 1; }
 
+# 1b. The compositor decides whether grim is part of the install.
+rm -f "$TMP/installed" "$TMP/pacman.log"
+( export XDG_CURRENT_DESKTOP=niri; run_installer > "$TMP/out" 2> "$TMP/err" )
+grep -q 'niri' "$TMP/out" || { echo 'niri session was not recognised' >&2; exit 1; }
+grep -q 'grim' "$TMP/pacman.log" || { echo 'niri install omitted grim' >&2; exit 1; }
+
+rm -f "$TMP/installed" "$TMP/pacman.log"
+( export XDG_CURRENT_DESKTOP=KDE; run_installer > "$TMP/out" 2> "$TMP/err" )
+grep -q 'KDE' "$TMP/out" || { echo 'KDE session was not recognised' >&2; exit 1; }
+if grep -q 'grim' "$TMP/pacman.log"; then
+    echo 'KDE install asked for grim, which KWin never uses' >&2; exit 1
+fi
+
 # 2. --no-deps must not touch the package manager at all.
 rm -f "$TMP/installed" "$TMP/pacman.log"
 run_installer --no-deps > "$TMP/out" 2> "$TMP/err"

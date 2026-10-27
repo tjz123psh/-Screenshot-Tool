@@ -40,7 +40,7 @@
 curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash
 ```
 
-脚本下载发行包、校验 SHA256，然后检查并补齐系统依赖：先补程序链接的 GTK 运行库，再补它调用的 `wl-copy`、`notify-send`、`grim` 和 `tesseract`（含 `eng` 与 `chi_sim` 语言包）。全部就绪后才交给版本管理器安装，并按当前会话（niri、KDE、GNOME）给出对应的快捷键绑定建议；**不从源码构建，也不写入合成器快捷键配置**。Arch 缺包时会询问提权，取消或补齐失败则不开始安装。`--no-deps` 可跳过全部系统包处理。
+脚本下载发行包、校验 SHA256，然后检查并补齐系统依赖：先补程序链接的 GTK 运行库，再按检测到的桌面会话补齐它调用的工具——`wl-copy`、`notify-send`、`tesseract`（含 `eng` 与 `chi_sim` 语言包），以及 wlroots 会话（niri 等）需要的 `grim`；KDE 走 KWin ScreenShot2，不会安装 grim。全部就绪后才交给版本管理器安装，并按当前会话（niri、KDE、GNOME）给出对应的快捷键绑定建议；**不从源码构建，也不写入合成器快捷键配置**。Arch 缺包时会询问提权，取消或补齐失败则不开始安装。`--no-deps` 可跳过全部系统包处理。
 
 旧式 0.1.x 安装迁移时，需要明确接管并备份：
 
