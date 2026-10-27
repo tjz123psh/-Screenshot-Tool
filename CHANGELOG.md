@@ -2,6 +2,12 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.3.4] - 2026-10-23
+
+- Make the published installer install the programs vellum shells out to, not just the linked GTK libraries: `wl-clipboard`, `libnotify`, `grim` and Tesseract with the English and Simplified Chinese language packs are checked and installed through pacman before the bundle is deployed. A missing language pack is detected separately, because `command -v tesseract` cannot see one, and tools that already work (an AUR variant, a manual build) are left untouched. `--no-deps` still skips all system package work.
+- Report a missing desktop portal instead of failing: global shortcuts need it, but it ships with the desktops vellum targets.
+- Fix `find | head` under `pipefail` in the installer, which could abort an install without a message.
+
 ## [0.3.3] - 2026-10-23
 
 - Cut the hotkey-to-overlay latency. KWin delivers each frame through a pipe that defaults to 64 KiB while the reader woke up on a fixed 2 ms tick, so an 8.3 MB frame cost 120-206 ms in pure waiting. The pipe buffer is raised to 1 MiB, reads use 256 KiB chunks, and a `poll()` wait replaces the tick. Measured on this machine (KDE Plasma 6.8.1, 1920x1080): frame read 120-206 ms -> 5-8 ms, first overlay frame 150-226 ms -> 80-90 ms, daemon-dispatched end to end about 105 ms.

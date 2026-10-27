@@ -29,7 +29,7 @@
 
 - 当前发行目标：Arch Linux x86_64、Wayland、GTK 4.12 及以上。
 - 支持 niri 与 KDE Plasma（KWin）。KDE Plasma 6.8.1 已实测区域截图和长截图；当前验收范围是单输出 1920×1080、scale 1，多输出、混合缩放与 HDR 尚未实机验证。KDE 截图使用 KWin ScreenShot2，不需要 wlr-screencopy。
-- 运行库包括 gtk4、gtk4-layer-shell、wl-clipboard、libnotify；niri 另需 grim，KDE 截图不依赖 grim。本地 OCR 另需 Tesseract 与相应语言包；应用全局快捷键还需要桌面 portal 支持，KDE Plasma 6.8.1 的 GlobalShortcuts 已实测可授权。
+- 运行库包括 gtk4、gtk4-layer-shell。一键安装脚本还会检查并安装程序外调的 wl-clipboard、libnotify、grim 与 Tesseract（含简体中文和英文语言包），这些包补齐后才开始安装。应用全局快捷键还需要桌面 portal 支持；KDE Plasma 6.8.1 的 GlobalShortcuts 已实测可授权。
 - 普通用户无需 Rust 工具链，无需在本机编译。API OCR 与翻译需要自行配置兼容服务；本地 OCR 不需要外部服务。
 
 ## 安装与版本管理
@@ -40,7 +40,7 @@
 curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/download/install.sh | bash
 ```
 
-脚本下载发行包、校验 SHA256、检查并补齐运行库，再交给版本管理器安装；**不从源码构建，也不写入合成器快捷键配置**。Arch 缺库时会询问提权，取消或补齐失败则不开始安装。`--no-deps` 可跳过系统包处理。
+脚本下载发行包、校验 SHA256，然后检查并补齐系统依赖：先补程序链接的 GTK 运行库，再补它调用的 `wl-copy`、`notify-send`、`grim` 和 `tesseract`（含 `eng` 与 `chi_sim` 语言包）。全部就绪后才交给版本管理器安装；**不从源码构建，也不写入合成器快捷键配置**。Arch 缺包时会询问提权，取消或补齐失败则不开始安装。`--no-deps` 可跳过全部系统包处理。
 
 旧式 0.1.x 安装迁移时，需要明确接管并备份：
 

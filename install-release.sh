@@ -101,7 +101,9 @@ fetch "$URL/$ASSET.sha256" "$TMP/$ASSET.sha256" \
 say '校验和通过'
 
 tar -xzf "$TMP/$ASSET" -C "$TMP" || die '解压失败'
-BUNDLE=$(find "$TMP" -maxdepth 1 -mindepth 1 -type d -name 'vellum-*' | head -1)
+# -print -quit instead of piping into head: under pipefail a fast-exiting head
+# can kill find with SIGPIPE and abort the install with no message at all.
+BUNDLE=$(find "$TMP" -maxdepth 1 -mindepth 1 -type d -name 'vellum-*' -print -quit)
 [ -n "$BUNDLE" ] && [ -d "$BUNDLE" ] || die '发行包结构异常'
 for member in bin/vellum bin/vellumctl bin/vellum-ui bin/vellum-tray install.sh manifest.json; do
     [ -e "$BUNDLE/$member" ] || die "发行包缺少 $member"
@@ -143,14 +145,74 @@ if [ -n "$missing" ]; then
     [ -z "$remaining" ] || die "仍有运行库缺失：$remaining；未开始安装"
 fi
 
-# These only limit features; they never block an install.
-optional_missing=()
-for tool in grim wl-copy notify-send tesseract; do
-    command -v "$tool" >/dev/null 2>&1 || optional_missing+=("$tool")
+# --- Runtime tools the bundle shells out to -------------------------------
+# The GTK libraries above are linked into the binaries; these are not. OCR needs
+# tesseract plus its language data, copying needs wl-copy/wl-paste, notifications
+# need notify-send, and wlroots sessions capture through grim. Tools are
+# detected directly, so a program installed outside pacman (an AUR variant, a
+# manual build) is never reinstalled over. The language data is checked
+# separately: `command -v tesseract` cannot see a missing language pack.
+package_for_tool() {
+    case "$1" in
+        wl-copy|wl-paste) printf 'wl-clipboard' ;;
+        notify-send) printf 'libnotify' ;;
+        tesseract) printf 'tesseract' ;;
+        grim) printf 'grim' ;;
+        *) printf '' ;;
+    esac
+}
+
+missing_packages=()
+add_package() {
+    case " ${missing_packages[*]} " in
+        *" $1 "*) ;;
+        *) missing_packages+=("$1") ;;
+    esac
+}
+for tool in wl-copy wl-paste notify-send tesseract grim; do
+    command -v "$tool" >/dev/null 2>&1 && continue
+    package=$(package_for_tool "$tool")
+    [ -n "$package" ] && add_package "$package"
 done
-if [ "${#optional_missing[@]}" -gt 0 ]; then
-    say "提示：未安装 ${optional_missing[*]}，相关功能（截图/复制/通知/本地识别）会受限"
+# grim stays on the list even on KDE: the same install must keep working if the
+# user later logs into a wlroots session, where the app captures through grim.
+if command -v tesseract >/dev/null 2>&1; then
+    available_languages=$(tesseract --list-langs 2>/dev/null || true)
+    for language in eng chi_sim; do
+        grep -qx "$language" <<< "$available_languages" \
+            || add_package "tesseract-data-$language"
+    done
+else
+    add_package tesseract-data-eng
+    add_package tesseract-data-chi_sim
 fi
+
+if [ "${#missing_packages[@]}" -gt 0 ]; then
+    say "缺少系统依赖，需要这些软件包：${missing_packages[*]}"
+    if [ "$SKIP_DEPS" = "1" ]; then
+        say '（--no-deps：跳过系统依赖安装，OCR/复制/通知/截图相关功能会受限）'
+    elif command -v pacman >/dev/null 2>&1; then
+        install_packages "${missing_packages[@]}" \
+            || die "安装系统依赖失败或被取消；请手动执行：sudo pacman -S --needed ${missing_packages[*]}"
+        say '系统依赖已安装'
+    else
+        say '提示：未检测到 pacman；请用你的发行版包管理器安装上面的软件包'
+    fi
+fi
+
+# A package manager that claimed success still has to have produced the tools;
+# report the gap instead of failing an install that otherwise works.
+missing_tools=()
+for tool in wl-copy wl-paste notify-send tesseract grim; do
+    command -v "$tool" >/dev/null 2>&1 || missing_tools+=("$tool")
+done
+if [ "${#missing_tools[@]}" -gt 0 ]; then
+    say "提示：仍未找到 ${missing_tools[*]}，相关功能会受限"
+fi
+# The portal turns a hotkey request into a binding the desktop grants; it ships
+# with the desktops vellum targets, so it is reported rather than installed.
+command -v xdg-desktop-portal >/dev/null 2>&1 \
+    || say '提示：未安装 xdg-desktop-portal，系统级快捷键授权不可用；可改用桌面自身的快捷键绑定 vellum region'
 
 say "安装 $(basename "$BUNDLE")"
 bash "$BUNDLE/install.sh" "${PASS_THROUGH[@]}"

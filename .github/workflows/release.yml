@@ -95,6 +95,7 @@ jobs:
           python3 tests/package-release.py
           bash -n contrib/install-bundle.sh install-release.sh
           bash tests/install-remote-fixed.sh
+          bash tests/install-release-deps.sh
 
       - name: Test native result opening before publishing
         env:

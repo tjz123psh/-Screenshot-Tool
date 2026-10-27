@@ -66,7 +66,10 @@ jobs:
         run: cargo audit --no-yanked
 
       - name: Check installer syntax
-        run: bash -n install.sh install-remote.sh
+        run: bash -n install.sh install-remote.sh install-release.sh
+
+      - name: Test release installer dependency handling
+        run: bash tests/install-release-deps.sh
 
       - name: Test installer dependency failures
         run: bash tests/install-dependency-query.sh
