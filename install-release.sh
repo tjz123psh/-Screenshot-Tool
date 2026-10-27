@@ -209,10 +209,39 @@ done
 if [ "${#missing_tools[@]}" -gt 0 ]; then
     say "提示：仍未找到 ${missing_tools[*]}，相关功能会受限"
 fi
-# The portal turns a hotkey request into a binding the desktop grants; it ships
-# with the desktops vellum targets, so it is reported rather than installed.
-command -v xdg-desktop-portal >/dev/null 2>&1 \
-    || say '提示：未安装 xdg-desktop-portal，系统级快捷键授权不可用；可改用桌面自身的快捷键绑定 vellum region'
+# Desktops differ in what turns a hotkey into a granted binding, and guessing
+# the session at build time is wrong: the same package is installed on niri, KDE
+# and GNOME machines. The portal binary also lives in /usr/lib, so a PATH lookup
+# reports it missing even when it is installed.
+PORTAL_BIN=/usr/lib/xdg-desktop-portal
+PORTAL_DIR=/usr/share/xdg-desktop-portal/portals
+desktop_session() {
+    case "${XDG_CURRENT_DESKTOP:-}" in
+        *KDE*|*kde*) printf 'kde' ;;
+        *GNOME*|*gnome*) printf 'gnome' ;;
+        *niri*|*Niri*|*sway*|*river*|*Hyprland*) printf 'wlroots' ;;
+        *) if [ -n "${NIRI_SOCKET:-}" ]; then printf 'wlroots'; else printf 'unknown'; fi ;;
+    esac
+}
+SESSION=$(desktop_session)
+if [ ! -e "$PORTAL_BIN" ]; then
+    say '提示：未安装 xdg-desktop-portal，桌面文件对话框与快捷键授权会受限（sudo pacman -S xdg-desktop-portal）'
+fi
+case "$SESSION" in
+    kde)
+        [ -e "$PORTAL_DIR/kde.portal" ] \
+            || say '提示：KDE 缺少 portal 后端，应用全局快捷键无法授权（sudo pacman -S xdg-desktop-portal-kde）'
+        ;;
+    gnome)
+        [ -e "$PORTAL_DIR/gnome.portal" ] \
+            || say '提示：GNOME 缺少 portal 后端 xdg-desktop-portal-gnome，应用全局快捷键无法授权'
+        ;;
+    wlroots)
+        # niri and friends expose no GlobalShortcuts backend; binding the
+        # command in the compositor configuration is the supported route.
+        say '提示：当前是 wlroots 会话（niri 等），没有 GlobalShortcuts 后端；请在合成器配置中绑定 vellum region（工作台「快捷键」页的兼容方式会写出同样的条目）'
+        ;;
+esac
 
 say "安装 $(basename "$BUNDLE")"
 bash "$BUNDLE/install.sh" "${PASS_THROUGH[@]}"

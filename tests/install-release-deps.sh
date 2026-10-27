@@ -109,4 +109,17 @@ run_installer > "$TMP/out" 2> "$TMP/err"
 [[ ! -e "$TMP/pacman.log" ]] || { echo 'installer reinstalled satisfied packages' >&2; exit 1; }
 [[ $(< "$TMP/installed") == installed ]] || { echo 'bundle was not installed' >&2; exit 1; }
 
+# 5. The session decides which shortcut advice is printed, never a guessed one.
+rm -f "$TMP/installed" "$TMP/pacman.log"
+( export XDG_CURRENT_DESKTOP=niri; run_installer > "$TMP/out" 2> "$TMP/err" )
+grep -q 'wlroots 会话' "$TMP/out" \
+    || { echo 'niri session did not get the compositor-binding advice' >&2; exit 1; }
+if grep -q 'xdg-desktop-portal-kde' "$TMP/out"; then
+    echo 'niri session was told to install a KDE package' >&2; exit 1
+fi
+( export XDG_CURRENT_DESKTOP=KDE; run_installer > "$TMP/out" 2> "$TMP/err" )
+if grep -q 'wlroots 会话' "$TMP/out"; then
+    echo 'KDE session was told it is a wlroots session' >&2; exit 1
+fi
+
 echo 'release installer installs OCR/clipboard/notification/capture tools and honours --no-deps'
