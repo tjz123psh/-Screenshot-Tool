@@ -44,11 +44,21 @@ if [[ -n "${VELLUM_TEST_INSTALL_FAIL:-}" ]]; then
 fi
 exit 0
 PACMAN
+# CI runs as root inside the Arch container; the installer refuses root on
+# purpose, so a fake id makes it take the ordinary-user path.
+cat > "$TMP/bin/id" <<'ID'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then
+    printf '1000\n'
+    exit 0
+fi
+exec /usr/bin/id "$@"
+ID
 cat > "$TMP/bin/sudo" <<'SUDO'
 #!/usr/bin/env bash
 exec "$@"
 SUDO
-chmod 0755 "$TMP/bin/pacman" "$TMP/bin/sudo"
+chmod 0755 "$TMP/bin/pacman" "$TMP/bin/sudo" "$TMP/bin/id"
 
 run_installer() {
     PATH="$TMP/bin:$TMP/sys" HOME="$TMP/home" TMPDIR="$TMP" \
