@@ -2,6 +2,19 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.3.7] - 2026-11-01
+
+- Fix the settings panel opening and instantly closing on niri 26.04. GTK 4.22+ already creates the ext-background-effect object for the GTK surface, and vellum's own blur module created a second one for the same `wl_surface`; niri answers the duplicate with `wl_surface already has a background effect object attached`, a protocol error that drops the connection (`Gdk-Message: Error 71 (Protocol error)`). The module is now a capability probe: it binds the manager, reads capabilities and adds the `vellum-compositor-blur` class, while `theme.css` declares `backdrop-filter` so GTK owns the single effect object. Verified on the production panel with `WAYLAND_DEBUG=1`: one `get_background_effect`, one `set_blur_region`, zero protocol errors, window stays open.
+- Record in `docs/NATIVE_CAPTURE_AND_BLUR.md` that GTK 4.24 paints the settings window's own background opaque on this machine, so the compositor blur has nothing to show through and the panel reads as solid. The UI is left as is by decision; the doc names the two routes for a visible material.
+
+## [0.3.6] - 2026-10-27
+
+- Choose installer dependencies by compositor instead of installing everything that might be needed. The session is detected from `XDG_CURRENT_DESKTOP` plus the compositor sockets (`NIRI_SOCKET`, `SWAYSOCK`, `HYPRLAND_INSTANCE_SIGNATURE`) and printed as 检测到桌面会话：…; `grim` is requested only for wlroots sessions, because KDE captures through KWin ScreenShot2 and never calls it. The shortcut advice follows the same detection instead of naming a backend for the wrong desktop.
+
+## [0.3.5] - 2026-10-27
+
+- Make the installer detect the running desktop session instead of assuming one when it explains shortcuts, so the portal package it names matches the desktop that is actually in use.
+
 ## [0.3.4] - 2026-10-23
 
 - Make the published installer install the programs vellum shells out to, not just the linked GTK libraries: `wl-clipboard`, `libnotify`, `grim` and Tesseract with the English and Simplified Chinese language packs are checked and installed through pacman before the bundle is deployed. A missing language pack is detected separately, because `command -v tesseract` cannot see one, and tools that already work (an AUR variant, a manual build) are left untouched. `--no-deps` still skips all system package work.
