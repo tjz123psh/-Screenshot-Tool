@@ -201,7 +201,7 @@ Wayland 下普通应用无法安全合成滚轮事件。这是事实陈述，不
 
 工作台是独立 GTK 窗口，默认首页呈现区域截图、滚动长截图、钉住剪贴板；模型接口、识别翻译、截图输出仍是完整设置页。桌面入口和托盘主点击打开工作台；托盘菜单本身由桌面宿主绘制，应用不假装能用 GTK CSS 控制它。
 
-- **设置材质与图像清晰度分开**：设置页为烟黑透明材质与克制暖金细节，约640×450；图像/录制/结果区域保持不透明。GTK样式在 [theme.css](crates/vellum-ui/src/theme.css)，Cairo材质在 [paint.rs](crates/vellum-ui/src/paint.rs)。[原生模糊模块](crates/vellum-ui/src/background_blur.rs)通过标准ext-background-effect-v1请求合成器模糊，不读取桌面、不改窗口规则；不支持时使用更深透明底，支持时提高通透度且保持亮背景上的文字对比度。GSK导出不包含合成器后处理，不能把普通窗口PNG当成模糊效果实测。
+- **设置材质与图像清晰度分开**：设置页为烟黑透明材质与克制暖金细节，约640×450；图像/录制/结果区域保持不透明。GTK样式在 [theme.css](crates/vellum-ui/src/theme.css)，Cairo材质在 [paint.rs](crates/vellum-ui/src/paint.rs)。设置窗口的模糊由 GTK 自己通过 CSS `backdrop-filter` 走标准 ext-background-effect-v1 实现（GTK 4.22+），[模糊模块](crates/vellum-ui/src/background_blur.rs)只探测能力并切换样式类，不创建效果对象——同一 wl_surface 只允许一个效果对象，重复创建会被 niri 判为协议错误并断开连接（设置窗口会一闪就关）。不支持时使用更深透明底，支持时提高通透度且保持亮背景上的文字对比度。GSK导出不包含合成器后处理，不能把普通窗口PNG当成模糊效果实测。
 - **按真实文字布局**：侧栏不参与剩余空间拉伸；正文滚动，输入控件按可用宽度扩展；窗口根据屏幕约束初始尺寸。保留 resizable(false) 首帧浮动语义，以及只按自身 PID 查找窗口的安全兜底，不推走别的窗口。
 - **操作可达**：保留 Ctrl+1/2/3 设置页快捷键，新增 Ctrl+0 工作台。Ctrl+S 保存、Esc 关闭；工作台启动截图前关闭自身，尚有未保存字段时明确询问，不静默丢失更改。
 - **配置行为不重写**：FormValues/FormWidgets 完整往返，密码默认遮罩、模型可手输或搜索、后台连接测试、原子保存与0600权限继续保留。演示模式 VELLUM_UI_DEMO=1 使用内存默认配置，禁止读写真实配置/偏好和请求模型端点。

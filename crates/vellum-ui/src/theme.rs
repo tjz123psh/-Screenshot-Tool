@@ -5,7 +5,7 @@ use gtk4::prelude::*;
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 use std::cell::RefCell;
 use std::collections::HashSet;
-const CSS_VERSION: u32 = 19;
+const CSS_VERSION: u32 = 20;
 const CSS: &str = include_str!("theme.css");
 thread_local! {static INSTALLED:RefCell<HashSet<(usize,u32)>>=RefCell::new(HashSet::new());}
 pub fn install(display: &Display) {
@@ -100,8 +100,12 @@ mod tests {
             assert!(CSS.contains(token), "missing role {token}");
         }
         assert!(
-            !CSS.contains("backdrop-filter"),
-            "do not promise a desktop blur a GTK surface cannot provide"
+            CSS.contains("backdrop-filter: blur("),
+            "compositor blur must go through GTK's own backdrop-filter"
+        );
+        assert!(
+            CSS.contains(".vellum-window.vellum-glass.vellum-compositor-blur { background-color: rgba(18,19,20,0.78); backdrop-filter: blur(24px); }"),
+            "blur stays behind the class the capability probe adds"
         );
         assert!(CSS.contains(".vellum-window.vellum-glass {"));
         assert!(CSS.contains("background-color: rgba(24,24,23,0.88)"));

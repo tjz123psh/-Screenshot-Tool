@@ -30,35 +30,33 @@
 
 实际Wayland registry包含 ext_background_effect_manager_v1。niri [官方窗口效果说明](https://raw.githubusercontent.com/niri-wm/niri/main/docs/wiki/Window-Effects.md)明确说明26.04支持应用通过此协议直接请求模糊，包括客户端自己的圆角区域，无须手工窗口规则。
 
-实现位于[原生模糊模块](../crates/vellum-ui/src/background_blur.rs)：
+GTK 4.22+ 本身就用这条协议实现 CSS `backdrop-filter`，而协议规定一个 wl_surface 只能有一个背景效果对象：客户端再创建第二个，niri 会回 `wl_surface already has a background effect object attached` 并断开整个连接（表现就是设置窗口一闪就关，日志里是 `Gdk-Message: Error 71 (Protocol error)`）。
+
+所以应用不再自己创建效果对象，[模糊模块](../crates/vellum-ui/src/background_blur.rs)只做能力探测：
 
 - 只用于设置窗口；录制面板、图片内容和文字结果不因玻璃效果被透明化。
-- 借用GTK现有Wayland连接，guest backend不拥有连接；不覆盖GDK监听器、不替GTK读socket、不手动提交或销毁GTK的wl_surface。
-- 用自己的事件队列异步获取能力，确认Blur位后创建效果；区域按表面逻辑尺寸和11px圆角生成，大小变化时更新。
-- GDK自己提交下一帧；窗口unrealize时销毁自有对象，显示closed信号在GDK后端dispose前释放借用资源。该顺序已核对 [GTK关闭实现](https://raw.githubusercontent.com/GNOME/gtk/4.22.0/gdk/gdkdisplay.c)。
-- 不支持协议时无配置修改、无后台截图，继续使用较深的0.88-alpha底；支持时使用对比度验证过的0.82-alpha材质。
-- 仅增加libwayland互操作所需的Rust依赖；没有安装系统包、改niri配置、替换已安装程序。
+- 借用GTK现有Wayland连接（guest backend，不拥有连接），绑一次 manager 读 capabilities，**不创建任何表面对象**，也不覆盖GDK监听器、不替GTK读socket、不手动提交或销毁GTK的wl_surface。
+- 确认 Blur 可用后给窗口加 `vellum-compositor-blur` 类；[theme.css](../crates/vellum-ui/src/theme.css) 在这个类上声明 `backdrop-filter: blur(24px)`，由GTK向合成器请求模糊，圆角与区域也归GTK处理。
+- 不支持协议、或GTK低于4.22时保持 0.88-alpha 深底；不改配置、不截屏、不安装系统包。
 
-## 3. 不是“发了请求”就算视觉成功
+## 3. 怎么算“模糊真的生效”
 
-[视觉测试](../crates/vellum-ui/src/background_blur_live_test.rs)创建生成的背景层和不透明背板，再显示普通GTK测试窗；只在经过包含关系和焦点验证的测试区域内抓取128×32像素，均不写盘。
-
-| 同一条纹画面 | 平均行内亮暗范围 |
-|---|---:|
-| 尚未请求模糊 | 144.00 |
-| 标准协议请求、GDK提交之后 | 3.81 |
-
-测试窗口的透明度在前后保持相同，因而不是通过加深窗口底色掩盖条纹。细节对比减少约97%，确认由合成器实际处理。测试走生产挂载入口，关闭窗口正常；额外在所有GTK窗口/回调释放后关闭测试显示连接也通过。不能把它描述成“任意异常断线恢复已验证”。
-
-模糊来源、强度和xray策略由合成器决定；niri默认xray通常只看壁纸。这与程序读取后方窗口像素不同。以前的WidgetPaintable/GSK导出只包含应用表面，不包含合成器背景后处理，不能拿这些PNG假装展示真实桌面模糊。
+- 协议层（可复现，见第4节）：生产设置窗口在 `WAYLAND_DEBUG=1` 下应当只有 **1 次** `ext_background_effect_manager_v1.get_background_effect`、**1 次** `set_blur_region`、**0 条**协议错误；出现第二条 `get_background_effect` 就是又回到了“窗口瞬间消失”的老 bug。
+- 视觉层：模糊半径与xray策略由合成器决定，GTK只声明“这一块要模糊”。GSK/WidgetPaintable 导出的窗口PNG不包含合成器后处理，不能拿它当模糊截图。
+- 早先那一版“应用自建效果对象”曾用条纹窗口量化到 144 → 3.81；该实现已移除，且当前 niri 26.04 的平铺布局不会把测试背板合成到探针下面（采样范围 0.0），所以那组数字不再作为当前实现的证据，也不再保留对应的像素测试。
 
 ## 4. 复查命令
 
 ~~~sh
-GSK_RENDERER=cairo VELLUM_LONGSHOT_TRACE=1 cargo test --locked --release --workspace recorder::live_tests::live_fast_scroll_capture_preserves_every_row -- --ignored --exact --nocapture --test-threads=1
+# 设置窗口的协议轨迹：期望 1 次 get_background_effect、1 次 set_blur_region、0 条错误
+WAYLAND_DEBUG=1 vellum-ui panel > /tmp/panel-debug.log 2>&1 &
+sleep 4; kill %1
+grep -c get_background_effect /tmp/panel-debug.log   # 1
+grep -c set_blur_region /tmp/panel-debug.log         # 1
+grep -c 'wl_display.*error' /tmp/panel-debug.log     # 0
+
+cargo test --locked --release --workspace recorder::live_tests::live_fast_scroll_capture_preserves_every_row -- --ignored --exact --nocapture --test-threads=1
 cargo test --locked --release --workspace recorder::live_tests::live_reports_background_effect_protocols -- --ignored --exact --nocapture --test-threads=1
-GSK_RENDERER=cairo cargo test --locked --release --workspace background_blur::live_tests::live_compositor_blur_reduces_background_detail -- --ignored --exact --nocapture --test-threads=1
-VELLUM_UI_DEMO=1 target/release/vellum-ui panel
 ~~~
 
 ## 5. 仍未解决的独立条件

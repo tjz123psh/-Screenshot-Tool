@@ -32,7 +32,9 @@
 /* Only a supported compositor request enables the clearer glass treatment.
    Text remains contrast-safe even over a white wallpaper; unsupported systems
    keep the denser 0.88-alpha fallback above. */
-.vellum-window.vellum-glass.vellum-compositor-blur { background-color: rgba(18,19,20,0.78); }
+/* GTK 4.22+ turns this into ext-background-effect blur on GTK's own surface;
+   vellum never creates a second effect object (niri rejects that outright). */
+.vellum-window.vellum-glass.vellum-compositor-blur { background-color: rgba(18,19,20,0.78); backdrop-filter: blur(24px); }
 .vellum-compositor-blur .vellum-caption, .vellum-compositor-blur .vellum-row-sub,
 .vellum-compositor-blur .vellum-section-hint, .vellum-compositor-blur .vellum-dim,
 .vellum-compositor-blur .vellum-status, .vellum-compositor-blur .vellum-status-line,
