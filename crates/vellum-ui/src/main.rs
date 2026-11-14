@@ -393,6 +393,15 @@ impl OutputFlags {
         }
         flags
     }
+
+    fn for_longshot(self, started_as_longshot: bool) -> Self {
+        // A region-to-long toolbar switch must not inherit region copy prefs;
+        // a direct long launch keeps its explicit --no-copy opt-out.
+        Self {
+            copy: self.copy || !started_as_longshot,
+            ..self
+        }
+    }
 }
 
 fn flag_value(args: &[String], name: &str) -> Option<String> {
@@ -444,6 +453,52 @@ fn capture_screen() -> Result<Rgb8, CaptureError> {
     } else {
         vellum_core::capture::grab_full()
     }
+}
+
+/// The workspace raster currently carries no output origin/scale mapping.
+/// Until surface::present accepts that metadata, only this identity is safe.
+fn longshot_geometry_error(
+    screen: (i32, i32),
+    outputs: &[vellum_core::Rect],
+) -> Option<&'static str> {
+    match outputs {
+        [output]
+            if output.x == 0
+                && output.y == 0
+                && output.valid()
+                && (output.w, output.h) == screen =>
+        {
+            None
+        }
+        [_, _, ..] => {
+            Some("当前多屏长截图尚不支持可靠的坐标映射；已停止以免截错区域，请只启用一块屏幕后重试")
+        }
+        _ => Some("无法确认长截图的屏幕原点、缩放或尺寸；已停止以免截错区域，请检查显示器布局"),
+    }
+}
+
+fn current_longshot_geometry_error(screen: (i32, i32)) -> Option<&'static str> {
+    let outputs = gtk4::gdk::Display::default()
+        .and_then(|display| {
+            let monitors = display.monitors();
+            (0..monitors.n_items())
+                .map(|index| {
+                    let monitor = monitors
+                        .item(index)?
+                        .downcast::<gtk4::gdk::Monitor>()
+                        .ok()?;
+                    let rect = monitor.geometry();
+                    Some(vellum_core::Rect::new(
+                        rect.x(),
+                        rect.y(),
+                        rect.width(),
+                        rect.height(),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    longshot_geometry_error(screen, &outputs)
 }
 
 /// A screen grab running while GTK starts up, collected in `activate`.
@@ -658,6 +713,9 @@ impl Session {
         let Some(background) = self.background.borrow().clone() else {
             return;
         };
+        if self.long_shot && self.reject_unsafe_longshot_mapping(app) {
+            return;
+        }
         self.install_finish_poll();
 
         let session = self.clone();
@@ -804,12 +862,27 @@ impl Session {
         app.quit();
     }
 
-    /// Starts the recorder after the overlay has left the screen.
-    ///
-    /// `hold` keeps the application alive across the window-less gap, and the
-    /// delay exists because grim would otherwise capture our own dimming layer
-    /// as the first frame.
+    fn reject_unsafe_longshot_mapping(&self, app: &gtk4::Application) -> bool {
+        let Some(message) = current_longshot_geometry_error(self.screen.get()) else {
+            return false;
+        };
+        self.trace.emit("longshot_output_mapping_rejected", &[]);
+        for window in app.windows() {
+            window.close();
+        }
+        vellum_core::io::notify("Vellum 长截图未开始", message, "normal");
+        self.exit_code.set(1);
+        app.quit();
+        true
+    }
+
+    /// Starts the recorder after the overlay has left the screen. The hold
+    /// keeps GTK alive across the gap; the delay prevents sampling our overlay.
     fn begin_longshot(self: &Rc<Self>, app: &gtk4::Application, rect: vellum_core::Rect) {
+        // Also covers the long-shot toolbar action from an ordinary region UI.
+        if self.reject_unsafe_longshot_mapping(app) {
+            return;
+        }
         // Only now does the second hotkey mean “finish”. SIGUSR1 delivered while
         // the user was still choosing a region is intentionally ignored.
         FINISH_ARMED.store(true, Ordering::SeqCst);
@@ -881,9 +954,14 @@ impl Session {
                 session.trace.clone(),
                 on_done,
             );
-            recorder.present();
-            let pending = session.finish_requested.replace(false);
+            // present() may synchronously fail a safety check and invoke done.
+            // Register first so that callback cannot be undone by a late insert.
             session.recorder.replace(Some(recorder.clone()));
+            recorder.present();
+            if session.recorder.borrow().is_none() {
+                return;
+            }
+            let pending = session.finish_requested.replace(false);
             session.trace.emit(
                 "recorder_ready",
                 &[("finish_already_pending", TraceField::Bool(pending))],
@@ -908,9 +986,11 @@ impl Session {
                 EXIT_CANCELLED
             }
             "long_done" | "long_done_incomplete" => match cropped {
-                Some(image) => {
-                    deliver_longshot(image, self.flags, action == "long_done_incomplete")
-                }
+                Some(image) => deliver_longshot(
+                    image,
+                    self.flags.for_longshot(self.long_shot),
+                    action == "long_done_incomplete",
+                ),
                 None => EXIT_CANCELLED,
             },
             "pin" => spawn_detached(cropped, &["pin-file", "--cleanup"], "pinned", None),
@@ -1337,9 +1417,9 @@ fn spawn_encoded_session(
 /// must not prevent the user from inspecting and retrying the completed image.
 fn deliver_longshot(image: Rgb8, flags: OutputFlags, incomplete: bool) -> i32 {
     use preview::{ExportState, OutputReport};
-    let png = match image.to_png() {
+    let png = match encode_longshot(&image) {
         Ok(png) => png,
-        Err(_) => {
+        Err(()) => {
             vellum_core::io::notify(
                 "Vellum 长图输出未完成",
                 "采集已完成，但图片编码失败",
@@ -1355,26 +1435,27 @@ fn deliver_longshot(image: Rgb8, flags: OutputFlags, incomplete: bool) -> i32 {
             return EXIT_OUTPUT_FAILED;
         }
     };
-    let mut report = OutputReport::default();
-    if flags.save {
-        let saved = vellum_core::io::save_default_bytes("vellum-long", &png);
-        report.save = match saved {
-            Ok(path) => {
-                println!("saved: {}", path.display());
-                ExportState::Done
-            }
-            Err(error) => {
-                eprintln!("[vellum] {}", region_save_failure_message(&error));
-                if vellum_core::io::committed_save_path(&error).is_some() {
-                    ExportState::Uncertain
-                } else {
-                    ExportState::Failed
+    let report = longshot_exports_with(
+        &png,
+        flags,
+        |png| {
+            let saved = vellum_core::io::save_default_bytes("vellum-long", png);
+            match saved {
+                Ok(path) => {
+                    println!("saved: {}", path.display());
+                    ExportState::Done
+                }
+                Err(error) => {
+                    eprintln!("[vellum] {}", region_save_failure_message(&error));
+                    if vellum_core::io::committed_save_path(&error).is_some() {
+                        ExportState::Uncertain
+                    } else {
+                        ExportState::Failed
+                    }
                 }
             }
-        };
-    }
-    if flags.copy {
-        report.copy = match vellum_core::io::copy_png(&png) {
+        },
+        |png| match vellum_core::io::copy_png(png) {
             Ok(()) => {
                 println!("long-shot done: {}x{} copied", image.width, image.height);
                 ExportState::Done
@@ -1383,8 +1464,8 @@ fn deliver_longshot(image: Rgb8, flags: OutputFlags, incomplete: bool) -> i32 {
                 eprintln!("[vellum] {}", region_copy_failure_message(&error));
                 ExportState::Failed
             }
-        };
-    }
+        },
+    );
     let args = preview_args(report, incomplete);
     let outcome = spawn_encoded(&png, &args, "preview ready");
     drop(png);
@@ -1399,11 +1480,66 @@ fn deliver_longshot(image: Rgb8, flags: OutputFlags, incomplete: bool) -> i32 {
     if failed {
         vellum_core::io::notify(
             "Vellum 长图输出未全部完成",
-            "采集已完成；保存、复制和预览状态分别显示，可在预览中重试。窗口未确认时用 vellum recover list 查找保留图片。",
+            longshot_output_failure_message(report),
             "normal",
         );
     }
     if failed { EXIT_OUTPUT_FAILED } else { 0 }
+}
+
+fn encode_longshot(image: &Rgb8) -> Result<Vec<u8>, ()> {
+    // A cancelled/invalid result must never replace a useful clipboard with an
+    // empty payload. Do not enter the encoder with inconsistent RGB metadata.
+    let expected = image
+        .width
+        .checked_mul(image.height)
+        .and_then(|n| n.checked_mul(3));
+    if image.width == 0 || image.height == 0 || expected != Some(image.data.len()) {
+        return Err(());
+    }
+    image
+        .to_png()
+        .map_err(|_| ())
+        .and_then(|png| if png.is_empty() { Err(()) } else { Ok(png) })
+}
+
+/// Both manual and hotkey completion share this export path, independent of
+/// the incomplete warning. A no-copy flag disables copying.
+/// Preference launchers must not translate an inherited copy=false to that flag.
+fn longshot_exports_with(
+    png: &[u8],
+    flags: OutputFlags,
+    save: impl FnOnce(&[u8]) -> preview::ExportState,
+    copy: impl FnOnce(&[u8]) -> preview::ExportState,
+) -> preview::OutputReport {
+    use preview::{ExportState, OutputReport};
+    OutputReport {
+        save: if !flags.save {
+            ExportState::NotRequested
+        } else if png.is_empty() {
+            ExportState::Failed
+        } else {
+            save(png)
+        },
+        copy: if !flags.copy {
+            ExportState::NotRequested
+        } else if png.is_empty() {
+            ExportState::Failed
+        } else {
+            copy(png)
+        },
+    }
+}
+
+fn longshot_output_failure_message(report: preview::OutputReport) -> &'static str {
+    if matches!(
+        report.copy,
+        preview::ExportState::Failed | preview::ExportState::Uncertain
+    ) {
+        "自动复制到剪贴板失败；已生成的长图仍保留，可在预览中重试复制。窗口未确认时用 vellum recover list 查找保留图片。"
+    } else {
+        "采集已完成；保存、复制和预览状态分别显示，可在预览中重试。窗口未确认时用 vellum recover list 查找保留图片。"
+    }
 }
 
 fn preview_args(report: preview::OutputReport, incomplete: bool) -> Vec<&'static str> {
@@ -1429,6 +1565,10 @@ fn longshot_output_failed(report: preview::OutputReport, preview_ready: bool) ->
         || matches!(report.save, Failed | Uncertain)
         || matches!(report.copy, Failed | Uncertain)
 }
+
+#[cfg(test)]
+#[path = "longshot_completion_tests.rs"]
+mod longshot_completion_tests;
 
 #[cfg(test)]
 mod tests {

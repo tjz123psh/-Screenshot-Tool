@@ -52,6 +52,15 @@ const NEAREST_ABOVE: f64 = 3.0;
 const TOAST_MS: u32 = 1600;
 const SAVE_PREFIX: &str = "vellum-pin";
 
+fn pin_title(compositor: compositor::Compositor) -> String {
+    if compositor == compositor::Compositor::Kde {
+        // Assigned once before mapping; never change it while the pin lives.
+        format!("vellum 钉图 [vellum-pin:{}]", glib::uuid_string_random())
+    } else {
+        "vellum 钉图".into()
+    }
+}
+
 struct View {
     /// None until the worker finishes converting the pixels. The window is shown
     /// before that happens, so a long screenshot never freezes the interface.
@@ -316,7 +325,8 @@ impl PinWindow {
 
         let window = ApplicationWindow::builder()
             .application(app)
-            .title("vellum 钉图")
+            .title(pin_title(compositor::detect()))
+            .decorated(false)
             .default_width(win_w)
             .default_height(win_h)
             // A compositor floats a window that declares a fixed size and hands
@@ -562,16 +572,9 @@ impl PinWindow {
         let this = Rc::clone(self);
         self.window.connect_map(move |_| {
             // The compositor needs a moment to map the surface before it can be
-            // moved to the floating layer or looked up by pid.
+            // moved to the floating layer or matched by its stable target.
             let this = Rc::clone(&this);
             glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
-                // Look this window up by pid and take the newest match rather
-                // than acting on "the focused window": between mapping and this
-                // callback the user may have focused something else, and floating
-                // their window instead would be a visible, confusing side
-                // effect. The newest match is this pin even when the process
-                // already owns an older viewer window. Retried on the main loop
-                // because the compositor's client list can lag the map.
                 if this.closed.get() {
                     return;
                 }
@@ -580,12 +583,12 @@ impl PinWindow {
                 // resize it, and re-assert the size as a safety net for a
                 // compositor that floated it at a size of its own choosing.
                 let sized = Rc::clone(&this);
-                crate::own_window::float_own_window_then(move || {
+                crate::own_window::float_window_then(&this.window, move |handle| {
                     if sized.closed.get() {
                         return;
                     }
                     sized.window.set_resizable(true);
-                    let handle = compositor::newest_window_for_pid(std::process::id());
+
                     if let Some(handle) = &handle {
                         let (w, h) = sized.target.get();
                         let _ = compositor::set_window_size(handle, w, h);
@@ -851,8 +854,8 @@ fn draw(cr: &cairo::Context, view: &View, width: i32, height: i32) {
         let _ = cr.restore();
     }
 
-    // The shipped window rules strip the compositor border here, so the pin draws
-    // its own hairline to separate itself from whatever is behind it.
+    // The pin requests no decorations and draws its own hairline to separate
+    // itself from whatever is behind it.
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
     cr.set_line_width(1.0);
     cr.rectangle(0.5, 0.5, w - 1.0, h - 1.0);
@@ -887,6 +890,10 @@ fn draw_toast(cr: &cairo::Context, text: &str, error: bool, w: f64, h: f64) {
         (0.93, 0.95, 1.0, 0.95),
     );
 }
+
+#[cfg(test)]
+#[path = "pin_window_tests.rs"]
+mod window_tests;
 
 #[cfg(test)]
 mod tests {

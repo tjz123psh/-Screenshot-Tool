@@ -30,7 +30,7 @@ use gtk4::{
     Stack, StackTransitionType, Switch, ToggleButton, gio, glib,
 };
 use pango::EllipsizeMode;
-use vellum_core::compositor::{self, Compositor};
+
 use vellum_core::config::{
     ApiConfig, Config, DEFAULT_API_BASE_URL, DEFAULT_API_KEY_ENV, DEFAULT_API_TIMEOUT_S,
     DEFAULT_LLM_MODEL, DEFAULT_OCR_LANGS, DEFAULT_TARGET_LANG, OCR_ENGINE_API, OCR_ENGINE_BUILTIN,
@@ -731,11 +731,9 @@ impl Panel {
         // with the long-shot panel, so translucency lives on a class only this
         // window carries.
         window.add_css_class("vellum-glass");
-        // KWin does not implement ext-background-effect-v1; attaching the
-        // guest Wayland backend there causes a protocol error before the panel maps.
-        if compositor::detect() != Compositor::Kde {
-            crate::background_blur::attach(&window);
-        }
+        // Newer KWin versions advertise the same protocol as niri. Probe the
+        // connection's capabilities instead of excluding a desktop by name.
+        crate::background_blur::attach(&window);
 
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.add_css_class("vellum-panel-shell");
@@ -1136,12 +1134,14 @@ impl Panel {
         // its own. vellum never writes the user's compositor config (DESIGN.md
         // §8), so this is how the panel floated before the fixed-size hint
         // above existed; it is kept because it costs one no-op dispatch on a
-        // compositor that already floated the window. Looked up by pid rather
-        // than acting on the focused window, because focus may have moved
-        // during the delay.
-        self.window.connect_map(|_| {
-            glib::timeout_add_local_once(FLOAT_DELAY, || {
-                crate::own_window::float_own_window_soon();
+        // compositor that already floated the window. Match this window's
+        // pid/title rather than whichever window is focused after the delay.
+        self.window.connect_map(|window| {
+            let weak = window.downgrade();
+            glib::timeout_add_local_once(FLOAT_DELAY, move || {
+                if let Some(window) = weak.upgrade() {
+                    crate::own_window::float_window_then(&window, |_| {});
+                }
             });
         });
     }
@@ -1164,7 +1164,7 @@ impl Panel {
             self.status.set_label(if self.demo {
                 "界面演示 · 未读取真实配置"
             } else {
-                "截图后保存与复制，始终遵循你的偏好设置"
+                "普通截图遵循保存与复制偏好，长图完成后自动复制"
             });
         } else if name == "shortcuts" {
             self.status.set_label("以系统授权结果为准，无需另外保存");
@@ -1370,8 +1370,14 @@ impl Panel {
                 .stderr(std::process::Stdio::inherit())
                 .process_group(0);
             // Resolve saved defaults at dispatch, never from this panel's old form.
-            if action != "pin-last" {
-                command.args(prefs::load().args());
+            match action {
+                "pin-last" => {}
+                "long" => {
+                    command.args(prefs::load().longshot_args());
+                }
+                _ => {
+                    command.args(prefs::load().args());
+                }
             }
             match command.spawn() {
                 Ok(child) => vellum_core::proc::reap_in_background(child),
@@ -2096,7 +2102,7 @@ fn capture_page(form: &FormWidgets) -> (ScrolledWindow, Button) {
         &capture_rows,
         &controls::action_row(
             "截图后复制",
-            Some("关闭后不再写入剪贴板"),
+            Some("只控制普通截图；长图完成后自动复制"),
             &form.copy_switch,
         ),
     );
@@ -2132,8 +2138,35 @@ fn capture_page(form: &FormWidgets) -> (ScrolledWindow, Button) {
     (page(&content), choose)
 }
 
+/// An explicit workbench launch restores the session tray, even when login
+/// startup is disabled or the user previously quit it. The tray owns its lock.
+fn ensure_tray() {
+    std::thread::spawn(|| {
+        let program = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("vellum-tray")))
+            .filter(|path| vellum_core::proc::is_executable(path));
+        let Some(program) = program else {
+            eprintln!("[vellum] 当前安装缺少托盘程序，请运行 vellum release repair");
+            return;
+        };
+        use std::os::unix::process::CommandExt;
+        let child = vellum_core::proc::command(program)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn();
+        match child {
+            Ok(child) => vellum_core::proc::reap_in_background(child),
+            Err(error) => eprintln!("[vellum] 无法恢复托盘：{error}"),
+        }
+    });
+}
+
 /// Opens the settings panel and runs until the window is closed.
 pub fn run_panel() -> i32 {
+    ensure_tray();
     let app = application();
     app.connect_activate(|app| {
         Panel::new(app).present();

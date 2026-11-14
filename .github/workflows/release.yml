@@ -59,7 +59,7 @@ jobs:
       - name: Install runner build dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          git rust pkgconf gtk4 gtk4-layer-shell python cargo-audit github-cli xorg-server-xvfb xorg-xauth
+          git rust pkgconf gtk4 gtk4-layer-shell python python-gobject nodejs dbus cargo-audit github-cli xorg-server-xvfb xorg-xauth
 
       - name: Check out the exact tag
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
@@ -93,6 +93,9 @@ jobs:
           cargo test --locked --workspace
           cargo audit --no-yanked
           python3 tests/package-release.py
+          python3 tests/kde-pin-regression.py
+          node tests/kde-pin-script-test.js
+          python3 tests/kde-user-workflow.py
           bash -n contrib/install-bundle.sh install-release.sh
           bash tests/install-remote-fixed.sh
           bash tests/install-release-deps.sh
@@ -110,6 +113,13 @@ jobs:
 
       - name: Build all four binaries together
         run: cargo build --locked --release --workspace
+
+      - name: Test release portal v1/v2 dispatch and shortcut service lifecycle on private D-Bus
+        timeout-minutes: 5
+        run: |
+          timeout 90s python3 tests/portal-shortcuts.py target/release/vellum-ui --portal-version 1 --dispatch
+          timeout 90s python3 tests/portal-shortcuts.py target/release/vellum-ui --portal-version 2 --dispatch
+          timeout 180s python3 tests/portal-shortcuts-lifecycle.py target/release/vellum-ui
 
       - name: Package clean fixed-tag binaries
         shell: bash
@@ -193,4 +203,3 @@ jobs:
             "$OUTPUT_DIR/vellum-linux-x86_64.tar.gz.sha256" \
             "$OUTPUT_DIR/install.sh"
           gh release view "$RELEASE_TAG" --json assets --jq ".assets[].name" | sort
-

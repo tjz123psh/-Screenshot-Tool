@@ -25,6 +25,9 @@ jobs:
           cargo-audit
           pkgconf
           python
+          python-gobject
+          nodejs
+          dbus
           gtk4
           gtk4-layer-shell
           xorg-server-xvfb
@@ -61,6 +64,22 @@ jobs:
           xvfb-run -a -s "-screen 0 1280x800x24" cargo test --locked -p vellum-ui closing_overlay_releases_full_screen_and_input_method_while_result_stays_alive -- --test-threads=1
           xvfb-run -a -s "-screen 0 1280x800x24" cargo test --locked -p vellum-ui native_ocr_compact_layout_coalesces_edits_and_closes_without_workspace -- --ignored --test-threads=1
           xvfb-run -a -s "-screen 0 1280x800x24" cargo test --locked -p vellum-ui externally_opened_image_reports_a_real_window_not_a_started_process -- --test-threads=1
+
+      - name: Build integration test binaries
+        run: cargo build --locked --workspace
+
+      - name: Test portal v1/v2 dispatch and shortcut service lifecycle on private D-Bus
+        timeout-minutes: 5
+        run: |
+          timeout 90s python3 tests/portal-shortcuts.py target/debug/vellum-ui --portal-version 1 --dispatch
+          timeout 90s python3 tests/portal-shortcuts.py target/debug/vellum-ui --portal-version 2 --dispatch
+          timeout 180s python3 tests/portal-shortcuts-lifecycle.py target/debug/vellum-ui
+
+      - name: Test KDE window targeting and user workflow wiring
+        run: |
+          python3 tests/kde-pin-regression.py
+          node tests/kde-pin-script-test.js
+          python3 tests/kde-user-workflow.py
 
       - name: Audit dependencies
         run: cargo audit --no-yanked

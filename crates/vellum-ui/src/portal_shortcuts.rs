@@ -35,6 +35,14 @@ impl ActivationGate {
         self.0.remove(id);
     }
 }
+fn capture_args(action: &str, preferences: &vellum_core::prefs::Preferences) -> Vec<String> {
+    if action == "long" {
+        preferences.longshot_args()
+    } else {
+        preferences.args()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RequestKind {
     Create,
@@ -517,7 +525,7 @@ impl Service {
             let args = if id == "pin-last" {
                 Vec::new()
             } else {
-                vellum_core::prefs::load().args()
+                capture_args(&id, &vellum_core::prefs::load())
             };
             match std::process::Command::new(exe).arg(id).args(args).spawn() {
                 Ok(child) => vellum_core::proc::reap_in_background(child),
@@ -527,11 +535,58 @@ impl Service {
     }
 }
 
-pub fn run_service() -> anyhow::Result<i32> {
-    // A managed release that an update replaced must not hold the D-Bus name:
-    // standing down lets the next request activate the current build.
-    if vellum_core::build_info::is_superseded() {
+const HANDOFF_ENV: &str = "VELLUM_SHORTCUTS_HANDOFF";
+
+fn replacement_executable() -> anyhow::Result<PathBuf> {
+    let resources = vellum_core::build_info::versioned_resource_root()
+        .ok_or_else(|| anyhow::anyhow!("无法确认旧快捷键服务的安装身份"))?;
+    let release = resources
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("缺少版本目录"))?;
+    let releases = release
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("缺少版本集合"))?;
+    let root = releases
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("缺少安装目录"))?;
+    let current = root.join("current").canonicalize()?;
+    anyhow::ensure!(
+        current.parent() == Some(releases) && current != release,
+        "快捷键服务交接目标不在同一安装的其它版本目录中"
+    );
+    let executable = current.join("bin/vellum-ui");
+    anyhow::ensure!(
+        executable.is_file() && executable.canonicalize()? == executable,
+        "当前版本缺少独立的快捷键服务入口"
+    );
+    Ok(executable)
+}
+
+fn handoff_current_service() -> anyhow::Result<i32> {
+    // An upgrade is not an explicit enable/login-start action. Fail closed on
+    // missing/invalid shortcut preferences or an unreadable startup preference.
+    if !load_enabled() || !vellum_core::autostart::login_enabled()? {
         return Ok(0);
+    }
+    use std::os::unix::process::CommandExt;
+    // exec keeps standalone and D-Bus activation parents attached to the new
+    // service. Never launch the capture daemon, CLI, or a PATH-selected program.
+    Err(std::process::Command::new(replacement_executable()?)
+        .arg("shortcuts-service")
+        .env(HANDOFF_ENV, "1")
+        .exec()
+        .into())
+}
+
+pub fn run_service() -> anyhow::Result<i32> {
+    if vellum_core::build_info::is_superseded() {
+        // current can move again between resolution and exec. One immediate
+        // handoff is allowed; a still-stale replacement must not exec-loop.
+        anyhow::ensure!(
+            std::env::var_os(HANDOFF_ENV).is_none(),
+            "快捷键服务交接目标再次过期，未循环启动；请重试当前版本"
+        );
+        return handoff_current_service();
     }
     let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)?;
     let reply = connection.call_sync(
@@ -687,11 +742,13 @@ pub fn run_service() -> anyhow::Result<i32> {
         service.initialize();
     }
     let loop_ = glib::MainLoop::new(None, false);
-    // This service can be D-Bus activated rather than started by systemd, so an
-    // upgrade cannot restart it. Hand the name over once current moves on.
+    // A D-Bus/standalone service has no supervisor to restart it on upgrade.
+    let superseded = Rc::new(Cell::new(false));
+    let replaced = superseded.clone();
     let resign = loop_.clone();
     let _resign = glib::timeout_add_local(Duration::from_secs(15), move || {
         if vellum_core::build_info::is_superseded() {
+            replaced.set(true);
             resign.quit();
             glib::ControlFlow::Break
         } else {
@@ -702,11 +759,34 @@ pub fn run_service() -> anyhow::Result<i32> {
     connection.set_exit_on_close(false);
     connection.connect_closed(move |_, _, _| on_closed.quit());
     loop_.run();
+    if superseded.get() {
+        service.cancel_pending();
+        service.close_session();
+        connection.flush_sync(None::<&gio::Cancellable>)?;
+        // Confirm release before exec: starting a replacement while we still
+        // own the name makes RequestName(DO_NOT_QUEUE) silently lose the race.
+        let reply = connection.call_sync(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReleaseName",
+            Some(&(BUS,).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            3000,
+            None::<&gio::Cancellable>,
+        )?;
+        anyhow::ensure!(
+            reply.child_value(0).get::<u32>() == Some(1),
+            "无法释放旧快捷键服务名"
+        );
+        return handoff_current_service();
+    }
     Ok(1)
 }
 
-fn has_owner(connection: &gio::DBusConnection) -> bool {
-    connection
+fn has_owner(connection: &gio::DBusConnection) -> Result<bool, String> {
+    let reply = connection
         .call_sync(
             Some("org.freedesktop.DBus"),
             "/org/freedesktop/DBus",
@@ -718,16 +798,22 @@ fn has_owner(connection: &gio::DBusConnection) -> bool {
             1000,
             None::<&gio::Cancellable>,
         )
-        .ok()
-        .and_then(|v| v.child_value(0).get::<bool>())
-        .unwrap_or(false)
+        .map_err(|e| e.to_string())?;
+    reply
+        .child_value(0)
+        .get::<bool>()
+        .ok_or_else(|| "无效服务状态回复".into())
 }
 fn ensure_service(connection: &gio::DBusConnection) -> Result<(), String> {
-    if has_owner(connection) {
+    if has_owner(connection)? {
         return Ok(());
     }
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = if vellum_core::build_info::is_superseded() {
+        replacement_executable().map_err(|e| e.to_string())?
+    } else {
+        std::env::current_exe().map_err(|e| e.to_string())?
+    };
     let child = std::process::Command::new(exe)
         .arg("shortcuts-service")
         .stdin(std::process::Stdio::null())
@@ -739,7 +825,7 @@ fn ensure_service(connection: &gio::DBusConnection) -> Result<(), String> {
     vellum_core::proc::reap_in_background(child);
     let end = Instant::now() + Duration::from_secs(3);
     while Instant::now() < end {
-        if has_owner(connection) {
+        if has_owner(connection)? {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(40));
@@ -748,15 +834,28 @@ fn ensure_service(connection: &gio::DBusConnection) -> Result<(), String> {
 }
 /// Call from a worker or the management CLI, never synchronously on the GTK loop.
 pub fn control(method: &str, start: bool) -> Result<serde_json::Value, String> {
+    // Disable is a durable user preference even if there is no service to call.
+    // Do not report success (or start anything) if this write fails.
+    if method == "Disable" {
+        store_enabled(false).map_err(|e| format!("无法保存快捷键偏好：{e}"))?;
+    }
     let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
         .map_err(|e| e.to_string())?;
     if start {
         ensure_service(&connection)?;
     }
-    if !has_owner(&connection) {
-        return Ok(
-            serde_json::json!({"phase":"stopped","message":"点击申请系统授权；是否可用取决于桌面快捷键后端","bindings":{},"portal_version":0}),
-        );
+    if !has_owner(&connection)? {
+        return match method {
+            "Disable" => Ok(
+                serde_json::json!({"requested":true,"enabled":false,"phase":"disabled",
+                "message":"应用授权已停用；已有桌面绑定不受影响","bindings":{},"portal_version":0}),
+            ),
+            "GetStatus" => Ok(
+                serde_json::json!({"phase":"stopped","enabled":load_enabled(),
+                "message":"点击申请系统授权；是否可用取决于桌面快捷键后端","bindings":{},"portal_version":0}),
+            ),
+            _ => Err("快捷键服务未运行，未执行操作".into()),
+        };
     }
     let reply = connection
         .call_sync(
@@ -1116,6 +1215,28 @@ mod tests {
         assert!(gate.press("long"));
         assert!(!gate.press("shell-command"));
     }
+    #[test]
+    fn longshot_inherits_save_but_not_the_region_copy_preference() {
+        for save in [false, true] {
+            for copy in [false, true] {
+                let preferences = vellum_core::prefs::Preferences {
+                    save,
+                    copy,
+                    ..Default::default()
+                };
+                let mut expected = Vec::new();
+                if !save {
+                    expected.push("--no-save".to_string());
+                }
+                assert_eq!(capture_args("long", &preferences), expected);
+                if !copy {
+                    expected.push("--no-copy".to_string());
+                }
+                assert_eq!(capture_args("region", &preferences), expected);
+            }
+        }
+    }
+
     #[test]
     fn legacy_projection_discards_private_sources_and_unknown_actions() {
         let found = legacy_keys(

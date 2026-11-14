@@ -266,6 +266,7 @@ struct Shared {
     sampling: AtomicBool,
     abort_capture: AtomicBool,
     stop_signal: Option<StopSignal>,
+    kde_cancel: gtk4::gio::Cancellable,
 }
 
 impl Shared {
@@ -289,6 +290,7 @@ impl Shared {
             sampling: AtomicBool::new(true),
             abort_capture: AtomicBool::new(false),
             stop_signal,
+            kde_cancel: gtk4::gio::Cancellable::new(),
         }
     }
 
@@ -321,6 +323,7 @@ impl Shared {
     /// immediately when the whole capture is cancelled.
     fn abort_capture(&self) {
         self.abort_capture.store(true, Ordering::SeqCst);
+        self.kde_cancel.cancel();
         if let Some(signal) = &self.stop_signal {
             signal.notify();
         }
@@ -1034,7 +1037,11 @@ fn single_output_for_selection(
     let monitor = monitors.item(0)?.downcast::<gtk4::gdk::Monitor>().ok()?;
     let geometry = monitor.geometry();
     let logical = (geometry.width(), geometry.height());
-    if logical != expected || !selection_fits_screen(rect, logical) {
+    if geometry.x() != 0
+        || geometry.y() != 0
+        || logical != expected
+        || !selection_fits_screen(rect, logical)
+    {
         return None;
     }
     Some((monitor, logical))
@@ -1733,6 +1740,13 @@ impl Recorder {
     /// first sample; a failed/oversized surface is closed and given another
     /// settle delay rather than gambling with user pixels.
     pub fn present(self: &Rc<Self>) {
+        if single_output_for_selection(self.screen, self.rect).is_none() {
+            self.fail_capture(
+                "output_mapping",
+                "无法确认长截图的屏幕坐标；目前仅支持原点为零、尺寸匹配的单屏，请调整显示器后重试",
+            );
+            return;
+        }
         match self.placement {
             Placement::Hidden(reason) => {
                 let feedback = PanelFeedback::Hidden(reason);
@@ -1880,6 +1894,13 @@ impl Recorder {
             );
             return;
         }
+        if single_output_for_selection(self.screen, self.rect).is_none() {
+            self.fail_capture(
+                "output_mapping",
+                "显示器布局已改变，已停止长截图以免截错区域",
+            );
+            return;
+        }
         self.trace.emit("capture_thread_starting", &[]);
 
         let shared = Arc::clone(&self.shared);
@@ -1969,17 +1990,23 @@ impl Recorder {
         self.panel_available.set(false);
         self.highlight.borrow_mut().close();
         self.window.close();
-        if let Some(handle) = self.worker.borrow_mut().take() {
-            let joined = handle.join().is_ok();
-            self.trace
-                .emit("capture_worker_joined", &[("ok", TraceField::Bool(joined))]);
-        }
-        self.emit_summary("failed", None, false, 1);
-        (self.on_done)(None, vec![warning.to_string()]);
+        self.wait_for_worker(true, Some(warning));
     }
 
     /// Main thread: stitch the next captured frame, preserving capture order.
     fn consume_pending(self: &Rc<Self>) {
+        // A queued idle can run during asynchronous finish. It must not pop a
+        // frame that only the ordered finish drain is now allowed to consume.
+        if self.state.borrow().finished {
+            return;
+        }
+        if single_output_for_selection(self.screen, self.rect).is_none() {
+            self.fail_capture(
+                "output_mapping",
+                "显示器布局已改变，已停止长截图以免截错区域",
+            );
+            return;
+        }
         let (frame, notice, depth_after) = {
             let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             queue.idle_queued = false;
@@ -2131,53 +2158,71 @@ impl Recorder {
         self.highlight.borrow_mut().close();
         self.window.close();
 
-        if cancel {
-            // Nothing is kept, so the pointer can come back immediately.
-            self.emit_summary("cancelled", None, false, 0);
-            (self.on_done)(None, Vec::new());
+        self.wait_for_worker(cancel, None);
+    }
+
+    /// Keep GTK responsive while the owned tail is allowed to land. Even if a
+    /// backend misses its abort target, never detach it and race the final drain.
+    fn wait_for_worker(self: &Rc<Self>, cancel: bool, failure: Option<&'static str>) {
+        let started = Instant::now();
+        let mut warned = false;
+        let joined = poll_capture_shutdown(
+            &mut self.worker.borrow_mut(),
+            &self.shared,
+            started,
+            started,
+            &mut warned,
+        );
+        if let Some(joined) = joined {
+            self.worker_stopped(joined, cancel, failure);
             return;
         }
-
-        // A grab may be in flight when 完成 is clicked. Waiting briefly *after*
-        // the UI is hidden lets that final frame land, so the saved image is not
-        // one scroll step short.
-        let worker_joined = if let Some(handle) = self.worker.borrow_mut().take() {
-            let deadline = Instant::now() + FINAL_GRAB_WAIT;
-            while !handle.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if !handle.is_finished() {
-                self.shared.abort_capture();
-                let abort_deadline = Instant::now() + ABORT_JOIN_WAIT;
-                while !handle.is_finished() && Instant::now() < abort_deadline {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-            if !handle.is_finished() {
-                self.trace.emit("capture_worker_abort_deadline_missed", &[]);
-                eprintln!(
-                    "[vellum] long-shot capture worker missed its fast abort deadline; waiting for bounded backend shutdown"
-                );
-            }
-            // Correctness requires ownership of the worker to end before queue
-            // drain/result. Both screencopy and grim have hard deadlines, so an
-            // unconditional join is bounded by the backend rather than
-            // detaching a writer that can race the final canvas.
-            let joined = handle.join().is_ok();
-            self.trace
-                .emit("capture_worker_joined", &[("ok", TraceField::Bool(joined))]);
-            joined
-        } else {
-            self.trace.emit(
-                "capture_worker_joined",
-                &[
-                    ("ok", TraceField::Bool(true)),
-                    ("worker", TraceField::Static("not_started")),
-                ],
+        // This strong reference deliberately owns the recorder until shutdown;
+        // the session's application hold remains alive until on_done fires.
+        let recorder = self.clone();
+        glib::timeout_add_local(Duration::from_millis(10), move || {
+            let joined = poll_capture_shutdown(
+                &mut recorder.worker.borrow_mut(),
+                &recorder.shared,
+                started,
+                Instant::now(),
+                &mut warned,
             );
-            true
-        };
+            match joined {
+                Some(joined) => {
+                    recorder.worker_stopped(joined, cancel, failure);
+                    glib::ControlFlow::Break
+                }
+                None => glib::ControlFlow::Continue,
+            }
+        });
+    }
 
+    fn worker_stopped(&self, worker_joined: bool, cancel: bool, failure: Option<&'static str>) {
+        self.trace.emit(
+            "capture_worker_joined",
+            &[("ok", TraceField::Bool(worker_joined))],
+        );
+        if let Some(warning) = failure {
+            self.emit_summary("failed", None, false, 1);
+            (self.on_done)(None, vec![warning.to_string()]);
+        } else if cancel {
+            self.emit_summary("cancelled", None, false, 0);
+            (self.on_done)(None, Vec::new());
+        } else {
+            self.complete_finish(worker_joined);
+        }
+    }
+
+    fn complete_finish(&self, worker_joined: bool) {
+        if single_output_for_selection(self.screen, self.rect).is_none() {
+            self.emit_summary("failed", None, false, 1);
+            (self.on_done)(
+                None,
+                vec!["显示器布局已改变，未输出可能截错区域的长图".into()],
+            );
+            return;
+        }
         // The worker may have captured several frames while the main loop was
         // updating status. Stitch everything already owned before taking the
         // final snapshot, otherwise the result silently stops short.
@@ -2334,23 +2379,32 @@ enum FrameSource {
     Grim,
 }
 
+fn forced_grim_backend(compositor: Compositor, requested: Option<&str>) -> bool {
+    compositor != Compositor::Kde && requested == Some("grim")
+}
+
 impl FrameSource {
     fn new(rect: Rect, shared: &Shared) -> Self {
-        if std::env::var("VELLUM_LONGSHOT_BACKEND").as_deref() == Ok("grim") {
-            shared.trace.emit(
-                "capture_backend_selected",
-                &[("backend", TraceField::Static("grim_forced"))],
-            );
-            eprintln!("[vellum] long-shot backend forced to bounded grim fallback");
-            return Self::Grim;
-        }
-        if compositor::detect() == Compositor::Kde {
+        let compositor = compositor::detect();
+        // A debugging override cannot enable a protocol KWin does not support.
+        if compositor == Compositor::Kde {
             shared.trace.emit(
                 "capture_backend_selected",
                 &[("backend", TraceField::Static("kwin_screenshot2"))],
             );
             eprintln!("[vellum] long-shot backend: KWin ScreenShot2");
             return Self::Kde;
+        }
+        if forced_grim_backend(
+            compositor,
+            std::env::var("VELLUM_LONGSHOT_BACKEND").ok().as_deref(),
+        ) {
+            shared.trace.emit(
+                "capture_backend_selected",
+                &[("backend", TraceField::Static("grim_forced"))],
+            );
+            eprintln!("[vellum] long-shot backend forced to bounded grim fallback");
+            return Self::Grim;
         }
         match ScreencopyCapturer::new(rect, shared.stop_fd(), || shared.aborting()) {
             Ok(capturer) => {
@@ -2383,7 +2437,7 @@ impl FrameSource {
 
     fn grab(&mut self, shared: &Shared, rect: Rect) -> Result<Rgb8, capture::CaptureError> {
         if matches!(self, Self::Kde) {
-            return crate::kde::capture_area(rect);
+            return crate::kde::capture_area_interruptible(rect, &shared.kde_cancel);
         }
         if let Self::Screencopy {
             capturer,
@@ -2438,6 +2492,37 @@ impl FrameSource {
             shared.aborting()
         })
     }
+}
+
+/// Poll only: joining is legal once is_finished proves the producer has exited.
+/// Returning None transfers no queue ownership and never waits for a slow grab.
+fn poll_capture_shutdown(
+    worker: &mut Option<std::thread::JoinHandle<()>>,
+    shared: &Shared,
+    started: Instant,
+    now: Instant,
+    warned: &mut bool,
+) -> Option<bool> {
+    let Some(handle) = worker.as_ref() else {
+        return Some(true);
+    };
+    if handle.is_finished() {
+        return Some(worker.take().expect("worker checked above").join().is_ok());
+    }
+    let elapsed = now.saturating_duration_since(started);
+    if elapsed >= FINAL_GRAB_WAIT && !shared.aborting() {
+        shared.abort_capture();
+    }
+    if elapsed >= FINAL_GRAB_WAIT + ABORT_JOIN_WAIT && !*warned {
+        *warned = true;
+        shared
+            .trace
+            .emit("capture_worker_abort_deadline_missed", &[]);
+        eprintln!(
+            "[vellum] capture shutdown is slow; GTK remains responsive while the backend stops"
+        );
+    }
+    None
 }
 
 /// Worker thread: grab `rect` back to back until sampling stops.
@@ -2726,6 +2811,10 @@ fn sleep_while_sampling(shared: &Shared, duration: Duration) {
 #[cfg(test)]
 #[path = "recorder_live_test.rs"]
 mod live_tests;
+
+#[cfg(test)]
+#[path = "recorder_shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {

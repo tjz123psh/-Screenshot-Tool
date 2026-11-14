@@ -136,10 +136,10 @@ impl Tray {
     fn dispatch_args(&mut self, action: Action) -> Vec<String> {
         self.refresh_preferences();
         // pin-last re-pins the clipboard; output flags do not apply.
-        if action == Action::PinLast {
-            Vec::new()
-        } else {
-            self.prefs.args()
+        match action {
+            Action::PinLast => Vec::new(),
+            Action::Long => self.prefs.longshot_args(),
+            _ => self.prefs.args(),
         }
     }
 
@@ -565,8 +565,9 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let mut next_poll = Instant::now();
     loop {
         if handle.is_closed() {
-            // The host went away and `watcher_offline` decided to stop.
-            return Ok(0);
+            // A broken D-Bus connection is not an explicit user quit. Report
+            // failure so the existing Restart=on-failure unit can restore it.
+            return Err(std::io::Error::other("托盘连接已关闭，等待服务管理器恢复").into());
         }
         match drain(&rx) {
             Some(Message::Quit) => break,
@@ -581,7 +582,7 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
                 .update(|tray: &mut Tray| tray.refresh(status))
                 .is_none()
             {
-                return Ok(0);
+                return Err(std::io::Error::other("无法更新托盘，等待服务管理器恢复").into());
             }
             next_poll = Instant::now() + POLL_INTERVAL;
         }
@@ -723,7 +724,7 @@ mod tests {
                         if !save {
                             expected.push("--no-save".to_string());
                         }
-                        if !copy {
+                        if !copy && action != Action::Long {
                             expected.push("--no-copy".to_string());
                         }
                     }

@@ -63,8 +63,13 @@ fallback_marker = root / 'unexpected-fallback'
 (root / 'bin/vellum').write_text(chr(10).join(['#!/bin/sh', 'printf fallback > ' + shlex.quote(str(fallback_marker)), 'exit 17', '']))
 (root / 'bin/vellum').chmod(0o700)
 (root / 'config/vellum/tray.json').write_text(json.dumps({'save': False, 'copy': False}))
+build = json.loads(subprocess.check_output([str(root / 'bin/vellumctl'), '--build-info-json'], text=True, timeout=5))
+assert json.loads(subprocess.check_output([str(root / 'bin/vellum-ui'), '--build-info-json'], text=True, timeout=5)) == build
+identity = {'build_id': build['build_id'], 'ipc_schema': build['ipc_schema'], 'managed': False}
 capture_requests = []
+capture_pings = []
 capture_errors = []
+capture_mode = {'identity': identity, 'expected': identity, 'requests': capture_requests, 'ack': identity}
 stop_capture = threading.Event()
 listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 listener.bind(str(root / 'control/control.sock'))
@@ -84,24 +89,35 @@ def capture_server():
         try:
             with peer:
                 peer.settimeout(2)
-                payload = bytearray()
-                while not payload.endswith(b'\n') and len(payload) <= 65536:
-                    chunk = peer.recv(4096)
-                    if not chunk:
-                        break
-                    payload.extend(chunk)
-                request = json.loads(payload)
-                if request.get('command') != 'action':
-                    raise AssertionError('unexpected control request: ' + repr(request))
-                capture_requests.append(request)
-                if request['action'] == 'long':
-                    long_running = not long_running
-                response = {'ok': True, 'running': True, 'accepted': True,
-                            'state': 'busy' if long_running else 'idle',
-                            'toggled': request['action'] == 'long' and not long_running}
-                if request['action'] == 'region':
-                    response.update(accepted=False, busy=True, state='busy', message='synthetic busy refusal')
-                peer.sendall((json.dumps(response) + '\n').encode())
+                mode = dict(capture_mode)
+                # Identified peers exchange Ping and Action on the same socket.
+                # Keep framing across reads instead of assuming one recv per JSON.
+                with peer.makefile('rb') as stream:
+                    line = stream.readline(65537)
+                    request = json.loads(line)
+                    assert request == {'command': 'ping'}, request
+                    capture_pings.append(mode['identity'])
+                    response = {'ok': True, 'running': True, 'state': 'idle'}
+                    if mode['identity'] is not None:
+                        response['identity'] = mode['identity']
+                    peer.sendall((json.dumps(response) + '\n').encode())
+                    line = stream.readline(65537)
+                    # Incompatible peers must disconnect before sending work.
+                    if not line:
+                        continue
+                    request = json.loads(line)
+                    assert request.get('command') == 'action', request
+                    assert request.get('identity') == mode['expected'], request
+                    mode['requests'].append(request)
+                    if request['action'] == 'long':
+                        long_running = not long_running
+                    response = {'ok': True, 'running': True, 'accepted': True,
+                                'identity': mode['ack'],
+                                'state': 'busy' if long_running else 'idle',
+                                'toggled': request['action'] == 'long' and not long_running}
+                    if request['action'] == 'region':
+                        response.update(accepted=False, busy=True, state='busy', message='synthetic busy refusal')
+                    peer.sendall((json.dumps(response) + '\n').encode())
         except Exception as error:
             capture_errors.append(str(error))
 
@@ -217,7 +233,7 @@ try:
     if options.dispatch:
         wait_for(lambda: len(capture_requests) == 2, 'portal activation did not reach the real control client')
         assert [r['action'] for r in capture_requests] == ['long', 'long']
-        assert all(r['args'] == ['--no-save', '--no-copy'] for r in capture_requests), capture_requests
+        assert all(r['args'] == ['--no-save'] for r in capture_requests), 'long must inherit save=False without inheriting copy=False: ' + repr(capture_requests)
         assert not fallback_marker.exists(), 'valid replies must not fall back to a GUI process'
         key('Deactivated', 'long')
         key('Activated', 'region')
@@ -323,6 +339,49 @@ try:
         assert json.loads(preference.read_text())['enabled'] is False
         assert preference.stat().st_mode & 0o777 == 0o600
         assert len(capture_requests) == 4, 'unknown/session-mismatched keys must not launch actions'
+        assert len(capture_pings) == 4, 'each action must verify its peer on the same connection'
+        # Exercise the actual managed client's identity gate, not a permissive
+        # development-only imitation. Receipts live only in this private tree.
+        release = root / 'managed/releases' / build['build_id']
+        (release / 'bin').mkdir(parents=True)
+        (release / 'generated').mkdir()
+        shutil.copy2(root / 'bin/vellumctl', release / 'bin/vellumctl')
+        shutil.copy2(root / 'bin/vellum', release / 'bin/vellum')
+        (release / 'manifest.json').write_text(json.dumps({
+            'format': 'vellum-release-v1', 'release_id': build['build_id'],
+            'version': build['version'], 'build': build, 'files': []}))
+        (release / 'installed.json').write_text(json.dumps({
+            'format': 'vellum-installed-v1', 'release_id': build['build_id'],
+            'build_id': build['build_id'], 'generated': []}))
+        managed = dict(identity, managed=True)
+        identity_requests = []
+        capture_mode.update(identity=managed, expected=managed, requests=identity_requests, ack=managed)
+
+        def managed_action(expected_exit, action='pin-last', args=()):
+            result = subprocess.run([str(release / 'bin/vellumctl'), action, *args], env=env,
+                                    capture_output=True, text=True, timeout=5)
+            assert result.returncode == expected_exit, (result.returncode, result.stderr)
+            assert not capture_errors, capture_errors
+            assert not fallback_marker.exists(), 'identity refusal must never trigger a GUI fallback'
+
+        managed_action(0)
+        assert len(identity_requests) == 1
+        for incompatible in [None, identity, dict(managed, build_id='synthetic-other-build'),
+                             dict(managed, ipc_schema=managed['ipc_schema'] + 1),
+                             dict(managed, build_id=None)]:
+            capture_mode.update(identity=incompatible)
+            managed_action(2)
+            assert len(identity_requests) == 1, 'unverified peer received an action'
+        capture_mode.update(identity=managed, ack=dict(managed, build_id='synthetic-other-build'))
+        managed_action(2)
+        assert len(identity_requests) == 2, 'acknowledgement test did not send exactly one action'
+        capture_mode.update(ack=managed)
+        managed_action(0, 'long', ['--no-copy'])
+        assert len(identity_requests) == 3, 'explicit longshot flag test did not send exactly one action'
+        assert identity_requests[-1]['action'] == 'long'
+        assert identity_requests[-1]['args'] == ['--no-copy'], 'explicit CLI --no-copy must remain intact'
+        assert len(capture_requests) == 4, 'identity checks changed the portal dispatch count'
+        print('managed identity integration passed: same-socket Ping/Action, mode/build/schema/missing identity refusals, mismatched acknowledgement, no fallback')
         print('dispatch integration passed: portal -> real vellumctl -> private control socket; long toggle pair, busy region, pin, output flags, no GUI fallback')
     else:
         assert capture_requests == [], 'dry-run mode must never dispatch'

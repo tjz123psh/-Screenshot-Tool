@@ -61,6 +61,10 @@ SUDO
 chmod 0755 "$TMP/bin/pacman" "$TMP/bin/sudo" "$TMP/bin/id"
 
 run_installer() {
+    # Never let the host KDE/wlroots session choose this test's baseline.
+    XDG_CURRENT_DESKTOP="${VELLUM_TEST_DESKTOP:-}" XDG_SESSION_DESKTOP= DESKTOP_SESSION= \
+    NIRI_SOCKET="${VELLUM_TEST_NIRI_SOCKET:-}" SWAYSOCK="${VELLUM_TEST_SWAYSOCK:-}" \
+    HYPRLAND_INSTANCE_SIGNATURE="${VELLUM_TEST_HYPRLAND:-}" \
     PATH="$TMP/bin:$TMP/sys" HOME="$TMP/home" TMPDIR="$TMP" \
     VELLUM_RELEASE_BASE="file://$TMP/dist" \
     VELLUM_TEST_INSTALL_MARKER="$TMP/installed" \
@@ -83,16 +87,50 @@ done
 
 # 1b. The compositor decides whether grim is part of the install.
 rm -f "$TMP/installed" "$TMP/pacman.log"
-( export XDG_CURRENT_DESKTOP=niri; run_installer > "$TMP/out" 2> "$TMP/err" )
+VELLUM_TEST_DESKTOP=niri run_installer > "$TMP/out" 2> "$TMP/err"
 grep -q 'niri' "$TMP/out" || { echo 'niri session was not recognised' >&2; exit 1; }
 grep -q 'grim' "$TMP/pacman.log" || { echo 'niri install omitted grim' >&2; exit 1; }
 
 rm -f "$TMP/installed" "$TMP/pacman.log"
-( export XDG_CURRENT_DESKTOP=KDE; run_installer > "$TMP/out" 2> "$TMP/err" )
+VELLUM_TEST_DESKTOP=KDE run_installer > "$TMP/out" 2> "$TMP/err"
 grep -q 'KDE' "$TMP/out" || { echo 'KDE session was not recognised' >&2; exit 1; }
 if grep -q 'grim' "$TMP/pacman.log"; then
     echo 'KDE install asked for grim, which KWin never uses' >&2; exit 1
 fi
+
+# Empty/unknown desktops conservatively require grim; explicit portal desktops
+# win over stale compositor socket variables, including colon-separated names.
+for desktop in '' unknown GNOME gNoMe KDE Plasma:KDE niri:KDE; do
+    rm -f "$TMP/installed" "$TMP/pacman.log"
+    VELLUM_TEST_DESKTOP="$desktop" VELLUM_TEST_NIRI_SOCKET=/synthetic/niri \
+    VELLUM_TEST_SWAYSOCK=/synthetic/sway VELLUM_TEST_HYPRLAND=synthetic \
+        run_installer > "$TMP/out" 2> "$TMP/err"
+    case "$desktop" in
+        ''|unknown)
+            grep -q 'niri' "$TMP/out" || { echo 'socket fallback did not detect niri' >&2; exit 1; }
+            grep -q 'grim' "$TMP/pacman.log" || { echo 'socket fallback omitted grim' >&2; exit 1; } ;;
+        *)
+            if grep -q 'grim' "$TMP/pacman.log"; then
+                echo "portal desktop $desktop inherited a wlroots dependency" >&2; exit 1
+            fi ;;
+    esac
+    [[ $(< "$TMP/installed") == installed ]] || { echo 'desktop boundary case was not installed' >&2; exit 1; }
+done
+for desktop in '' unknown sway Hyprland; do
+    rm -f "$TMP/installed" "$TMP/pacman.log"
+    VELLUM_TEST_DESKTOP="$desktop" run_installer > "$TMP/out" 2> "$TMP/err"
+    grep -q 'grim' "$TMP/pacman.log" || { echo "desktop $desktop omitted grim" >&2; exit 1; }
+done
+for compositor in sway hyprland; do
+    rm -f "$TMP/installed" "$TMP/pacman.log"
+    if [[ "$compositor" == sway ]]; then
+        VELLUM_TEST_SWAYSOCK=/synthetic/sway run_installer > "$TMP/out" 2> "$TMP/err"
+    else
+        VELLUM_TEST_HYPRLAND=synthetic run_installer > "$TMP/out" 2> "$TMP/err"
+    fi
+    grep -qi "$compositor" "$TMP/out" || { echo "$compositor socket was not recognised" >&2; exit 1; }
+    grep -q 'grim' "$TMP/pacman.log" || { echo "$compositor socket omitted grim" >&2; exit 1; }
+done
 
 # 2. --no-deps must not touch the package manager at all.
 rm -f "$TMP/installed" "$TMP/pacman.log"
@@ -124,13 +162,13 @@ run_installer > "$TMP/out" 2> "$TMP/err"
 
 # 5. The session decides which shortcut advice is printed, never a guessed one.
 rm -f "$TMP/installed" "$TMP/pacman.log"
-( export XDG_CURRENT_DESKTOP=niri; run_installer > "$TMP/out" 2> "$TMP/err" )
+VELLUM_TEST_DESKTOP=niri run_installer > "$TMP/out" 2> "$TMP/err"
 grep -q 'wlroots 会话' "$TMP/out" \
     || { echo 'niri session did not get the compositor-binding advice' >&2; exit 1; }
 if grep -q 'xdg-desktop-portal-kde' "$TMP/out"; then
     echo 'niri session was told to install a KDE package' >&2; exit 1
 fi
-( export XDG_CURRENT_DESKTOP=KDE; run_installer > "$TMP/out" 2> "$TMP/err" )
+VELLUM_TEST_DESKTOP=KDE run_installer > "$TMP/out" 2> "$TMP/err"
 if grep -q 'wlroots 会话' "$TMP/out"; then
     echo 'KDE session was told it is a wlroots session' >&2; exit 1
 fi

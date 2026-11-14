@@ -1,14 +1,14 @@
 # 开发与发布
 
-[返回首页](<../README.md>) · [文档导航](<README.md>) · [贡献约定](<../CONTRIBUTING.md>)
+[返回首页](../README.md) · [文档导航](README.md) · [贡献约定](../CONTRIBUTING.md)
 
 ## 默认交付方式
 
 本项目默认只安装正式发布的二进制包。本机不从源码构建、不为构建安装系统依赖；完整编译、严格 clippy、测试和依赖审计由 Arch Linux CI 执行。
 
 1. 修改源码与对应测试，先做可运行的轻量检查。
-2. 推送 main，由 [CI 工作流](<../.github/workflows/ci.yml>)执行完整检查。
-3. 需要发版时才创建与 Cargo 版本对应的 `vX.Y.Z` 标签，并在同一标签上手动触发 [release 工作流](<../.github/workflows/release.yml>)。不要移动或覆盖已发布标签。
+2. 推送 main，由 [CI 工作流](../.github/workflows/ci.yml)执行完整检查。
+3. 需要发版时才创建与 Cargo 版本对应的 `vX.Y.Z` 标签，并在同一标签上手动触发 [release 工作流](../.github/workflows/release.yml)。不要移动或覆盖已发布标签。
 4. 用户通过发布的一键脚本安装；仅修改文档和测试维护代码时，不必重新安装程序。
 
 ```sh
@@ -22,23 +22,29 @@ curl -fsSL https://github.com/tjz123psh/-Screenshot-Tool/releases/latest/downloa
 ```sh
 cargo fmt --check
 PYTHONDONTWRITEBYTECODE=1 python3 tests/package-release.py
+PYTHONDONTWRITEBYTECODE=1 python3 tests/kde-pin-regression.py
+node tests/kde-pin-script-test.js
+PYTHONDONTWRITEBYTECODE=1 python3 tests/kde-user-workflow.py
+bash tests/install-release-deps.sh
 bash -n install.sh install-remote.sh install-release.sh
 git diff --check
 ```
 
-Rust 工具链未安装时，不必为了本地格式检查安装它，交给 CI 即可。图形测试按测试说明显式运行，不把默认忽略的用例说成已经验收。完整基准与真机限制见 [性能记录](<../PERFORMANCE.md>)；旧记录中的通过数量不是当前测试总数。
+Rust 工具链未安装时，不必为了本地格式检查安装它，交给 CI 即可。图形测试按测试说明显式运行，不把默认忽略的用例说成已经验收。完整基准与真机限制见 [性能记录](../PERFORMANCE.md)；旧记录中的通过数量不是当前测试总数。
+
+源码契约检查和 JavaScript 模板夹具不等于 GTK/KWin 真机验收。CI/release 另外以本次构建的 `vellum-ui` / `vellumctl` 在私有 D-Bus 上执行 portal v1/v2 分发及 `portal-shortcuts-lifecycle.py`；不得用旧安装版通过的结果冒充新源码验收。该生命周期测试会模拟版本切换，不修改真实服务、偏好或桌面授权。
 
 ## 脚本与目录职责
 
 | 入口 | 用途 |
 | --- | --- |
-| [install-release.sh](<../install-release.sh>) | 用户默认入口，作为 Release 中的 install.sh 发布，下载并校验二进制包 |
-| [contrib/install-bundle.sh](<../contrib/install-bundle.sh>) | 发行包内部入口，委托版本管理器 |
-| [tools/package_release.py](<../tools/package_release.py>) | CI 打包、清单校验与构建身份检查 |
-| [tests](<../tests/>) | 安装、打包、发布故障矩阵 |
-| [install.sh](<../install.sh>)、[install-remote.sh](<../install-remote.sh>) | 保留的源码开发兼容入口，不是本机或用户默认安装方式 |
+| [install-release.sh](../install-release.sh)                            | 用户默认入口，作为 Release 中的 install.sh 发布，下载并校验二进制包 |
+| [contrib/install-bundle.sh](../contrib/install-bundle.sh)              | 发行包内部入口，委托版本管理器                                      |
+| [tools/package_release.py](../tools/package_release.py)                | CI 打包、清单校验与构建身份检查                                     |
+| [tests](../tests/)                                                     | 安装、打包、发布故障矩阵                                            |
+| [install.sh](../install.sh)、[install-remote.sh](../install-remote.sh) | 保留的源码开发兼容入口，不是本机或用户默认安装方式                  |
 
-发布清单与故障恢复细节见 [RELEASE_FORMAT](<RELEASE_FORMAT.md>)。
+发布清单与故障恢复细节见 [RELEASE_FORMAT](RELEASE_FORMAT.md)。
 
 ## 保留的维护参考
 
@@ -84,6 +90,4 @@ VELLUM_SOURCE_REF=<40位提交SHA> bash install-remote.sh
 
 只有包含版本化安装器的提交才会运行；临时源码会清理，安装版本保存在用户级版本根。该开发通道不代替正式二进制发行包。
 
-详情见[发布格式](<RELEASE_FORMAT.md>)与[连续执行计划](<PRODUCT_EXECUTION_PLAN.md>)。
-
-
+详情见[发布格式](RELEASE_FORMAT.md)与[连续执行计划](PRODUCT_EXECUTION_PLAN.md)。

@@ -3,7 +3,7 @@
 //! vellum needs exactly four things from a compositor, and only for its own
 //! long-lived windows (pin, OCR/translation result):
 //!
-//! 1. find the window belonging to this process,
+//! 1. identify a specific window belonging to this process,
 //! 2. move it to the floating layer,
 //! 3. read its current size,
 //! 4. set its size exactly.
@@ -110,17 +110,44 @@ pub fn detect() -> Compositor {
 
 /// A compositor's handle for one window.
 ///
-/// niri assigns a numeric window id. KWin is driven by a pid-matched script
-/// because it exposes no equivalent client window handle, so the pid is the
-/// stable identifier vellum uses. Keeping the distinction in the type stops one
-/// being passed where the other is expected.
+/// niri assigns a numeric window id. KWin scripts use an immutable pid/title
+/// pair: a pid alone cannot distinguish a pin from its viewer or another pin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Window {
     Niri(u64),
-    Kde(u32),
+    Kde(KdeWindow),
+}
+
+/// An exact KWin target belonging to this process. Fields stay private so a
+/// caller cannot accidentally construct a handle for another application.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KdeWindow {
+    pid: u32,
+    title: String,
+}
+
+/// Identifies a just-mapped window belonging to this process.
+///
+/// On KDE, `title` must be nonempty and remain unchanged for the window's
+/// lifetime. Give each pin a unique title before mapping it. Scripts require
+/// exactly one live pid/title match; missing or ambiguous targets do nothing.
+/// Constructing a KDE handle does not confirm that KWin has mapped the window.
+/// niri retains its newest-window lookup and stores the resulting numeric id.
+pub fn own_window(title: &str) -> Option<Window> {
+    match detect() {
+        Compositor::Niri => niri::newest_window_for_pid(std::process::id()).map(Window::Niri),
+        Compositor::Kde if !title.trim().is_empty() => Some(Window::Kde(KdeWindow {
+            pid: std::process::id(),
+            title: title.to_owned(),
+        })),
+        Compositor::Kde | Compositor::Unknown => None,
+    }
 }
 
 /// Finds the window owned by `pid`.
+///
+/// KDE cannot identify a stable window by pid alone and returns `None`; use
+/// [`own_window`] with a unique title instead.
 ///
 /// vellum always looks its own window up by pid rather than acting on "the
 /// focused window": between mapping and the deferred float call the user may
@@ -129,7 +156,7 @@ pub enum Window {
 pub fn window_for_pid(pid: u32) -> Option<Window> {
     match detect() {
         Compositor::Niri => niri::window_for_pid(pid).map(Window::Niri),
-        Compositor::Kde => Some(Window::Kde(pid)),
+        Compositor::Kde => None,
         Compositor::Unknown => None,
     }
 }
@@ -139,11 +166,12 @@ pub fn window_for_pid(pid: u32) -> Option<Window> {
 /// Prefer this to [`window_for_pid`] whenever the process may own more than one
 /// window: opening a pin from the image viewer puts the pin and the viewer in
 /// the same process, and acting on the viewer by mistake would resize the very
-/// window the user is reading.
+/// window the user is reading. KDE returns `None`: stacking order is not
+/// creation order and is never a safe substitute for an explicit title.
 pub fn newest_window_for_pid(pid: u32) -> Option<Window> {
     match detect() {
         Compositor::Niri => niri::newest_window_for_pid(pid).map(Window::Niri),
-        Compositor::Kde => Some(Window::Kde(pid)),
+        Compositor::Kde => None,
         Compositor::Unknown => None,
     }
 }
@@ -156,11 +184,14 @@ pub fn newest_window_for_pid(pid: u32) -> Option<Window> {
 pub fn float(window: &Window) -> bool {
     match window {
         Window::Niri(id) => niri::float(*id),
-        Window::Kde(pid) => kde::apply_window(*pid, 0, 0, true),
+        Window::Kde(target) => kde::apply_window(target, 0, 0, true),
     }
 }
 
 /// Moves the newest window this process owns to the floating layer.
+///
+/// On KDE this returns `false`: pid-only callers must migrate to [`own_window`]
+/// with an explicit title. There is no fallback to another window of this pid.
 ///
 /// Single-shot: the caller retries on its own main loop, because a window that
 /// was just mapped may not be in the compositor's client list yet, and sleeping
@@ -179,10 +210,11 @@ pub fn float_own_window(pid: u32) -> bool {
     newest_window_for_pid(pid).is_some_and(|window| float(&window))
 }
 
-/// Places the newest window of a pid at an exact screen rectangle.
+/// Places the sole live window of this process at an exact screen rectangle.
 ///
 /// This is used by the KDE long-shot panel when layer-shell is unavailable.
-/// Other platforms keep their compositor-owned geometry.
+/// Other platforms keep their compositor-owned geometry. The legacy pid-only
+/// path refuses foreign pids and ambiguous matches rather than picking topmost.
 pub fn place_window(pid: u32, x: i32, y: i32, width: i32, height: i32, keep_above: bool) -> bool {
     if detect() != Compositor::Kde || width <= 0 || height <= 0 {
         return false;
@@ -213,7 +245,7 @@ pub fn set_window_size(window: &Window, width: i32, height: i32) -> bool {
     }
     match window {
         Window::Niri(id) => niri::set_window_size(*id, width, height),
-        Window::Kde(pid) => kde::apply_window(*pid, width, height, false),
+        Window::Kde(target) => kde::apply_window(target, width, height, false),
     }
 }
 
@@ -294,6 +326,7 @@ mod tests {
         // No compositor control: no handle, no calls, no errors — and in
         // particular no attempt to float whatever happens to be focused.
         assert!(window_for_pid(std::process::id()).is_none());
+        assert!(own_window("pin").is_none());
         assert!(!float_own_window(std::process::id()));
     }
 
@@ -309,15 +342,44 @@ mod tests {
     }
 
     #[test]
+    fn kde_requires_an_explicit_owned_title_and_never_falls_back_to_pid() {
+        let _lock = test_env_lock();
+        let _clear = clear_compositor_environment();
+        let _kde = EnvGuard::set("KDE_FULL_SESSION", "true");
+        assert!(window_for_pid(std::process::id()).is_none());
+        assert!(newest_window_for_pid(std::process::id()).is_none());
+        assert!(!float_own_window(std::process::id()));
+        assert!(own_window("").is_none());
+        assert!(own_window(" \n\t").is_none());
+        let first = own_window("pin-one").unwrap();
+        let second = own_window("pin-two").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first, own_window("pin-one").unwrap());
+        assert!(matches!(first, Window::Kde(KdeWindow { pid, title })
+            if pid == std::process::id() && title == "pin-one"));
+    }
+
+    #[test]
     fn a_nonsensical_size_is_refused_before_reaching_the_compositor() {
-        let window = Window::Kde(1234);
+        let window = Window::Kde(KdeWindow {
+            pid: std::process::id(),
+            title: "pin".into(),
+        });
         assert!(!set_window_size(&window, 0, 100));
         assert!(!set_window_size(&window, 100, -1));
     }
 
     #[test]
     fn handles_of_different_compositors_are_distinct_types() {
-        assert_ne!(Window::Kde(1), Window::Kde(2));
+        let first = KdeWindow {
+            pid: std::process::id(),
+            title: "pin-one".into(),
+        };
+        let second = KdeWindow {
+            title: "pin-two".into(),
+            ..first.clone()
+        };
+        assert_ne!(Window::Kde(first), Window::Kde(second));
         assert_eq!(Window::Niri(7), Window::Niri(7));
     }
 }

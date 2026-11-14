@@ -110,6 +110,16 @@ impl Preferences {
         }
         args
     }
+
+    /// Long shots are ready to paste on completion, independently of the
+    /// ordinary screenshot copy toggle. Explicit CLI --no-copy still wins.
+    pub fn longshot_args(&self) -> Vec<String> {
+        if self.save {
+            Vec::new()
+        } else {
+            vec!["--no-save".to_string()]
+        }
+    }
 }
 
 /// Only three tokens are supported. The template is a basename, never a path or
@@ -332,6 +342,23 @@ mod tests {
             ..Preferences::default()
         };
         assert_eq!(prefs.args(), vec!["--no-save", "--no-copy"]);
+    }
+
+    #[test]
+    fn longshots_always_default_to_copy_without_rewriting_preferences() {
+        for save in [false, true] {
+            for copy in [false, true] {
+                let prefs = Preferences {
+                    save,
+                    copy,
+                    ..Preferences::default()
+                };
+                let expected = if save { vec![] } else { vec!["--no-save"] };
+                assert_eq!(prefs.longshot_args(), expected);
+                assert_eq!(prefs.copy, copy);
+                assert_eq!(prefs.args().contains(&"--no-copy".to_string()), !copy);
+            }
+        }
     }
 
     #[test]

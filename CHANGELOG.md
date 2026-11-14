@@ -2,6 +2,15 @@
 
 All notable changes to vellum are documented here. The Rust rewrite starts a new version series rather than continuing the retired Python implementation's releases.
 
+## [0.3.8] - 2026-11-14
+
+- Open pins without compositor title bars while retaining drag, zoom, context-menu and keyboard-close controls. KDE window operations retain an exact PID/title target instead of selecting whichever sibling window is currently on top; absent or ambiguous targets are left untouched.
+- Restore a missing session tray when the workbench is explicitly opened, without changing login preferences. Unexpected tray connection shutdown now reports failure so the existing service restart policy can recover it; explicit tray quit still exits normally.
+- Make interactive long-shot completion copy the full result before opening its viewer, independently of the ordinary screenshot copy toggle. This includes entering long-shot mode from the region toolbar; explicit `vellum long --no-copy` remains supported. Copy failure keeps the image recoverable and reports an actionable error.
+- Cancel KDE capture waits with one bounded deadline, release request-pipe writers promptly, and validate frame metadata and budgets before allocation. Wait for recording shutdown without blocking the GTK loop or discarding queued tail frames. Reject unverified multi-output long-shot coordinates instead of silently sampling the wrong area.
+- Persist shortcut disable requests even when the service is stopped, and hand an enabled standalone shortcut service over to the current release after upgrade when login startup is allowed. Repair portal dispatch mocks, isolate installer tests from the host desktop, and add private-bus lifecycle and KDE window-targeting checks to CI/release gates.
+- Probe background-effect capabilities on KDE as on niri rather than hard-coding a desktop exclusion; visible blur still depends on GTK and compositor rendering policy.
+
 ## [0.3.7] - 2026-11-01
 
 - Fix the settings panel opening and instantly closing on niri 26.04. GTK 4.22+ already creates the ext-background-effect object for the GTK surface, and vellum's own blur module created a second one for the same `wl_surface`; niri answers the duplicate with `wl_surface already has a background effect object attached`, a protocol error that drops the connection (`Gdk-Message: Error 71 (Protocol error)`). The module is now a capability probe: it binds the manager, reads capabilities and adds the `vellum-compositor-blur` class, while `theme.css` declares `backdrop-filter` so GTK owns the single effect object. Verified on the production panel with `WAYLAND_DEBUG=1`: one `get_background_effect`, one `set_blur_region`, zero protocol errors, window stays open.
